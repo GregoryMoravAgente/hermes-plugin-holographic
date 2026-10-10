@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.1 — 2026-10-11
+
+### Fixed
+
+- **Keywords no longer make a fact look recently changed.** `update` with keywords alone stamped `updated_at` like
+  any edit, so every fact given keywords afterwards (by `enrich`, by hand or by a nightly job) looked fresh: temporal
+  decay favoured it, and a job that reviews recent facts (hermes-dreaming) would have taken a backlog of old facts
+  for new ones. Keywords are a search aid, not a change of the fact: an `update` that carries only `keywords` keeps
+  `updated_at`; one that also changes content, tags, category, trust or entities stamps it as before.
+
 ## 0.6.0 — 2026-10-11
 
 Synonyms and words of another root through keywords the agent gives when it stores a fact, and four more languages

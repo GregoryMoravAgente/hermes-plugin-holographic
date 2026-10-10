@@ -463,9 +463,10 @@ class MemoryStore:
             return fact_id, created
 
     def update_fact(self, fact_id: int, content: str | None = None, trust_delta: float | None = None,
-                    tags: str | None = None, category: str | None = None, *, entities=()) -> bool:
+                    tags: str | None = None, category: str | None = None, *, entities=(), touch: bool = True) -> bool:
         """Partially update a fact (trust clamped to [0, 1]). Returns True if the row existed. Raises ValueError for
-        empty content and DuplicateContentError when another fact already has the new content."""
+        empty content and DuplicateContentError when another fact already has the new content. touch=False keeps
+        updated_at (temporal decay and "recently changed" read it): for search aids that do not change the fact."""
         if content is not None:
             content = content.strip()
             if not content:
@@ -478,7 +479,9 @@ class MemoryStore:
                 "content": content, "tags": tags, "category": category,
                 "trust_score": _clamp_trust(row["trust_score"] + trust_delta) if trust_delta is not None else None,
             }.items() if val is not None}
-            assignments = ", ".join(["updated_at = CURRENT_TIMESTAMP"] + [f"{col} = ?" for col in changes])
+            assignments = ", ".join((["updated_at = CURRENT_TIMESTAMP"] if touch else []) + [f"{col} = ?" for col in changes])
+            if not assignments:
+                return True
             try:
                 self._write(f"UPDATE facts SET {assignments} WHERE fact_id = ?", [*changes.values(), fact_id])
             except sqlite3.IntegrityError:

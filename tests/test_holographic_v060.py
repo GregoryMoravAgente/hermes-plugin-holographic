@@ -73,6 +73,23 @@ def test_update_replaces_keywords_and_keeps_tags(provider):
     assert tags.startswith("medical") and "anaphylaxis" in tags
 
 
+def test_keywords_alone_keep_the_fact_age(provider):
+    """Keywords are a search aid: adding them must not make an old fact look recently changed (temporal decay, a
+    nightly job that reviews recent facts)."""
+    fact = _call(provider, action="add", content="Eva swims on Saturdays")["fact_id"]
+    provider._store._conn.execute("UPDATE facts SET updated_at = '2020-01-01 00:00:00' WHERE fact_id = ?", (fact,))
+    provider._store._conn.commit()
+
+    def age():
+        return provider._store.read("SELECT updated_at FROM facts WHERE fact_id = ?", (fact,))[0][0]
+
+    _call(provider, action="update", fact_id=fact, keywords=["swimming", "pool"])
+    assert age() == "2020-01-01 00:00:00"
+    assert _found(provider, "pool")[0] == "Eva swims on Saturdays"
+    _call(provider, action="update", fact_id=fact, keywords=["swimming"], tags="sport")
+    assert age() != "2020-01-01 00:00:00"  # a real edit still counts
+
+
 def test_enrich_lists_facts_without_keywords(provider):
     bare = _call(provider, action="add", content="The cat is called Mia")["fact_id"]
     _call(provider, action="add", content="Eva swims on Saturdays", keywords=["swimming", "pool"])

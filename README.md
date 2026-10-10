@@ -187,7 +187,9 @@ with that the fact does not contain (synonyms, other roots, broader terms, the s
 They are kept with the fact's tags, searched like its text, never shown in the recalled block, and old versions index
 them too. This is document expansion, as doc2query does for lexical search: the meaning is added once, when the fact
 is written, and recall stays local and deterministic. `enrich` lists the facts that have none, so the agent or a
-nightly job can add them with `update`.
+nightly job can add them with `update`; an update with keywords alone keeps the fact's age (`updated_at`), so old
+facts do not turn into recent ones. [hermes-dreaming](https://github.com/itpartypattaya/hermes-dreaming) does this
+nightly (`keywords.enabled`).
 
 Measured on a third set per language: 8 questions that share no word with their fact except a name ("Where are we
 relocating?", "What breed is our pet?", "Can my office computer handle AI models?"), written after the keywords. The

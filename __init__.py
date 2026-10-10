@@ -727,9 +727,12 @@ class HolographicMemoryProvider(MemoryProvider):
             user_tags, keywords = _split_tags(row[0]["tags"] if row else "")
             tags = _join_tags(_split_tags(tags)[0] if tags is not None else user_tags,
                               _keywords(a["keywords"]) if a.get("keywords") is not None else keywords)
+        # Keywords alone are a search aid, not a change of the fact: its age (temporal decay, "recently changed") stays.
+        only_keywords = a.get("keywords") is not None and all(
+            a.get(k) is None for k in ("content", "tags", "category", "trust_delta", "entities"))
         return json.dumps({"updated": self._store.update_fact(
             int(a["fact_id"]), content=a.get("content"), trust_delta=float(a["trust_delta"]) if "trust_delta" in a else None,
-            tags=tags, category=a.get("category"), entities=self._entities(a))})
+            tags=tags, category=a.get("category"), entities=self._entities(a), touch=not only_keywords)})
 
     def _enrich(self, a: dict) -> str:
         """Facts without keywords, the most recalled first: what the agent (or a nightly job) should give keywords."""
