@@ -697,7 +697,7 @@ class MemoryStore:
                     for name in [row["name"], *((row["aliases"] or "").split(",")), *names.get(row["entity_id"], [])]:
                         key = name_keys(name)
                         if len(key) > 1 or (key and row["entity_type"] == "declared"):
-                            for first in key[0]:
+                            for first in key[0][0]:
                                 index.setdefault(first, []).append((int(row["entity_id"]), key))
                         glued = name.strip().lower()
                         if UNSEGMENTED.search(glued) and len(glued) >= 2 and (len(key) > 1 or row["entity_type"] == "declared"):
@@ -706,17 +706,19 @@ class MemoryStore:
             return cached[1]
 
     def mentioned_entity_ids(self, text: str) -> set[int]:
-        """Known entities whose name (or alias) occurs in *text* as a run of words, compared by their keys (word and
-        stem): "Маши" and "Машу" mention the entity "Маша", "لإيفا" mentions "إيفا"; "машина" does not. Looked up by
-        each word's keys, not by scanning names."""
-        sequence = [w.keys for w in analyze(text).words]
+        """Known entities whose name (or alias) occurs in *text* as a run of words: a Latin-script name as written
+        (or with 's), a name in another script by its keys, so "Маши" and "Машу" mention "Маша" and "لإيفا" mentions
+        "إيفا", while "jeans" does not mention "Jean" and "машина" not "Маша". Looked up by each word's keys, not by
+        scanning names."""
+        sequence = analyze(text).words
         index = self._known_entities()
         found = set()
-        for i, keys in enumerate(sequence):
-            for first in keys:
+        for i, word in enumerate(sequence):
+            for first in word.keys:
                 for entity_id, key in index.get(first, ()):
-                    if entity_id not in found and len(sequence) - i >= len(key) and \
-                            all(name & sequence[i + j] for j, name in enumerate(key)):
+                    if entity_id not in found and len(sequence) - i >= len(key) and all(
+                            sequence[i + j].text in forms if exact else not forms.isdisjoint(sequence[i + j].keys)
+                            for j, (forms, exact) in enumerate(key)):
                         found.add(entity_id)
         if UNSEGMENTED.search(text or ""):  # a name in Chinese/Thai text has no spaces around it: substring match
             lowered = text.lower()

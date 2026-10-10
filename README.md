@@ -78,21 +78,36 @@ In `config.yaml` under `plugins.hermes-memory-store`:
 
 A word matches another when they share its plain form or its stem in the language of the text:
 
-- **Stems**: Snowball for English, Russian, Spanish, French, Portuguese, Indonesian and Hindi; for Arabic, Larkey's
-  light stemmer (the one Lucene ships) next to Snowball's, plus a variant without a glued one-letter preposition
-  (`لإيفا` is "for Eva"); for Bengali, a light suffix stripper (Snowball has none).
+- **Stems**: Snowball for English, Russian, Spanish, French, Portuguese, Indonesian and Hindi, with two plural rules it
+  lacks (Portuguese `ação` / `ações`, Spanish `lápiz` / `lápices`); for Arabic, Larkey's light stemmer (the one Lucene
+  ships) next to Snowball's, plus the word without a glued conjunction or preposition before an alef (`لإيفا`, "for
+  Eva"; `ولإيفا`, "and for Eva"); for Bengali, a light suffix stripper (Snowball has none) that leaves at least three
+  letters, so `মাটি` (soil) is not `মা` (mother).
 - **Which language**: the script decides for Cyrillic, Arabic, Devanagari and Bengali. Latin text is English, Spanish,
   French, Portuguese or Indonesian by the function words it uses ("the", "el", "le", "o", "yang"); text with none of
-  them is stemmed in all five. Each language has its own function words, so French "son" is not dropped from an
-  English question about a son.
-- **Folding**: Latin accents (`esta` finds `está`), Arabic vowel marks and letter variants, the Indic nukta, and
-  native digits (`2027` finds `২০২৭`). French elision and inversion (`d'Eva`, `prend-il`), Indonesian reduplication
-  (`anak-anak`) and suffixes after a hyphen (`hr-ovh-এর`) are taken apart.
+  them is stemmed in all five. A word is dropped as a function word only when the other words show that language, or
+  when it is the only sign of it in a sentence of four words or more: "son" alone, or in "where does my son study",
+  is a search word; in "il boit son café" it is French "his". With no other evidence the English list applies, as it
+  did to all Latin text before 0.5.0.
+- **Folding**: Latin accents and ligatures (`esta` finds `está`, `coeur` finds `cœur`), Arabic vowel marks and letter
+  variants, the Indic nukta, and native digits (`2027` finds `২০২৭`, `HR24` finds `HR২৪`). Folding also merges what
+  only an accent tells apart (Spanish `año` / `ano`), as the FTS5 index already did.
+- **Hyphens**: French elision and inversion (`d'Eva`, `prend-il`, `est-ce`) and Portuguese enclisis (`chama-se`) are
+  taken apart in text of that language, reduplication (`anak-anak`) in any; a hyphen between scripts splits
+  (`hr-ovh-এর`). A letters-only hyphenated token is an identifier in English text or text of no determined language
+  (`hr-ovh`, `carry-on`): a message naming it is about that one, and a fact about `hr-other` is not recalled for it.
+  In Spanish, French, Portuguese and Indonesian text it is a compound word (`week-end`, `sexta-feira`), so a host name
+  in a question in those languages is matched like any word, not enforced.
+- **Names** in Latin script are matched as written (and with an English `'s`): `Jean` is not mentioned by `jeans`.
+  Names in other scripts carry their inflections (`Маши` mentions `Маша`, `لإيفا` mentions `إيفا`).
 - **Chinese, Japanese, Korean, Thai** (no spaces between words): character n-grams.
-- **Arabic, Indic scripts and Indonesian** are matched word by word against the text of the facts instead of the SQLite
-  FTS5 index, which splits Indic words at their vowel signs and cannot see past Arabic and Indonesian prefixes. Measured
-  at 5,000 facts: about 0.04 s per search plus 0.03 s for the relevance gate, and about one second once per process
-  to read the facts.
+- **Arabic, Indic scripts and Indonesian** are also matched word by word against the text of the facts (so are Latin
+  words of a question of undetermined language, when the store holds Indonesian facts): the SQLite FTS5 index splits
+  Indic words at their vowel signs and cannot see past Arabic and Indonesian prefixes. The rows are read on every such
+  search; a fact is analysed once and again only when its text changes. Measured at 5,000 facts: 0.03–0.07 s per
+  search and about the same for the relevance gate; the first such search after start analyses every fact, about 1 s
+  at 5,000 facts and 4–6 s at 20,000 facts (later searches 0.2–0.4 s, plus 0.15–0.2 s for the gate). A store without
+  Arabic, Indic or Indonesian facts never scans: an English store answers in about 0.02 s at 5,000 facts, as before.
 
 Measured on stores of 20 everyday facts per language (people, school, work, servers, plans). "Found" = the right
 fact among the first five search results; "recalled" = injected before the turn; "quiet" = chit-chat, greetings and
@@ -111,9 +126,10 @@ off-topic questions recall nothing.
 | Portuguese | 100 % / 100 % | 100 % / 100 % | 10 / 10 |
 | Indonesian | 100 % / 100 % | 100 % / 100 % | 10 / 10 |
 
-In the unseen sets the right fact is first in 75–100 % of questions, and 0–1 of the 15 unrelated facts is injected
-per language. English, Russian and Chinese also have a second set (10 questions): found 90 / 90 / 100 %, recalled
-80 / 90 / 90 %.
+The right fact is first in 95–100 % of main-set questions and 75–100 % of unseen ones. Recall before the turn is not
+only the right fact: about one other fact of the store comes with it per question (0.8–1.1 on the main sets), and in
+the unseen sets 0–1 of the 15 unrelated facts per language. English, Russian and Chinese also have a second set (10
+questions): found 90 / 90 / 100 %, recalled 80 / 90 / 90 %.
 
 How the numbers were obtained, honestly:
 
@@ -121,10 +137,15 @@ How the numbers were obtained, honestly:
   the set was first run on 0.4.2, where it found 85–100 % and recalled 50–100 % (Arabic 50 %, French 75 %, Spanish
   85 %), and chit-chat recalled facts in four languages; 0.5.0 fixes were made against those misses. The fixes are
   per language and per script (function words, stemmers, folding, how a word is matched), not per question.
-- **Unseen sets were written after the fixes and run once.** English, Russian, Chinese: after it, whole-message
-  greetings were made to recall nothing ("good morning" recalled facts about mornings), and the quiet column includes
-  that fix. The other seven: three fixes followed from unit tests written afterwards (native digits in search,
-  `rendez-vous`, conflicts in claims with extra words); the set was run again and gave the same numbers.
+- **Unseen sets were written after the fixes.** English, Russian, Chinese: run once; after it, whole-message greetings
+  were made to recall nothing ("good morning" recalled facts about mornings), and the quiet column includes that fix.
+  The other seven: first run before the changes below, with the same found and recalled numbers as in the table.
+- **An independent review (Codex CLI) of 0.4.2 and 0.5.0** found regressions the sets did not: a lone "son" dropped as
+  a Spanish function word, `hr-ovh` no longer enforced, `ação` / `ações` apart, "with" / "without" sugar no longer a
+  conflict, `Jean` mentioned by `jeans`, and others. Each is fixed with a test, and every set was run again. One of
+  those fixes made French `est-ce` a required identifier, which the unseen set showed (French recalled 88 %); the
+  remedy (compound words in Romance-language text, a hyphenated word votes for a language with its first part) was
+  made after seeing it, so that unseen-set number is no longer blind.
 - **The second set was written after the main set of 0.4.2**, first run without changes (Russian recall 90 %, Chinese
   70 %), and two fixes followed. Its numbers published with 0.4.2 (recalled 90 / 100 / 100 %) were partly luck: facts
   of a named person saved in the same second came back in arbitrary order. They now come back newest first, every
@@ -136,8 +157,9 @@ What it does not do: find a fact through a synonym or a word of another root ("r
 "резервные копии", Spanish `nada` for `natación`, 十月 for 10月). It can surface a fact that shares a word in another
 sense: "nightly backups" → "night market"; Hindi `बनाना` is both "to cook" and "to make a plan"; Portuguese `dirigir`
 is "to drive" and "to run a company". Stems are search keys, not lemmas: an irregular form can miss (`ponies` /
-`pony`). `auto_extract` and the refusal of instruction-like text recognise English and Russian phrasing only. The main
-sets of all ten languages run in CI (`tests/test_holographic_languages.py`).
+`pony`). A negation counts for the whole clause up to a "but" ("likes cats but not dogs" is detail, not a conflict),
+not for a single word. `auto_extract` and the refusal of instruction-like text recognise English and Russian phrasing
+only. The main sets of all ten languages run in CI (`tests/test_holographic_languages.py`).
 
 ## Data and privacy
 

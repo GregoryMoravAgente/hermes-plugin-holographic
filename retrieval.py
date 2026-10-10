@@ -13,8 +13,9 @@ if TYPE_CHECKING:
     from .store import MemoryStore
 
 from . import holographic as hrr
-from .text import (CJK_NEGATORS, NEGATORS, UNSEGMENTED, analyze, content_chars, content_keys, content_stems,
-                   gram_coverage, is_greeting, query_grams, query_terms, soft_jaccard, soft_overlap, words)
+from .text import (CJK_NEGATORS, CLAIM_WORDS, CONTRASTIVE, NEGATORS, UNSEGMENTED, analyze, content_chars,
+                   content_keys, content_stems, gram_coverage, is_greeting, query_grams, query_terms, soft_jaccard,
+                   soft_overlap, words)
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,9 @@ _PUNCT = ".,;:!?\"'()[]{}#@<>"
 # tokens unicode61 indexed, adjacent (deleting them gave "pve01", which matches nothing).
 _FTS_OPERATORS = str.maketrans({c: " " for c in '"()*^:-+'})
 _RE_UNSEGMENTED = UNSEGMENTED
+# The commonest Indonesian function words: a store with none of them holds no Indonesian, and Latin words of a query
+# of undetermined language need no word scan (Indonesian prefixes are what hides a word from FTS5).
+_INDONESIAN_PROBE = '"yang" OR "dengan" OR "untuk" OR "tidak" OR "adalah" OR "sudah" OR "belum"'
 
 
 def _shift(sim: float) -> float:
@@ -68,10 +72,11 @@ class FactRetriever:
         terms = query_terms(query or "")
         candidates = {f["fact_id"]: f for f in self._fts_candidates(query, category, min_trust, limit * 3)
                       if self._contains_a_term(terms, f)}
-        for fact in self._ngram_candidates(query, category, min_trust, limit * 3) + \
-                self._scan_candidates(terms, category, min_trust, limit * 3):
+        for fact in self._ngram_candidates(query, category, min_trust, limit * 3):
             if fact["fact_id"] not in candidates or candidates[fact["fact_id"]].get("fts_rank", 0) < fact["fts_rank"]:
                 candidates[fact["fact_id"]] = fact
+        for fact in self._scan_candidates(terms, category, min_trust, limit * 3):
+            candidates.setdefault(fact["fact_id"], fact)  # fills in what FTS cannot see; FTS ranks what it found
         return self._rerank(query, list(candidates.values()), limit)
 
     @staticmethod
@@ -83,46 +88,66 @@ class FactRetriever:
         analysis = analyze(f'{fact.get("content", "")} {fact.get("tags") or ""}')
         return any(t.found_in(analysis) for t in terms)
 
-    def _texts(self, category: str | None = None, min_trust: float | None = None) -> list[tuple[int, object]]:
-        """(fact_id, Analysis) of every fact passing the filters. Read fresh on every call (the table is the truth;
-        another process may have written), analysed again only when a fact's text changed."""
+    def _texts(self, category: str | None = None, min_trust: float | None = None) -> list[tuple[int, float, object]]:
+        """(fact_id, trust, Analysis) of every fact passing the filters. The rows are read on every call (the table is
+        the truth; another process may have written); a fact is analysed again only when its text changed, so the
+        first scan after start analyses every fact and later ones only what changed."""
         where = [c for c, on in (("trust_score >= ?", min_trust is not None), ("category = ?", category)) if on]
         params = [p for p, on in ((min_trust, min_trust is not None), (category, category)) if on]
-        rows = self.store.read("SELECT fact_id, content, tags FROM facts" + (" WHERE " + " AND ".join(where) if where else "")
-                               + " ORDER BY fact_id",
-                               params)
+        rows = self.store.read("SELECT fact_id, content, tags, trust_score FROM facts"
+                               + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY fact_id", params)
         cache, out = self._analyses, []
         for row in rows:
             text = f'{row["content"]} {row["tags"] or ""}'
             hit = cache.get(row["fact_id"])
             if hit is None or hit[0] != text:
                 hit = cache[row["fact_id"]] = (text, analyze(text))
-            out.append((row["fact_id"], hit[1]))
-        if len(cache) > 2 * len(out) + 1024:  # deleted facts; filtered reads only shrink it to what they saw
-            self._analyses = {fact_id: cache[fact_id] for fact_id, _ in out}
+            out.append((row["fact_id"], row["trust_score"], hit[1]))
+        if not where and len(cache) > len(out) + 1024:  # deleted facts: only an unfiltered read sees every fact
+            self._analyses = {fact_id: cache[fact_id] for fact_id, _, _ in out}
         return out
 
-    def _rows(self, ids: list[int]) -> list[dict]:
+    def _scan_terms(self, terms) -> list:
+        """The terms matched word by word: Arabic and Indic always; Latin ones (Indonesian, or a query of undetermined
+        language) only when the store holds Indonesian facts, so an English store never pays for a scan."""
+        scan = [t for t in terms if t.scan]
+        if any(t.fts_ok for t in scan):
+            try:
+                indonesian = bool(self.store.read("SELECT 1 FROM facts_fts WHERE facts_fts MATCH ? LIMIT 1", (_INDONESIAN_PROBE,)))
+            except Exception:  # a damaged index: the scan does not need it
+                indonesian = True
+            if not indonesian:
+                scan = [t for t in scan if not t.fts_ok]
+        return scan
+
+    def _rows(self, ids: list[int], category: str | None = None, min_trust: float | None = None) -> list[dict]:
+        """Full rows of *ids*, the filters applied again: the fact may have changed since its text was read."""
         if not ids:
             return []
-        return [dict(r) for r in self.store.read(f"SELECT * FROM facts WHERE fact_id IN ({','.join('?' * len(ids))})", ids)]
+        sql = (f"SELECT * FROM facts WHERE fact_id IN ({','.join('?' * len(ids))})"
+               + (" AND trust_score >= ?" if min_trust is not None else "") + (" AND category = ?" if category else ""))
+        params = [*ids, *([min_trust] if min_trust is not None else []), *([category] if category else [])]
+        return [dict(r) for r in self.store.read(sql, params)]
 
     def _scan_candidates(self, terms, category: str | None, min_trust: float, limit: int) -> list[dict]:
         """Facts containing the query's scan terms (Arabic, Indic, Indonesian: words whose other forms the FTS5
         index cannot find), matched word by word against the text of every fact and ranked by the IDF-weighted share
         of those terms they contain ('fts_rank'). A scan, like the n-gram path: milliseconds at the size this store
         is meant for."""
-        scan = [t for t in terms if t.scan]
+        scan = self._scan_terms(terms)
         if not scan:
             return []
         texts = self._texts(category, min_trust)
-        found = [(fact_id, [t for t in scan if t.found_in(a)]) for fact_id, a in texts]
-        df = {t: sum(t in hit for _, hit in found) for t in scan}
+        found = [(fact_id, trust, [t for t in scan if t.found_in(a)]) for fact_id, trust, a in texts]
+        df = {t: sum(t in hit for _, _, hit in found) for t in scan}
         weight = {t: math.log(1.0 + len(texts) / df[t]) for t in scan if df[t]}
         total = sum(weight.values()) or 1.0
-        ranked = sorted(((sum(weight[t] for t in hit) / total, fact_id) for fact_id, hit in found if hit), reverse=True)[:limit]
-        rank = {fact_id: score for score, fact_id in ranked}
-        rows = self._rows([fact_id for _, fact_id in ranked])
+        # ties: the more trusted fact, then the newer one
+        ranked = sorted(((sum(weight[t] for t in hit) / total, trust, fact_id) for fact_id, trust, hit in found if hit),
+                        reverse=True)[:limit]
+        rank = {fact_id: score for score, _, fact_id in ranked}
+        rows = [f for f in self._rows([fact_id for _, _, fact_id in ranked], category, min_trust)
+                if self._contains_a_term(scan, f)]
         for fact in rows:
             fact["fts_rank"] = rank[fact["fact_id"]]
         return rows
@@ -207,9 +232,12 @@ class FactRetriever:
             if not terms:
                 return []
             required += terms
-        if required:
-            lexical = self._rows([fact_id for fact_id, a in self._texts(category, min_trust)
-                                  if all(t.found_in(a) for t in required)][-500:])
+        if required:  # every constraint first, then the 500 most trusted (newest on ties)
+            allowed = {f["fact_id"] for f in self._linked_facts(known, category, min_trust, 10_000)} if known else None
+            hits = sorted(((trust, fact_id) for fact_id, trust, a in self._texts(category, min_trust)
+                           if (allowed is None or fact_id in allowed) and all(t.found_in(a) for t in required)),
+                          reverse=True)[:500]
+            lexical = self._rows([fact_id for _, fact_id in hits], category, min_trust)
         elif known:
             lexical = self._linked_facts(known, category, min_trust, 500)
         else:
@@ -338,7 +366,7 @@ class FactRetriever:
         tanks recall on prose: informative terms only (English and Russian stopwords dropped), each as its exact
         word OR its stem as a prefix ("маши" -> ("маши" OR "маш"*)), FTS5 operator characters inside a token
         turned into a phrase ("pve-01" -> "pve 01"). Nothing left -> "" (no search, never a raw MATCH)."""
-        return " OR ".join(term.fts(_FTS_OPERATORS) for term in query_terms(query or "") if not term.scan)
+        return " OR ".join(term.fts(_FTS_OPERATORS) for term in query_terms(query or "") if term.fts_ok)
 
     # -- prefetch relevance --------------------------------------------------------------------------------------
 
@@ -371,15 +399,19 @@ class FactRetriever:
                 if gram_coverage(grams, text) >= min_coverage or char_cov >= max(0.5, min_coverage):
                     gram_kept.append(f)
         terms = [t for t in query_terms(_RE_UNSEGMENTED.sub(" ", query or "")) if t.word]
+        identifiers = [t for t in terms if t.identifier]
+        if identifiers:  # "hr-ovh" inside Chinese text: the character overlap must not stand in for the host
+            gram_kept = [f for f in gram_kept
+                         if any(t.found_in(analyze(f'{f.get("content", "")} {f.get("tags") or ""}')) for t in identifiers)]
         if not terms or not candidates:
             return gram_kept
         total_facts = max(self.store.count_facts(), 1)
-        scan = [t for t in terms if t.scan]
+        scan = self._scan_terms(terms)
         texts = self._texts() if scan else []
-        scan_df = {t: sum(1 for _, a in texts if t.found_in(a)) for t in scan}
+        scan_df = {t: sum(1 for _, _, a in texts if t.found_in(a)) for t in scan}
         weights, unknown = {}, []
         for term in terms:
-            df = scan_df[term] if term.scan else self._doc_freq(term)
+            df = scan_df[term] if term in scan_df else self._doc_freq(term)
             if df:
                 weights[term] = math.log(1.0 + total_facts / df)
             else:
@@ -390,7 +422,6 @@ class FactRetriever:
         # most common known word, so "do submarines deploy on Jupiter?" is not "about" a fact that mentions deploy.
         total = sum(weights.values()) + len(unknown) * min(weights.values())
         kept = []
-        identifiers = [t for t in terms if t.identifier]
         for fact in candidates:
             analysis = analyze(f'{fact.get("content", "")} {fact.get("tags") or ""}')
             if identifiers and not any(t.found_in(analysis) for t in identifiers):
@@ -426,7 +457,7 @@ class FactRetriever:
         """(the claim without the entity names, negators and function words, negated?). Words compare by their keys
         (word and stems); unsegmented text (Chinese, Thai) by its characters, which is what a short claim shares with
         a contradicting one."""
-        claim, negated = [], False
+        claim, negated, contrast = [], False, False
         for word in analyze(text).words:
             w = word.text
             if w in entity_words:
@@ -437,12 +468,14 @@ class FactRetriever:
                         w = w.replace(name, " ")
                 for ch in w:
                     if ch in CJK_NEGATORS:
-                        negated = True
+                        negated = negated or not contrast
                     elif ch.isalnum():
                         claim.append(frozenset({ch}))
+            elif w in CONTRASTIVE:  # "likes cats but not dogs": the negation is another clause's
+                contrast = True
             elif w in NEGATORS:
-                negated = True
-            elif not word.stop:
+                negated = negated or not contrast
+            elif not word.stop or w in CLAIM_WORDS:  # "with" / "without" sugar is the claim
                 claim.append(word.keys)
         return tuple(dict.fromkeys(claim)), negated
 
@@ -493,12 +526,11 @@ class FactRetriever:
             shared = own_entities & other_entities
             other_words = {w for e in other_entities for w in words(entity_names.get(e, ""))}
             other_claim = self._claim(other["content"], other_words)
-            if overlap >= 0.7 and own_claim[1] == other_claim[1]:  # same polarity: a near-duplicate, not a conflict
-                similar.append(entry)
-                continue
             score = self._conflicting(own_claim, other_claim)
             if (shared and score >= 0.3) or (not own_entities and not other_entities and score >= 0.5):
-                conflicts.append(entry)
+                conflicts.append(entry)  # before duplicates: "budget is 500" / "budget is 600" is an update
+            elif overlap >= 0.7 and own_claim[1] == other_claim[1]:
+                similar.append(entry)
         by_overlap = lambda xs: sorted(xs, key=lambda e: e["word_overlap"], reverse=True)[:limit]  # noqa: E731
         return {"similar": by_overlap(similar), "possible_conflicts": by_overlap(conflicts)}
 

@@ -36,12 +36,25 @@ directory name must be a valid Python identifier (CI uses `plugin`): pytest impo
 CI runs the suite on Linux, macOS and Windows against hermes-agent `main`, and `hermes plugins validate
 --install-deps`, the catalog's admission check.
 
+## Languages
+
+`text.py` holds everything per language: function words (`STOP`), stemmer choice (`_STEMMERS`, `_DEFAULT_LANG`,
+`_SCRIPT_LANGS`), greetings, negators, claim words, folding (`_FOLD`). To add a language: its function words (they
+also decide which Latin language a text is), its stemmer, greetings and negators; then a main set and an unseen set in
+`tests/test_holographic_languages.py` style, measured before the change. Arabic, Indic scripts and Indonesian go
+through the word scan in `retrieval.py` (`_texts`, `_scan_candidates`), not FTS5; keep that in mind for any script
+whose words FTS5 splits or whose inflection is a prefix. The README "Languages" section states how every number was
+obtained; keep it that way.
+
 ## Open work
 
 - Unsegmented scripts use a substring scan of character n-grams; an FTS5 trigram index would scale further but needs
   a sync story for older versions writing the file (no triggers: they would fail on SQLite builds without trigram).
   Not needed at this store's size; revisit if stores grow past ~50k facts.
 - Paraphrase recall (no shared words) needs embeddings; deliberately out of scope (no network, no model).
+- The word scan reads every row on each scan; past ~20k facts a persisted key index (with a reconciliation story for
+  older versions writing the file) would be the next step. Host names in Spanish/French/Portuguese/Indonesian
+  questions are not enforced as identifiers (compound words win there).
 - Upstream PRs to the bundled copy that were never merged and are worth reviewing here: hermes-agent#133389
   (retrieval contract tests), #123599 (setup offers saved config).
 

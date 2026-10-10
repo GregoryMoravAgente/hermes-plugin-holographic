@@ -5,29 +5,46 @@
 Seven more languages: Spanish, Hindi, Arabic, French, Bengali, Portuguese, Indonesian (the most spoken after English,
 Chinese and Russian). Measured on the same kind of stores as 0.4.2 (README, "Languages"): before, Arabic recalled the
 right fact before the turn for 50 % of questions, French 75 %, Spanish 85 %, and chit-chat recalled facts in four
-languages; now 100 % on the main sets, 100 % found and recalled on unseen sets.
+languages; now 100 % on the main sets, and the right fact is found and recalled for every question of the unseen sets.
+Reviewed before release by Codex CLI; its findings are fixed below, each with a test.
 
 ### Added
 
 - **Stems per language**: Snowball for Spanish, French, Portuguese, Indonesian and Hindi (Latin words were all stemmed
-  as English); Arabic light10 with Snowball's Arabic and a variant without a glued preposition; a light Bengali suffix
-  stripper. The language of Latin text is told by its function words; text with none gets all five Latin stems.
-- **Function words per language** (ten lists): a Spanish or Hindi "thanks" recalls nothing, and a word is dropped only
-  as a function word of the text's own language.
-- **Arabic, Indic scripts and Indonesian are matched word by word** against the facts' text: the FTS5 index splits
-  Devanagari and Bengali words into letters and cannot see past Arabic (`ال`, `ل`, `بال`) or Indonesian (`me-`,
-  `di-`) prefixes. About 0.04 s per search at 5,000 facts; facts are re-read only when their text changed.
-- **Folding**: Latin accents, Arabic vowel marks and letter variants (`أ` = `ا`, `ة` = `ه`), the Indic nukta, native
-  digits (searched in each digit system too, so `2027` finds `২০২৭`).
-- **Tokens**: Unicode punctuation stripped (`¿`, `؟`, `।`); French elision (`d'Eva`) and inversion (`prend-il`);
-  reduplication (`anak-anak`); a hyphen between scripts splits (`hr-ovh-এর`). A hyphen alone no longer makes an
-  identifier, so `prend-il` or `sexta-feira` is not required to match exactly.
+  as English), with the Portuguese `-ões` and Spanish `-ces` plurals Snowball keeps apart; Arabic light10 with
+  Snowball's Arabic and the word without a glued conjunction/preposition before an alef; a light Bengali suffix
+  stripper that leaves at least three letters. The language of Latin text is told by its function words; text with
+  none gets all five Latin stems.
+- **Function words per language** (ten lists): a Spanish or Hindi "thanks" recalls nothing. A word is dropped only as a
+  function word of the language the other words show (or, in a sentence of four words or more, it alone shows); with
+  no other evidence the English list applies, so "son" or "bisa" alone stays a search word.
+- **Arabic, Indic scripts and Indonesian are also matched word by word** against the facts' text (Latin words of a
+  question of undetermined language too, if the store holds Indonesian facts): the FTS5 index splits Devanagari and
+  Bengali words into letters and cannot see past Arabic (`ال`, `ل`, `بال`) or Indonesian (`me-`, `di-`) prefixes. FTS
+  still ranks what it finds; the scan fills in. Rows are read on every scan, a fact is analysed again only when its
+  text changed: 0.03–0.07 s per search at 5,000 facts, after a first scan that analyses every fact (about 1 s at
+  5,000, 4–6 s at 20,000). A store without such facts never scans.
+- **Folding**: Latin accents and ligatures, Arabic vowel marks and letter variants (`أ` = `ا`, `ة` = `ه`), the Indic
+  nukta, native digits (searched in each digit system too, inside identifiers as well: `2027` finds `২০২৭`, `HR24`
+  finds `HR২৪`). Control characters never reach an FTS5 expression.
+- **Tokens**: Unicode punctuation stripped (`¿`, `؟`, `।`); French elision (`d'Eva`) and, in French text, inversion
+  (`prend-il`, `est-ce`, but not `rendez-vous`); Portuguese enclisis in Portuguese text; reduplication (`anak-anak`); a
+  hyphen between scripts splits (`hr-ovh-এর`). Letters-only hyphenated tokens stay identifiers in English text and
+  text of no determined language (`hr-ovh`, also inside Chinese text); in Spanish, French, Portuguese and Indonesian
+  text they are compound words.
 - **Greetings** in the seven languages; negators (`no`, `pas`, `não`, `tidak`, `لا`, `नहीं`, `না`).
 
 ### Changed
 
-- Possible conflicts compare claims by word keys without function words, so "Ana come carne todos los días" and "Ana
-  no come carne" are flagged, as are claims whose texts were told apart as different languages.
+- Latin-script entity names are matched as written (or with `'s`): `Jean` is not mentioned by `jeans`, `Rose` not by
+  `roses`. Names in other scripts still match their inflections.
+- A long Latin stem reaches the words that extend it (`allergi` → `allergic`, as the FTS prefix does); the looser
+  "shared beginning" rule of 0.4.2 now applies to Russian only, so `contract` no longer matches `contrast`.
+- Possible conflicts compare claims by word keys without function words, keeping "with" / "without" and their
+  equivalents; a negation after "but" belongs to another clause; a conflict is reported before a near-duplicate ("the
+  budget is 500" / "600" is an update). "Ana come carne todos los días" / "Ana no come carne" is flagged.
+- `reason()` applies every constraint before its cap of 500 and keeps the most trusted; scan candidates are cut by
+  coverage, then trust, then age, and re-checked against the row as read.
 - Facts of a named entity come back newest first when their timestamps tie (were in arbitrary order; the second-set
   numbers published with 0.4.2 were partly that luck and are corrected in the README).
 

@@ -187,7 +187,7 @@ def test_fts_failure_is_logged_not_silent(store, caplog):
     store.add_fact("Alice Smith lives in Paris")
     store._write("DROP TABLE facts_fts")  # a damaged index
     with caplog.at_level(logging.WARNING):
-        assert FactRetriever(store, hrr_dim=DIM).search("Paris") == []
+        FactRetriever(store, hrr_dim=DIM).search("Paris")  # 0.5.0: a one-word query is also matched word by word
     assert any("FTS5 search failed" in r.getMessage() for r in caplog.records)
 
 

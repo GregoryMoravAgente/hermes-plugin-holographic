@@ -62,6 +62,7 @@ _SCRIPT_LANGS = {"cyrillic": ("ru",), "arabic": ("ar",), "devanagari": ("hi",), 
 LATIN = ("en", "es", "fr", "pt", "id")
 
 _FOLD = str.maketrans({
+    "œ": "oe", "æ": "ae",  # Latin ligatures ("cœur" = "coeur")
     **{c: "ا" for c in "أإآٱ"}, "ى": "ي", "ة": "ه", "ـ": None,  # Arabic letter variants, tatweel
     **{chr(c): None for c in range(0x64B, 0x660)}, "ٰ": None,  # Arabic vowel marks
     "़": None, "ँ": "ं",  # Devanagari nukta; candrabindu written as anusvara
@@ -134,12 +135,12 @@ STOP = {
     você vocês ele ela eles elas nós me te lhe lhes meu minha meus minhas teu tua seu sua seus suas nosso nossa este
     esta estes estas esse essa esses essas isto isso aquilo aquele aquela já também só muito é são era eram foi ser sou
     somos está estão estou estava estar tem têm tenho tinha ter vai vou vamos há pode posso podem poder devo deve devem
-    algum alguma alguns algumas nenhum nenhuma cada outro outra gente ok obrigado obrigada oi olá sim beleza valeu"""),
+    algum alguma alguns algumas nenhum nenhuma cada outro outra ok obrigado obrigada oi olá sim valeu"""),
 "id": _folded("""
     yang dan di ke dari ini itu dengan untuk tidak tak ada akan juga atau pada adalah ialah saya aku kamu engkau dia ia
     mereka kita kami anda sudah telah belum bisa dapat harus sedang masih lebih sangat apa siapa kapan mana bagaimana
     mengapa kenapa berapa apakah yaitu yakni oleh karena jika kalau agar supaya tetapi tapi namun hanya saja pun lagi
-    para sebuah seorang setiap tiap semua banyak sedikit nya ya oke ok terima kasih makasih halo hai sip seperti
+    para sebuah seorang setiap tiap semua banyak sedikit nya ya oke ok makasih halo hai sip seperti
     sebaiknya punya mau ingin boleh perlu nih dong kok sih deh"""),
 "ar": _folded("""
     في من إلى الى على عن عمن مع هذا هذه ذلك تلك هؤلاء هو هي هم هن هما أنا نحن أنت أنتم كان كانت يكون تكون كانوا ما
@@ -164,6 +165,12 @@ NEGATORS = _folded("""not no never nobody nothing cannot don't doesn't didn't is
     couldn't shouldn't haven't hasn't dont doesnt didnt isnt cant wont не нет никогда ни nunca jamás tampoco nadie
     ningún ninguna ninguno ne pas jamais aucun aucune non não nem nenhum nenhuma tidak tak bukan belum jangan لا لم لن
     ليس ليست नहीं न मत না নয় নেই নি""")
+
+
+# Function words a claim still needs ("with sugar" / "without sugar"), and conjunctions after which a negation belongs
+# to another clause ("likes cats but not dogs").
+CLAIM_WORDS = _folded("with without avec sans con sin com sem dengan tanpa مع بدون साथ बिना সাথে ছাড়া с без")
+CONTRASTIVE = _folded("but however pero sino mais mas porém tapi tetapi namun لكن बल्कि लेकिन किंतु কিন্তু но")
 
 
 def _greeting_key(text: str) -> str:
@@ -195,9 +202,12 @@ def is_greeting(text: str) -> bool:
 
 
 def is_identifier(token: str) -> bool:
-    """'pve-01', 'v0.21.6', 'gpt-4o', 'host:22', '/etc/hosts': kept exact, never stemmed or dropped. A hyphen alone
-    does not make one: "prend-il", "anak-anak" and "sexta-feira" are words."""
-    return any(c.isdigit() for c in token) or (len(token) > 2 and any(c in token for c in "._:/"))
+    """'pve-01', 'v0.21.6', 'gpt-4o', 'host:22', '/etc/hosts', 'hr-ovh': kept exact, never stemmed or dropped, and a
+    message naming one is about that one. A hyphenated word with a letter outside ASCII is a word ("кто-то",
+    "peut-être"), and so is any letters-only hyphenated word in Spanish, French, Portuguese or Indonesian text (see
+    analyze); French inversion, Portuguese enclisis and reduplication are taken apart before this is asked."""
+    return any(c.isdigit() for c in token) or (len(token) > 2 and (
+        any(c in token for c in "._:/") or ("-" in token and token.isascii())))
 
 
 # -- stemming ------------------------------------------------------------------------------------------------------
@@ -220,8 +230,9 @@ def _arabic_light(word: str) -> str:
 
 
 # Bengali: Snowball has no stemmer; one inflectional suffix (case, plural, classifier, common verb endings) is
-# stripped, longest first, leaving at least two characters. Over-stripping a bare word ("শুক্রবার" -> "শুক্রবা") is
-# harmless because a word also matches by its unstripped form.
+# stripped, longest first, leaving at least three characters (so "মাটি", soil, does not become "মা", mother). A bare
+# word that loses a letter it does not inflect with ("শুক্রবার" -> "শুক্রবা") still meets its inflected forms through
+# its unstripped form.
 _BN_SUFFIXES = sorted({fold(unicodedata.normalize("NFC", s)) for s in """
     গুলোকে গুলোতে গুলোর গুলো গুলিকে গুলিতে গুলির গুলি দেরকে দের েরা রা টাকে টিকে টাতে টিতে টার টির টা টি খানা খানি
     য়েরা য়ের য়ে য় ের কে তে েতে র ে এর এ চ্ছিলাম চ্ছিলেন চ্ছিল চ্ছেন চ্ছিস চ্ছি চ্ছে ছিলাম ছিলেন ছিল ছেন ছিস ছি ছে
@@ -230,7 +241,7 @@ _BN_SUFFIXES = sorted({fold(unicodedata.normalize("NFC", s)) for s in """
 
 def _bengali_stem(word: str) -> str:
     for suffix in _BN_SUFFIXES:
-        if word.endswith(suffix) and len(word) - len(suffix) >= 2:
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
             return word[:-len(suffix)]
     return word
 
@@ -253,16 +264,25 @@ def stem(word: str, lang: str | None = None) -> str:
     return fold(stemmer.stemWord(word)) if stemmer else word
 
 
+# A conjunction (و ف) and/or a preposition (ب ك ل) glued to a word that starts with alef, as names and the article
+# do: "لإيفا" is "for Eva", "ولإيفا" "and for Eva". A lexical first letter ("كتاب") is left alone.
+_AR_CLITICS = re.compile(r"^[وف]?[بكل]?(?=ا)")
+
+
 @lru_cache(maxsize=65536)
 def _keys(word: str, langs: tuple[str, ...]) -> frozenset:
     keys = {word, *(stem(word, lang) for lang in langs)}
     if "ar" in langs:
         if "ar" in _STEMMERS:
             keys.add(fold(_STEMMERS["ar"].stemWord(word)))
-        # a one-letter conjunction or preposition (و ف ب ك ل) before a name or a short word: "لإيفا" is "for Eva"
-        if word[0] in "وفبكل" and len(word) >= 4:
-            bare = word[1:]
-            keys |= {bare, _arabic_light(bare)}
+        match = _AR_CLITICS.match(word)
+        cut = match.end() if match else 0
+        if cut and len(word) - cut >= 3:
+            keys |= {word[cut:], _arabic_light(word[cut:])}
+    if "pt" in langs and word.endswith("oes") and len(word) > 4:  # ação / ações: Snowball keeps -ão and -ões apart
+        keys.add(stem(word[:-3] + "ao", "pt"))
+    if "es" in langs and word.endswith("ces") and len(word) > 4:  # lápiz / lápices, vez / veces
+        keys.add(stem(word[:-3] + "z", "es"))
     return frozenset(keys)
 
 
@@ -270,8 +290,12 @@ def _keys(word: str, langs: tuple[str, ...]) -> frozenset:
 
 # French/Italian elision: "d'Eva", "l'offre", "qu'on" are Eva, offre, on.
 _ELISION = re.compile(r"^(?:l|d|j|m|n|s|t|c|qu|jusqu|lorsqu|puisqu|quoiqu|dell|all|nell|sull|dall|un)'(?=[^\W\d_])")
-# French pronouns after an inverted verb: "prend-il", "a-t-elle", "est-ce", "vas-y".
-_CLITICS = frozenset("je tu il elle on nous vous ils elles ce moi toi lui leur le la les y en".split())
+# Pronouns after the verb, taken off only in text of that language: French inversion ("prend-il", "a-t-elle",
+# "est-ce", "vas-y"; not the noun "rendez-vous") and Portuguese enclisis ("chama-se", "lembra-me").
+_FR_CLITICS = frozenset("je tu il elle on nous vous ils elles ce moi toi lui leur le la les y en".split())
+_FR_COMPOUNDS = frozenset({"rendez-vous"})
+_PT_CLITICS = frozenset("se me te lhe lhes nos vos o a os as lo la los las no na nas".split())
+_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
 
 def _edge(c: str) -> bool:
@@ -287,12 +311,11 @@ def _strip_edges(token: str) -> str:
     return token[i:j]
 
 
-def _split_word(token: str) -> list[tuple[str, bool]]:
-    """(word, bag-only) pieces of a hyphenated token: split where the script changes ("hr-ovh-এর" is hr-ovh + এর,
-    "IT-тусовка" is it + тусовка); reduplication is the word ("anak-anak"); French inversion loses its pronoun
-    ("prend-il"); other hyphenated words stay whole and lend their parts to containment checks ("sextas-feiras")."""
+def _script_split(token: str) -> list[str]:
+    """A hyphenated token split where the script changes: "hr-ovh-এর" is hr-ovh + এর, "IT-тусовка" is it +
+    тусовка, "03:00-এ" is 03:00 + এ (digits and symbols go with Latin)."""
     if "-" not in token or UNSEGMENTED.search(token):
-        return [(token, False)]
+        return [token]
     groups: list[list] = []
     for part in token.split("-"):
         script = word_script(part)
@@ -301,23 +324,32 @@ def _split_word(token: str) -> list[tuple[str, bool]]:
             groups[-1][1].append(part)
         else:
             groups.append([script, [part]])
-    out = []
-    for _, parts in groups:
-        original = "-".join(parts)
-        kept = parts
-        if len(parts) > 1 and not is_identifier(original) and all(parts):
-            if len(set(parts)) == 1:
-                kept = parts[:1]
-            else:
-                while len(kept) > 1 and kept[-1] in _CLITICS:
-                    kept = kept[:-1]
-                if len(kept) > 1 and kept[-1] == "t":
-                    kept = kept[:-1]
-        whole = "-".join(kept)
-        out.append((whole, False))
-        if "-" in original and not is_identifier(original):  # the whole and its parts, for containment
-            out += [(original, True)] * (original != whole) + [(p, True) for p in parts if p]
-    return out
+    return ["-".join(parts) for _, parts in groups]
+
+
+def _letters_only(group: str) -> bool:
+    return not any(c.isdigit() or c in "._:/" for c in group)
+
+
+def _resolve_hyphen(group: str, langs: tuple, determined: bool) -> tuple[str, list[str]]:
+    """(the word, extra bag entries) of a hyphenated word: reduplication is the word ("anak-anak"); a French or
+    Portuguese verb loses its pronoun in text of that language; the whole and its parts stay available to
+    containment checks ("sextas-feiras" contains "sextas")."""
+    parts = group.split("-")
+    if len(parts) < 2 or not all(parts) or not _letters_only(group):
+        return group, []
+    kept = parts
+    if len(set(parts)) == 1:
+        kept = parts[:1]
+    elif determined and "fr" in langs and group not in _FR_COMPOUNDS:
+        while len(kept) > 1 and kept[-1] in _FR_CLITICS:
+            kept = kept[:-1]
+        if len(kept) > 1 and kept[-1] == "t":
+            kept = kept[:-1]
+    elif determined and "pt" in langs:
+        while len(kept) > 1 and kept[-1] in _PT_CLITICS:
+            kept = kept[:-1]
+    return "-".join(kept), [group] * (len(kept) != len(parts)) + parts
 
 
 @dataclass(frozen=True)
@@ -327,7 +359,8 @@ class Word:
     keys: frozenset  # the word and its stems
     stop: bool
     identifier: bool
-    scan: bool  # the FTS5 index cannot find its other forms (see _SCAN_SCRIPTS; Indonesian prefixes)
+    scan: bool  # matched against the facts' text: the FTS5 index cannot find its other forms
+    fts: bool = True  # the FTS5 index can find the word itself (not Arabic or Indic script)
 
 
 @dataclass(frozen=True)
@@ -339,49 +372,73 @@ class Analysis:
     langs: tuple  # languages of the Latin words (all five when undetermined)
 
 
-def _latin_langs(words: list[str]) -> tuple[tuple[str, ...], bool]:
-    """Languages of the Latin words by their function words; ties keep every tied language; none found: all five."""
-    votes = {lang: sum(w in STOP[lang] for w in words) for lang in LATIN}
-    best = max(votes.values())
-    return (tuple(lang for lang in LATIN if votes[lang] == best), True) if best else (LATIN, False)
+def _stop(word: str, script: str, votes: dict, sentence: bool) -> bool:
+    """A function word of the text's language. For Latin script that language is told by the other words: "son" in
+    "where does my son study" is a word, in "il boit son café" French "his". A word that is the only evidence decides
+    only in a sentence ("Ana come carne todos los días"), not in a short message ("son", "bisa"): there, with no other
+    evidence, the English list applies, as it did to all Latin text before 0.5.0."""
+    if script != "latin":
+        return any(word in STOP[lang] for lang in _SCRIPT_LANGS.get(script, ()))
+    others = {lang: votes[lang] - (word in STOP[lang]) for lang in LATIN}
+    best = max(others.values())
+    if best:
+        return any(word in STOP[lang] for lang in LATIN if others[lang] == best)
+    if sentence:
+        return any(word in STOP[lang] for lang in LATIN if votes[lang])
+    return word in STOP["en"]
 
 
 @lru_cache(maxsize=1024)
 def analyze(text: str) -> Analysis:
-    lowered = unicodedata.normalize("NFC", text or "").lower().replace("’", "'")
-    pieces = []
+    lowered = _CONTROL.sub(" ", unicodedata.normalize("NFC", text or "")).lower().replace("’", "'")
+    groups = []
     for token in lowered.split():
         token = _ELISION.sub("", _strip_edges(token))
-        for piece, part in _split_word(token) if token else ():
-            piece = fold(_strip_edges(piece))
-            if piece:
-                pieces.append((piece, part))
-    latin_words = [p for p, part in pieces if not part and word_script(p) == "latin" and not is_identifier(p)]
-    latin, determined = _latin_langs(latin_words)
+        groups += [g for g in (_strip_edges(g) for g in _script_split(token)) if g] if token else []
+    # Latin language by function words (ties keep every tied language; none found: all five). A hyphenated word votes
+    # with its first part only: "est-ce" is French by "est", "carry-on" is not French by "on".
+    latin = [fold(g.split("-")[0]) for g in groups if word_script(g) == "latin" and _letters_only(g) and g.split("-")[0]]
+    votes = {lang: sum(w in STOP[lang] for w in latin) for lang in LATIN}
+    best = max(votes.values())
+    langs, determined = (tuple(lang for lang in LATIN if votes[lang] == best), True) if best else (LATIN, False)
+    # Spanish, French, Portuguese and Indonesian write compound words with a hyphen; English text and text of no
+    # determined language keep letters-only hyphenated tokens as identifiers ("hr-ovh")
+    compounds = determined and "en" not in langs
     words, bag, keys = [], set(), set()
-    for piece, part in pieces:
-        script, ident = word_script(piece), is_identifier(piece)
-        langs = () if ident or UNSEGMENTED.search(piece) else latin if script == "latin" else _SCRIPT_LANGS.get(script, ())
-        word_keys = _keys(piece, langs) if langs else frozenset({piece})
-        bag.add(piece)
+    for group in groups:
+        raw, extra = _resolve_hyphen(group, langs, determined) if "-" in group else (group, [])
+        word, script, ident = fold(raw), word_script(raw), is_identifier(raw)
+        if ident and compounds and "-" in raw and _letters_only(raw):
+            ident = False  # "week-end", "sexta-feira", "rendez-vous": a compound word, not a host name
+        unsegmented = UNSEGMENTED.search(raw) is not None
+        word_langs = () if ident or unsegmented else langs if script == "latin" else _SCRIPT_LANGS.get(script, ())
+        word_keys = _keys(word, word_langs) if word_langs else frozenset({word})
+        bag.add(word)
         keys |= word_keys
-        if not part:
-            words.append(Word(
-                text=piece, stem=stem(piece, langs[0]) if langs else piece, keys=word_keys,
-                stop=not ident and any(piece in STOP[lang] for lang in langs), identifier=ident,
-                scan=script in _SCAN_SCRIPTS or (script == "latin" and determined and "id" in langs)))
-    return Analysis(tuple(words), frozenset(bag), frozenset(keys), _fold_text(lowered), latin)
+        for piece in (fold(e) for e in extra):  # the whole and the parts of a hyphenated word, for containment
+            bag.add(piece)
+            keys |= _keys(piece, word_langs) if word_langs and _letters_only(piece) else {piece}
+        words.append(Word(
+            text=word, stem=stem(word, word_langs[0]) if word_langs else word, keys=word_keys,
+            stop=not ident and not unsegmented and _stop(word, script, votes, len(latin) >= 4), identifier=ident,
+            # Indonesian prefixes (me-, di-, ber-) hide a word from a prefix query; text of undetermined language
+            # might be Indonesian
+            scan=script in _SCAN_SCRIPTS or (script == "latin" and "id" in word_langs),
+            fts=script not in _SCAN_SCRIPTS))
+    return Analysis(tuple(words), frozenset(bag), frozenset(keys), _fold_text(lowered), langs)
 
 
-def name_keys(name: str) -> tuple[frozenset, ...]:
-    """Keys of each word of an entity name under every language of its script: a name is matched in a message of any
-    of them."""
+def name_keys(name: str) -> tuple[tuple[frozenset, bool], ...]:
+    """(forms, exact?) of each word of an entity name. Latin-script names are not inflected, so they match only
+    themselves (and the English possessive): "Jean" is not mentioned by "jeans", "Rose" not by "roses". Names in
+    other scripts match by their keys, which carry their inflections ("Маши" mentions "Маша", "لإيفا" "إيفا")."""
     out = []
     for word in analyze(name).words:
         script = word_script(word.text)
-        langs = () if word.identifier or UNSEGMENTED.search(word.text) else \
-            LATIN if script == "latin" else _SCRIPT_LANGS.get(script, ())
-        out.append(_keys(word.text, langs) if langs else frozenset({word.text}))
+        if script in _SCRIPT_LANGS and not word.identifier and not UNSEGMENTED.search(word.text):
+            out.append((_keys(word.text, _SCRIPT_LANGS[script]), False))
+        else:
+            out.append((frozenset({word.text, word.text + "'s"}), True))
     return tuple(out)
 
 
@@ -512,12 +569,14 @@ class Term:
     tokens: tuple[str, ...] = ()
     keys: frozenset = frozenset()
     scan: bool = False
+    fts_ok: bool = True
 
     @property
     def loose(self) -> str:
-        """A shorter shared beginning for long words, so derivations Snowball keeps apart still meet
-        ("переезжаем" / "переезд" share "переез"); "" for short words and identifiers."""
-        if self.identifier or len(self.tokens) != 1 or len(self.stem) < _LOOSE_FROM:
+        """A shorter shared beginning for long Russian words, so derivations Snowball keeps apart still meet
+        ("переезжаем" / "переезд" share "переез"); "" for other words (in English "contra" would join "contract" and
+        "contrast"), short words and identifiers."""
+        if self.identifier or len(self.tokens) != 1 or len(self.stem) < _LOOSE_FROM or word_script(self.word) != "cyrillic":
             return ""
         return self.stem[:max(_LOOSE_MIN, len(self.stem) - 2)]
 
@@ -527,10 +586,9 @@ class Term:
         tokens = self.tokens or tuple(self.word.translate(FTS_OPERATORS).split())
         exact = '"' + " ".join(tokens) + '"'
         if self.identifier or len(tokens) != 1 or tokens[0] != self.word:
-            if not any(t.isascii() and t.isdigit() for t in tokens):
+            if not any("0" <= c <= "9" for t in tokens for c in t):
                 return exact
-            native = ['"' + " ".join(t.translate(d) if t.isascii() and t.isdigit() else t for t in tokens) + '"'
-                      for d in _NATIVE_DIGITS]
+            native = ['"' + " ".join(t.translate(d) for t in tokens) + '"' for d in _NATIVE_DIGITS]
             return "(" + " OR ".join([exact, *native]) + ")"
         prefixes = sorted(k for k in (self.keys or {self.stem}) | ({self.loose} if self.loose else set())
                           if len(k) >= _MIN_STEM and k.translate(FTS_OPERATORS) == k and k.split() == [k])
@@ -544,6 +602,14 @@ class Term:
         edge = r"A-Za-z0-9_\-" if self.word.isascii() else r"\w\-"
         return re.compile(rf"(?<![{edge}])" + re.escape(self.word) + rf"(?![{edge}])")
 
+    @cached_property
+    def _prefix_keys(self) -> tuple:
+        """Latin: keys of six letters or more that a word of the fact may extend ("allergi" reaches "allergic", as
+        the FTS prefix query does); a whole stem, so "contract" does not reach "contrast"."""
+        if self.identifier or len(self.tokens) != 1 or word_script(self.word) != "latin":
+            return ()
+        return tuple(k for k in self.keys if len(k) >= 6)
+
     def found_in(self, fact: Analysis) -> bool:
         """Does a fact contain this term: the same word, a shared key (word or stem), the loose beginning, or (for
         identifiers and multi-token words) the same token run with word boundaries, so "pve-01" does not match
@@ -553,6 +619,8 @@ class Term:
         if not self.identifier and len(self.tokens) <= 1 and not self.keys.isdisjoint(fact.keys):
             return True
         if self.loose and self.loose in fact.text and any(w.startswith(self.loose) for w in fact.bag):
+            return True
+        if self._prefix_keys and any(k in fact.text for k in self._prefix_keys) and                 any(f.startswith(k) for k in self._prefix_keys for f in fact.keys):
             return True
         return self.word in fact.text and self._bounded.search(fact.text) is not None
 
@@ -570,5 +638,5 @@ def query_terms(text: str) -> list[Term]:
         key = w.stem if single else w.text
         if key not in seen:
             seen.add(key)
-            terms.append(Term(w.text, key, w.identifier, tokens, w.keys if single else frozenset({w.text}), w.scan))
+            terms.append(Term(w.text, key, w.identifier, tokens, w.keys if single else frozenset({w.text}), w.scan, w.fts))
     return terms
