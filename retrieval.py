@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from .store import MemoryStore
 
 from . import holographic as hrr
-from .text import content_stems, query_terms, stems, words
+from .text import NEGATORS, content_stems, query_terms, stems, words
 
 logger = logging.getLogger(__name__)
 
@@ -81,11 +81,23 @@ class FactRetriever:
     def search(self, query: str, category: str | None = None, min_trust: float = 0.3, limit: int = 10) -> list[dict]:
         """FTS5 candidates (limit*3) → Jaccard + HRR rerank → trust weighting → optional temporal decay
         0.5^(age_days / half_life). Returns fact dicts with 'score', sorted desc."""
-        candidates = {f["fact_id"]: f for f in self._fts_candidates(query, category, min_trust, limit * 3)}
+        terms = query_terms(query or "")
+        candidates = {f["fact_id"]: f for f in self._fts_candidates(query, category, min_trust, limit * 3)
+                      if self._contains_a_term(terms, f)}
         for fact in self._ngram_candidates(query, category, min_trust, limit * 3):
             if fact["fact_id"] not in candidates or candidates[fact["fact_id"]].get("fts_rank", 0) < fact["fts_rank"]:
                 candidates[fact["fact_id"]] = fact
         return self._rerank(query, list(candidates.values()), limit)
+
+    @staticmethod
+    def _contains_a_term(terms, fact: dict) -> bool:
+        """A stem prefix ("walk"*) also matches other words ("walker"): keep a candidate only when it really contains
+        a query term (same word, same stem, or the same identifier with word boundaries)."""
+        if not terms:
+            return True
+        text = f'{fact.get("content", "")} {fact.get("tags") or ""}'.lower()
+        fact_words, fact_stems = set(words(text)), stems(text)
+        return any(t.found_in(fact_words, fact_stems, text) for t in terms)
 
     def _ngram_candidates(self, query: str, category: str | None, min_trust: float, limit: int) -> list[dict]:
         """Facts sharing character n-grams with the query's unsegmented runs, ranked by the share of n-grams they
@@ -156,10 +168,16 @@ class FactRetriever:
         groups = [self.store.entity_ids(name) for name in names]
         if all(groups):
             return self._linked_facts(groups, category, min_trust, limit)
-        phrases = [self._fts_phrase(name) for name in names]
+        unknown = [name for name, ids in zip(names, groups) if not ids]
+        phrases = [self._fts_phrase(name) for name in unknown]
         if not all(phrases):
             return []
-        return self._rerank(" ".join(names), self._fts_query(" AND ".join(phrases), category, min_trust, limit * 3), limit)
+        known = [ids for ids in groups if ids]
+        lexical = self._fts_query(" AND ".join(phrases), category, min_trust, 500 if known else limit * 3)
+        if known:  # known names by identity (aliases included), unknown names by their words
+            allowed = {f["fact_id"] for f in self._linked_facts(known, category, min_trust, 10_000)}
+            lexical = [f for f in lexical if f["fact_id"] in allowed]
+        return self._rerank(" ".join(names), lexical, limit)
 
     def related(self, entity: str, category: str | None = None, limit: int = 10, min_trust: float = 0.3) -> list[dict]:
         """Facts structurally connected to an entity (the entity's atom unbinds to a role), above a noise floor.
@@ -192,21 +210,22 @@ class FactRetriever:
         topics about the same subject do not qualify. ``content_similarity`` is that word overlap. Word sets, so
         word order is ignored. Works without numpy."""
         sql = ("SELECT fact_id, content, category, tags, trust_score, created_at, updated_at FROM facts "
-               "WHERE trust_score >= ?" + (" AND category = ?" if category else ""))
+               "WHERE trust_score >= ?" + (" AND category = ?" if category else "")
+               + " ORDER BY COALESCE(updated_at, created_at) DESC LIMIT 500")  # bound: the most recently changed facts
         rows = self.store.read(sql, [min_trust] + ([category] if category else []))
         if len(rows) < 2:
             return []
-        if len(rows) > 500:  # O(n^2) guard: only compare the most recently updated facts
-            rows = sorted(rows, key=lambda r: r["updated_at"] or r["created_at"], reverse=True)[:500]
+        ids = [r["fact_id"] for r in rows]
         names_by_fact: dict[int, set[str]] = {}
-        for r in self.store.read("SELECT fe.fact_id, e.name FROM fact_entities fe JOIN entities e ON e.entity_id = fe.entity_id"):
+        for r in self.store.read("SELECT fe.fact_id, e.name FROM fact_entities fe JOIN entities e ON e.entity_id = fe.entity_id "
+                                 f"WHERE fe.fact_id IN ({','.join('?' * len(ids))})", ids):
             names_by_fact.setdefault(r["fact_id"], set()).add(r["name"].lower())
-        facts = []  # (public dict, lower-cased entity names, claim words without the entity words)
+        facts = []  # (public dict, lower-cased entity names, claim)
         for row in rows:
             names = names_by_fact.get(row["fact_id"])
             if names:
-                entity_words = {w for name in names for w in self._tokenize(name)}
-                facts.append((dict(row), names, self._tokenize(row["content"]) - entity_words))
+                entity_words = {w for name in names for w in words(name)}
+                facts.append((dict(row), names, self._claim(row["content"], entity_words)))
         # Only pairs that share an entity can qualify: group by entity instead of comparing every pair.
         by_entity: dict[str, list[int]] = {}
         for index, (_, names, _) in enumerate(facts):
@@ -217,9 +236,9 @@ class FactRetriever:
         for i, j in pairs:
             (f1, ents1, claim1), (f2, ents2, claim2) = facts[i], facts[j]
             entity_overlap = len(ents1 & ents2) / len(ents1 | ents2)
-            if entity_overlap < 0.3 or claim1 <= claim2 or claim2 <= claim1:
-                continue  # different subjects, the same claim, or one claim refining the other
-            claim_sim = self._jaccard_similarity(claim1, claim2)
+            if entity_overlap < 0.3:
+                continue  # different subjects
+            claim_sim = self._conflicting(claim1, claim2)
             contradiction_score = entity_overlap * claim_sim
             if contradiction_score >= threshold:
                 contradictions.append({
@@ -304,26 +323,52 @@ class FactRetriever:
         if not terms or not candidates:
             return gram_kept
         total_facts = max(self.store.count_facts(), 1)
-        weights = {}
+        weights, unknown = {}, []
         for term in terms:
             df = self._doc_freq(term)
             if df:
                 weights[term] = math.log(1.0 + total_facts / df)
-        total = sum(weights.values())
-        if not total:
+            else:
+                unknown.append(term)
+        if not weights:
             return gram_kept
+        # A word no fact contains still says what the message is about: it counts against coverage, weighted like the
+        # most common known word, so "do submarines deploy on Jupiter?" is not "about" a fact that mentions deploy.
+        total = sum(weights.values()) + len(unknown) * min(weights.values())
         kept = []
+        identifiers = [t for t in terms if t.identifier]
         for fact in candidates:
-            text = f'{fact.get("content", "")} {fact.get("tags") or ""}'
+            text = f'{fact.get("content", "")} {fact.get("tags") or ""}'.lower()
             fact_words, fact_stems = set(words(text)), stems(text)
-            matched = [t for t in weights if t.word in fact_words or t.stem in fact_stems
-                       or (t.identifier and t.word in text.lower())]
+            if identifiers and not any(t.found_in(fact_words, fact_stems, text) for t in identifiers):
+                continue  # a message naming pve-01 or v0.21.6 is about that, not about pve-010
+            matched = [t for t in weights if t.found_in(fact_words, fact_stems, text)]
             if any(t.identifier for t in matched) or sum(weights[t] for t in matched) / total >= min_coverage \
                     or fact in gram_kept:
                 kept.append(fact)
         return kept
 
     # -- write-time checks and housekeeping ----------------------------------------------------------------------
+
+    @staticmethod
+    def _claim(text: str, entity_words: set[str]) -> tuple[frozenset, bool]:
+        """(stems of the claim without the entity words and negators, negated?)."""
+        ws = [w for w in words(text) if w not in entity_words]
+        return frozenset(stems(" ".join(w for w in ws if w not in NEGATORS))), any(w in NEGATORS for w in ws)
+
+    @classmethod
+    def _conflicting(cls, a: tuple[frozenset, bool], b: tuple[frozenset, bool]) -> float:
+        """Claim overlap when two claims about one subject look like a conflict, else 0: the same statement with
+        the opposite polarity ("likes apples" / "does not like apples"), or a similar but different statement
+        where neither only adds detail to the other ("lives in Paris" / "lives in London"). Lexical candidates for
+        a person to judge; word order (who paid whom) is not modelled."""
+        (claim_a, neg_a), (claim_b, neg_b) = a, b
+        overlap = cls._jaccard_similarity(set(claim_a), set(claim_b))
+        if neg_a != neg_b:
+            return overlap if overlap >= 0.5 else 0.0
+        if claim_a <= claim_b or claim_b <= claim_a:
+            return 0.0
+        return overlap
 
     def write_check(self, fact_id: int, limit: int = 3) -> dict:
         """Facts that look like a near-duplicate of fact *fact_id* or a possible conflict with it (advisory: the
@@ -334,34 +379,34 @@ class FactRetriever:
         content = rows[0]["content"]
         own_entities = {r[0] for r in self.store.read("SELECT entity_id FROM fact_entities WHERE fact_id = ?", (fact_id,))}
         candidate_ids = {r[0] for r in self.store.read(
-            "SELECT DISTINCT fact_id FROM fact_entities WHERE entity_id IN ({}) AND fact_id != ?".format(
+            "SELECT DISTINCT fact_id FROM fact_entities WHERE entity_id IN ({}) AND fact_id != ? ORDER BY fact_id DESC LIMIT 50".format(
                 ",".join("?" * len(own_entities)) or "NULL"), [*own_entities, fact_id])}
         candidate_ids |= {f["fact_id"] for f in self.search(content, min_trust=0.0, limit=10)} - {fact_id}
         if not candidate_ids:
             return {"similar": [], "possible_conflicts": []}
-        entity_names = {r["entity_id"]: r["name"] for r in self.store.read("SELECT entity_id, name FROM entities")}
+        entity_names = {r["entity_id"]: r["name"] for r in self.store.read(
+            "SELECT entity_id, name FROM entities WHERE entity_id IN (SELECT entity_id FROM fact_entities WHERE fact_id IN ({}))".format(
+                ",".join("?" * (len(candidate_ids) + 1))), [fact_id, *sorted(candidate_ids)])}
         links: dict[int, set[int]] = {}
         for r in self.store.read("SELECT fact_id, entity_id FROM fact_entities WHERE fact_id IN ({})".format(
                 ",".join("?" * len(candidate_ids))), sorted(candidate_ids)):
             links.setdefault(r["fact_id"], set()).add(r["entity_id"])
-        own_words = {w for e in own_entities for w in self._tokenize(entity_names.get(e, ""))}
-        own_stems, own_claim = content_stems(content), self._tokenize(content) - own_words
+        own_words = {w for e in own_entities for w in words(entity_names.get(e, ""))}
+        own_stems, own_claim = content_stems(content), self._claim(content, own_words)
         similar, conflicts = [], []
         for other in self.store.read("SELECT fact_id, content FROM facts WHERE fact_id IN ({})".format(
                 ",".join("?" * len(candidate_ids))), sorted(candidate_ids)):
             other_entities = links.get(other["fact_id"], set())
             overlap = self._jaccard_similarity(own_stems, content_stems(other["content"]))
             entry = {"fact_id": other["fact_id"], "content": other["content"], "word_overlap": round(overlap, 2)}
-            if overlap >= 0.7:
+            shared = own_entities & other_entities
+            other_words = {w for e in other_entities for w in words(entity_names.get(e, ""))}
+            other_claim = self._claim(other["content"], other_words)
+            if overlap >= 0.7 and own_claim[1] == other_claim[1]:  # same polarity: a near-duplicate, not a conflict
                 similar.append(entry)
                 continue
-            shared = own_entities & other_entities
-            other_words = {w for e in other_entities for w in self._tokenize(entity_names.get(e, ""))}
-            other_claim = self._tokenize(other["content"]) - other_words
-            if own_claim <= other_claim or other_claim <= own_claim:
-                continue  # one only adds detail to the other
-            if (shared and self._jaccard_similarity(own_claim, other_claim) >= 0.3) or (
-                    not own_entities and not other_entities and overlap >= 0.5):
+            score = self._conflicting(own_claim, other_claim)
+            if (shared and score >= 0.3) or (not own_entities and not other_entities and score >= 0.5):
                 conflicts.append(entry)
         by_overlap = lambda xs: sorted(xs, key=lambda e: e["word_overlap"], reverse=True)[:limit]  # noqa: E731
         return {"similar": by_overlap(similar), "possible_conflicts": by_overlap(conflicts)}
@@ -375,15 +420,18 @@ class FactRetriever:
                 seen.add(fact["fact_id"])
                 out.append({"fact_id": fact["fact_id"], "content": fact["content"], "trust_score": fact["trust_score"],
                             "retrieval_count": fact["retrieval_count"], "reason": reason})
-        facts = [dict(r) for r in self.store.read(f"SELECT {_FACT_COLUMNS} FROM facts ORDER BY trust_score DESC")]
-        for fact in facts:
-            if fact["trust_score"] < 0.3:
-                add(fact, "low trust (rated unhelpful)")
+        for fact in self.store.read(f"SELECT {_FACT_COLUMNS} FROM facts WHERE trust_score < 0.3 ORDER BY trust_score LIMIT ?", (limit,)):
+            add(dict(fact), "low trust (rated unhelpful)")
         for fact in self.store.read(
-                f"SELECT {_FACT_COLUMNS} FROM facts WHERE retrieval_count = 0 AND julianday('now') - julianday(created_at) > ?",
-                (stale_days,)):
+                f"SELECT {_FACT_COLUMNS} FROM facts WHERE retrieval_count = 0 AND julianday('now') - julianday(created_at) > ? "
+                "ORDER BY created_at LIMIT ?", (stale_days, limit)):
             add(dict(fact), f"never recalled in {stale_days}+ days")
-        keyed = [(f, content_stems(f["content"])) for f in facts[:500]]
+        if len(out) >= limit:
+            return out[:limit]
+        # near-duplicates among the most recent 200 facts (bounded pair scan), the more trusted one kept
+        facts = sorted((dict(r) for r in self.store.read(f"SELECT {_FACT_COLUMNS} FROM facts ORDER BY fact_id DESC LIMIT 200")),
+                       key=lambda f: f["trust_score"], reverse=True)
+        keyed = [(f, content_stems(f["content"])) for f in facts]
         for i, (better, a) in enumerate(keyed):
             for worse, b in keyed[i + 1:]:
                 if self._jaccard_similarity(a, b) >= 0.8:

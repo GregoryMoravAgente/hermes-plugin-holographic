@@ -7,6 +7,7 @@ git or the tag is unavailable."""
 from __future__ import annotations
 
 import importlib.util
+import os
 import shutil
 import subprocess
 import sys
@@ -27,14 +28,17 @@ DIM = 256
 @pytest.fixture(scope="module")
 def old(tmp_path_factory):
     """The v0.1.1 store and retriever modules, loaded as their own package."""
+    def unavailable(reason):  # release CI must run this test, not skip it
+        (pytest.fail if os.environ.get("CI") else pytest.skip)(reason)
+
     if shutil.which("git") is None:
-        pytest.skip("git not available")
+        unavailable("git not available")
     pkg = tmp_path_factory.mktemp("old") / "holo_v011"
     pkg.mkdir()
     for name in ("store.py", "retrieval.py", "holographic.py"):
         shown = subprocess.run(["git", "-C", str(REPO), "show", f"{OLD_TAG}:{name}"], capture_output=True)
         if shown.returncode != 0:
-            pytest.skip(f"tag {OLD_TAG} not available (fetch tags to run this test)")
+            unavailable(f"tag {OLD_TAG} not available (fetch tags to run this test)")
         (pkg / name).write_bytes(shown.stdout)
     (pkg / "__init__.py").write_text("", encoding="utf-8")
     spec = importlib.util.spec_from_file_location("holo_v011", pkg / "__init__.py", submodule_search_locations=[str(pkg)])

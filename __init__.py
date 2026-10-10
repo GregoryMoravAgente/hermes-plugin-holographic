@@ -7,10 +7,12 @@ prefetch_repeat_turns (6), scope (profile | user)."""
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import logging
 import re
+import threading
 from collections import Counter, OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List
@@ -112,6 +114,14 @@ _RE_INJECTION = re.compile(
     r"|(?:игнорируй|забудь|отмени)\s+(?:все\s+)?(?:предыдущие\s+|прежние\s+|системные\s+)?(?:инструкции|правила|указания)"
     r"|системный\s+промпт\s*:",
     re.IGNORECASE)
+# Asking the assistant to hand credentials to someone: an instruction to act, never a fact about the user.
+_RE_EXFILTRATION = re.compile(
+    r"\b(?:send|share|reveal|post|upload|forward|email|leak|paste)\b.{0,40}\b(?:passwords?|secrets?|tokens?|api[\s_-]?keys?|"
+    r"credentials?|private\s+keys?|seed\s+phrases?)\b"
+    r"|(?:отправ|перешл|покаж|раскрой|выложи)\w*.{0,40}(?:парол|секрет|токен|ключ|учётн|учетн)",
+    re.IGNORECASE)
+# Quoted spans are reported text ("the test case contains 'ignore previous instructions'"), not instructions.
+_RE_QUOTED_SPAN = re.compile(r"\"[^\"\n]*\"|'[^'\n]*'|«[^»\n]*»|“[^”\n]*”")
 _RE_ROLE_MARKUP = re.compile(r"(?im)^\s*(?:system|assistant|user|tool)\s*:|</?(?:tool_call|function_call|system|assistant)\b|<\|")
 _RE_BLOB = re.compile(r"[A-Za-z0-9+/=_-]{200,}")
 _INVISIBLE = frozenset("​‌‍⁠﻿‪‫‬‭‮⁦⁧⁨⁩")
@@ -130,8 +140,11 @@ def _fact_problem(content: str) -> str | None:
             pass
     if _RE_ROLE_MARKUP.search(text):
         return "contains chat-role or tool-call markup"
-    if _RE_INJECTION.search(text):
+    unquoted = _RE_QUOTED_SPAN.sub(" ", text)
+    if _RE_INJECTION.search(unquoted):
         return "reads like an instruction to the assistant, not a fact"
+    if _RE_EXFILTRATION.search(unquoted):
+        return "asks to send credentials somewhere: an instruction, not a fact"
     if any(c in _INVISIBLE for c in text):
         return "contains invisible formatting characters"
     if _RE_BLOB.search(text):
@@ -160,6 +173,7 @@ _PREFETCH_CANDIDATES, _PREFETCH_FACTS, _ENTITY_FACTS = 15, 5, 2
 _PREFETCH_LINE_CHARS = 300
 _COUNT_FLUSH_AT = 25  # buffered recall counts are written in one go at this many, and at session boundaries
 _MAX_TRACKED_SESSIONS, _MAX_TRACKED_FACTS = 16, 512
+_MAX_OPEN_STORES = 16  # per-user stores kept open; the least recently used one is closed beyond this
 
 
 def _limit(args: dict) -> int:
@@ -171,6 +185,22 @@ def _tool_handler(actions: dict):
     """(self, args) handler dispatching on args["action"] over ``actions``; unknown action -> tool_error."""
     return lambda self, args: (actions[args["action"]](self, args) if args["action"] in actions
                                else tool_error(f"Unknown action: {args['action']}"))
+
+
+def _serialized(method):
+    """Run a provider entry point under the provider lock. The gateway calls hooks from several threads (and core
+    leaves a timed-out prefetch running), so the active store, the dedupe window and the count buffers must not
+    change underneath an operation. Every operation is local and short."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._op_lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
+def _revision(fact: dict) -> tuple:
+    """(fact_id, content hash): a reworded fact is a new revision even within the same second."""
+    return fact["fact_id"], hashlib.sha1((fact.get("content") or "").encode()).hexdigest()[:12]
 
 
 def _one_line(text: str, limit: int = _PREFETCH_LINE_CHARS) -> str:
@@ -190,16 +220,19 @@ class HolographicMemoryProvider(MemoryProvider):
         self._writable = True
         self._init_error = ""
         self._session_id = ""
-        self._pending_counts: Counter = Counter()
-        # session -> {(fact_id, updated_at): prefetch turn it was last injected}; bounded LRU of sessions.
+        self._op_lock = threading.RLock()
+        self._pending: dict[str, Counter] = {}  # store key -> buffered recall counts for THAT database
+        # session|store -> {(fact_id, content hash): prefetch turn it was last injected}; bounded LRU of sessions.
         self._injected: OrderedDict[str, OrderedDict] = OrderedDict()
         self._turns: dict[str, int] = {}
         self._last_recall = 0
         scope = str(self._config.get("scope", "profile")).strip().lower()
         self._scope = scope if scope in _SCOPES else "profile"
         self._scope_key = ""  # "" = the profile store; otherwise the user whose store is active
-        self._stores: dict[str, tuple] = {}  # scope key -> (MemoryStore, FactRetriever)
+        self._stores: OrderedDict[str, tuple] = OrderedDict()  # scope key -> (MemoryStore, FactRetriever), LRU
         self._home, self._platform = "", ""
+        self._init_key: str | None = None  # the user Hermes named at start (user scope)
+        self._authors_seen = False  # a turn carried an author: a shared conversation, so an anonymous turn is nobody
 
     @property
     def name(self) -> str:
@@ -266,8 +299,14 @@ class HolographicMemoryProvider(MemoryProvider):
             path.resolve().relative_to(home.resolve())
             return []
         except (ValueError, OSError):
-            return [str(path.resolve())] if path.is_absolute() or path.exists() else []
+            pass
+        found = [str(path.resolve())] if path.is_absolute() or path.exists() else []
+        users = path.parent / "holographic-users"
+        if self._scope == "user" and users.is_dir():
+            found += sorted(str(p.resolve()) for p in users.glob("*.db"))
+        return found
 
+    @_serialized
     def initialize(self, session_id: str, **kwargs) -> None:
         from hermes_constants import get_hermes_home
         _hermes_home = str(kwargs.get("hermes_home") or get_hermes_home())
@@ -277,8 +316,10 @@ class HolographicMemoryProvider(MemoryProvider):
         self._writable = str(kwargs.get("agent_context") or "primary") in _WRITER_CONTEXTS
         self._session_id, self._init_error = session_id, ""
         self._home, self._platform = _hermes_home, str(kwargs.get("platform") or "")
+        self._authors_seen = False
         if self._scope == "user":
-            self._activate(self._user_key(kwargs.get("user_id")))
+            self._init_key = self._user_key(kwargs.get("user_id"))
+            self._activate(self._init_key)
         else:
             self._activate("")
 
@@ -299,37 +340,54 @@ class HolographicMemoryProvider(MemoryProvider):
             return base
         return str(Path(base).expanduser().parent / "holographic-users" / f"{key}.db")
 
+    def _open(self, key: str) -> tuple | None:
+        """(store, retriever) of *key*, opened on first use and kept in a small LRU; None if it cannot be opened."""
+        if key in self._stores:
+            self._stores.move_to_end(key)
+            return self._stores[key]
+        hrr_dim = int(self._config.get("hrr_dim", 1024))
+        db_path = self._scoped_db_path(key)
+        try:
+            # Read-only contexts never migrate or repair a store: they only read what a writer left.
+            store = MemoryStore(db_path=db_path, default_trust=float(self._config.get("default_trust", 0.5)), hrr_dim=hrr_dim,
+                                migrate=self._writable)
+        except Exception as exc:  # a damaged or unreadable database: keep the agent up, say why memory is off
+            self._init_error = (f"cannot open {db_path} ({type(exc).__name__}: {exc}). If the file is damaged, "
+                                f"recover it with: sqlite3 {db_path} \".recover\" | sqlite3 recovered.db")
+            logger.error("holographic: %s", self._init_error)
+            return None
+        retriever = FactRetriever(store=store, hrr_dim=hrr_dim, hrr_weight=float(self._config.get("hrr_weight", 0.3)),
+                                  temporal_decay_half_life=int(self._config.get("temporal_decay_half_life", 0)))
+        self._stores[key] = (store, retriever)
+        while len(self._stores) > _MAX_OPEN_STORES:
+            old_key = next(k for k in self._stores if k not in (key, self._scope_key))
+            self._flush_counts(old_key)
+            self._pending.pop(old_key, None)
+            self._stores.pop(old_key)[0].close()
+        return self._stores[key]
+
     def _activate(self, key: str | None) -> None:
         """Make the store of *key* ("" = profile store, None = no identity in user scope) the active one."""
-        self._flush_counts()
-        if key is None:
-            self._scope_key, self._store, self._retriever = None, None, None
-            return
-        if key not in self._stores:
-            hrr_dim = int(self._config.get("hrr_dim", 1024))
-            db_path = self._scoped_db_path(key)
-            try:
-                store = MemoryStore(db_path=db_path, default_trust=float(self._config.get("default_trust", 0.5)), hrr_dim=hrr_dim)
-            except Exception as exc:  # a damaged or unreadable database: keep the agent up, say why memory is off
-                self._init_error = (f"cannot open {db_path} ({type(exc).__name__}: {exc}). If the file is damaged, "
-                                    f"recover it with: sqlite3 {db_path} \".recover\" | sqlite3 recovered.db")
-                logger.error("holographic: %s", self._init_error)
-                self._scope_key, self._store, self._retriever = key, None, None
-                return
-            retriever = FactRetriever(store=store, hrr_dim=hrr_dim, hrr_weight=float(self._config.get("hrr_weight", 0.3)),
-                                      temporal_decay_half_life=int(self._config.get("temporal_decay_half_life", 0)))
-            self._stores[key] = (store, retriever)
+        opened = self._open(key) if key is not None else None
         self._scope_key = key
-        self._store, self._retriever = self._stores[key]
+        self._store, self._retriever = opened if opened else (None, None)
 
+    @_serialized
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
-        """In user scope, a shared conversation switches to the store of whoever wrote this turn."""
-        if self._scope == "user" and self._home and kwargs.get("author_id") is not None:
-            if kwargs.get("author_is_bot"):
-                self._activate(None)
-            else:
-                self._activate(self._user_key(kwargs.get("author_id")))
+        """User scope follows the author of each turn. A bot author, or an anonymous turn in a conversation that has
+        had authors (a shared chat), is nobody: recall and writes are off for that turn (fail closed). A conversation
+        without any author is the user Hermes named at start."""
+        if self._scope != "user" or not self._home:
+            return
+        if kwargs.get("author_is_bot"):
+            self._activate(None)
+        elif kwargs.get("author_id") not in (None, ""):
+            self._authors_seen = True
+            self._activate(self._user_key(kwargs.get("author_id")))
+        else:
+            self._activate(None if self._authors_seen else self._init_key)
 
+    @_serialized
     def system_prompt_block(self) -> str:
         if self._init_error:
             return f"# Holographic Memory\nUnavailable this session: {self._init_error}"
@@ -357,6 +415,7 @@ class HolographicMemoryProvider(MemoryProvider):
 
     # -- recall before the turn ----------------------------------------------------------------------------------
 
+    @_serialized
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Up to five relevant facts: keyword candidates that pass the relevance gate, plus the top facts of entities
         the message names; facts already injected in this session within ``prefetch_repeat_turns`` are not repeated."""
@@ -367,14 +426,16 @@ class HolographicMemoryProvider(MemoryProvider):
             key = f"{session_id or self._session_id or ''}|{self._scope_key or ''}"
             turn = self._turns[key] = self._turns.get(key, 0) + 1
             candidates = self._retriever.search(query, min_trust=self._min_trust, limit=_PREFETCH_CANDIDATES)
-            chosen = self._retriever.relevant(query, candidates, self._min_coverage)[:_PREFETCH_FACTS]
-            have = {f["fact_id"] for f in chosen}
+            # Recently injected facts are dropped BEFORE the top five are taken, so they leave room for others.
+            fresh = [f for f in self._retriever.relevant(query, candidates, self._min_coverage)
+                     if self._not_recent(key, f, turn)][:_PREFETCH_FACTS]
+            have, extra = {f["fact_id"] for f in fresh}, 0
             for entity_id in sorted(self._store.mentioned_entity_ids(query)):
-                for fact in self._retriever._linked_facts([[entity_id]], None, self._min_trust, _ENTITY_FACTS):
-                    if fact["fact_id"] not in have and len(chosen) < _PREFETCH_FACTS + _ENTITY_FACTS:
-                        chosen.append(fact)
+                for fact in self._retriever._linked_facts([[entity_id]], None, self._min_trust, _ENTITY_FACTS * 3):
+                    if extra < _ENTITY_FACTS and fact["fact_id"] not in have and self._not_recent(key, fact, turn):
+                        fresh.append(fact)
                         have.add(fact["fact_id"])
-            fresh = [f for f in chosen if self._not_recent(key, f, turn)]
+                        extra += 1
             for fact in fresh:
                 self._remember(key, fact, turn)
             self._last_recall = len(fresh)
@@ -388,20 +449,21 @@ class HolographicMemoryProvider(MemoryProvider):
             return ""
 
     def _not_recent(self, session: str, fact: dict, turn: int) -> bool:
-        seen = self._injected.get(session, {}).get((fact["fact_id"], fact.get("updated_at")))
+        seen = self._injected.get(session, {}).get(_revision(fact))
         return seen is None or turn - seen > self._repeat_turns
 
     def _remember(self, session: str, fact: dict, turn: int) -> None:
         facts = self._injected.setdefault(session, OrderedDict())
         self._injected.move_to_end(session)
-        facts[(fact["fact_id"], fact.get("updated_at"))] = turn
-        facts.move_to_end((fact["fact_id"], fact.get("updated_at")))
+        facts[_revision(fact)] = turn
+        facts.move_to_end(_revision(fact))
         while len(facts) > _MAX_TRACKED_FACTS:
             facts.popitem(last=False)
         while len(self._injected) > _MAX_TRACKED_SESSIONS:
             dropped, _ = self._injected.popitem(last=False)
             self._turns.pop(dropped, None)
 
+    @_serialized
     def recall_status(self):
         """What the last prefetch injected, for the core's recall indicator."""
         if RecallStatus is None or not self._last_recall:
@@ -411,6 +473,7 @@ class HolographicMemoryProvider(MemoryProvider):
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [FACT_STORE_SCHEMA, FACT_FEEDBACK_SCHEMA]
 
+    @_serialized
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         if tool_name not in self._TOOL_HANDLERS:
             return tool_error(f"Unknown tool: {tool_name}")
@@ -433,19 +496,48 @@ class HolographicMemoryProvider(MemoryProvider):
 
     # -- session boundaries --------------------------------------------------------------------------------------
 
-    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+    def _extracting(self) -> bool:
         # is_truthy_value: auto_extract is a string enum ("false"/"true"); plain truthiness would treat "false" as on.
-        if self._writable and is_truthy_value(self._config.get("auto_extract", False)) and self._store and messages:
-            self._auto_extract_facts(messages)
+        return self._writable and is_truthy_value(self._config.get("auto_extract", False))
+
+    @_serialized
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", messages=None,
+                  turn_author: dict | None = None) -> None:
+        """Extraction per completed turn, filed under whoever wrote it. In user scope a turn by a bot, or an
+        anonymous turn in a shared conversation, is skipped rather than stored in somebody's memory."""
+        if not self._extracting() or not user_content:
+            return
+        if self._scope != "user":
+            target = self._open("")
+        else:
+            author = turn_author or {}
+            if author.get("is_bot"):
+                return
+            key = self._user_key(author.get("id")) if author.get("id") not in (None, "") else (
+                None if self._authors_seen else self._init_key)
+            target = self._open(key) if key is not None else None
+        if target:
+            self._auto_extract_facts([{"role": "user", "content": user_content}], target[0])
+
+    @_serialized
+    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        # User scope extracts per turn in sync_turn (attributed); a whole transcript cannot be attributed safely.
+        if self._extracting() and self._scope != "user" and self._store and messages:
+            self._auto_extract_facts(messages, self._store)
         self._flush_counts()
 
+    @_serialized
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
-        """Harvest before the turns are summarised away: a long session that is later killed keeps what it said."""
-        if self._writable and is_truthy_value(self._config.get("auto_extract", False)) and self._store and messages:
-            self._auto_extract_facts(messages)
+        """Harvest before the turns are summarised away (a long session that is later killed keeps what it said),
+        and let facts injected into the compressed turns be recalled again."""
+        if self._extracting() and self._scope != "user" and self._store and messages:
+            self._auto_extract_facts(messages, self._store)
+        for key in [k for k in self._injected if k.split("|", 1)[0] == self._session_id]:
+            self._injected.pop(key, None)
         self._flush_counts()
         return ""
 
+    @_serialized
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False,
                           rewound: bool = False, **kwargs) -> None:
         """Rebind to the new session; a new conversation or a rewound transcript forgets what was injected."""
@@ -458,6 +550,7 @@ class HolographicMemoryProvider(MemoryProvider):
                 self._turns.pop(key, None)
         self._flush_counts()
 
+    @_serialized
     def on_memory_write(self, action: str, target: str, content: str, metadata: dict | None = None) -> None:
         """Mirror built-in memory writes as facts, only with ``mirror_memory_writes`` on.
 
@@ -488,9 +581,11 @@ class HolographicMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.debug("Holographic memory_write mirror failed: %s", e)
 
+    @_serialized
     def shutdown(self) -> None:
         # Close on the caller's thread: leaving the shared connection (+ write lock) to GC keeps it alive on a gateway.
         self._flush_counts()
+        self._pending.clear()  # counts the database refused now are dropped, never applied to another store
         for store, _ in self._stores.values():
             try:
                 store.close()
@@ -506,26 +601,31 @@ class HolographicMemoryProvider(MemoryProvider):
         contradict). Buffered and written in one statement every few recalls and at session boundaries, without
         waiting on another process's write lock, so recall never stalls on bookkeeping. Read-only contexts do not
         count."""
-        if not self._writable:
+        if not self._writable or self._scope_key is None or self._store is None:
             return results
+        pending = self._pending.setdefault(self._scope_key, Counter())
         for r in results:
             fact_id = r.get("fact_id")
             if isinstance(fact_id, int) and not isinstance(fact_id, bool):
-                self._pending_counts[fact_id] += 1
-        if sum(self._pending_counts.values()) >= _COUNT_FLUSH_AT:
-            self._flush_counts()
+                pending[fact_id] += 1
+        if sum(pending.values()) >= _COUNT_FLUSH_AT:
+            self._flush_counts(self._scope_key)
         return results
 
-    def _flush_counts(self) -> None:
-        if not self._pending_counts or self._store is None:
-            return
-        try:
-            if self._store.add_retrieval_counts(dict(self._pending_counts)):
-                self._pending_counts.clear()
-        except Exception as e:
-            logger.debug("Holographic retrieval count failed: %s", e)
-        if len(self._pending_counts) > _MAX_TRACKED_FACTS:  # the database stays busy: keep memory bounded
-            self._pending_counts = Counter(dict(self._pending_counts.most_common(_MAX_TRACKED_FACTS)))
+    def _flush_counts(self, key: str | None = None) -> None:
+        """Write buffered counts, each batch to the database it was counted in (fact ids are per database)."""
+        for store_key in ([key] if key is not None else list(self._pending)):
+            pending = self._pending.get(store_key)
+            opened = self._stores.get(store_key)
+            if not pending or not opened:
+                continue
+            try:
+                if opened[0].add_retrieval_counts(dict(pending)):
+                    pending.clear()
+            except Exception as e:
+                logger.debug("Holographic retrieval count failed: %s", e)
+            if len(pending) > _MAX_TRACKED_FACTS:  # the database stays busy: keep memory bounded
+                self._pending[store_key] = Counter(dict(pending.most_common(_MAX_TRACKED_FACTS)))
 
     # -- tool handlers -------------------------------------------------------------------------------------------
     # (self, args) -> str. KeyError from args[...] / Exception -> tool_error in handle_tool_call.
@@ -584,7 +684,7 @@ class HolographicMemoryProvider(MemoryProvider):
 
     def _stats(self, a: dict) -> str:
         """What is in the store and whether recall works: counts, categories, how many facts were ever recalled."""
-        self._flush_counts()
+        self._flush_counts(self._scope_key)
         read = self._store.read
         by_category = {r[0] or "general": r[1] for r in read("SELECT category, COUNT(*) FROM facts GROUP BY category")}
         return json.dumps({
@@ -634,7 +734,7 @@ class HolographicMemoryProvider(MemoryProvider):
         "fact_feedback": lambda self, a: self._feedback(a),
     }
 
-    def _auto_extract_facts(self, messages: list) -> None:
+    def _auto_extract_facts(self, messages: list, store: MemoryStore) -> None:
         # Compaction handoff summaries arrive as role="user" and match the decision patterns; never store the
         # compactor's own output as a fact. A merge-into-tail row holds genuine prior user text BEFORE
         # _MERGED_SUMMARY_DELIMITER (after the header) and the summary AFTER it — harvest only that segment.
@@ -657,7 +757,7 @@ class HolographicMemoryProvider(MemoryProvider):
                 for patterns, category in _EXTRACT_CATEGORIES:
                     if any(p.search(sentence) for p in patterns):
                         try:
-                            if self._store.add_fact_status(sentence, category=category, trust=extract_trust)[1]:
+                            if store.add_fact_status(sentence, category=category, trust=extract_trust)[1]:
                                 extracted += 1
                         except Exception:
                             pass

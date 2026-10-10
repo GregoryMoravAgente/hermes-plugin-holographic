@@ -210,11 +210,11 @@ def test_buffered_counts_survive_a_busy_database(tmp_path):
     blocker = sqlite3.connect(str(tmp_path / "memory_store.db"), isolation_level=None)
     blocker.execute("BEGIN IMMEDIATE")  # another process holds the write lock
     provider._flush_counts()
-    assert provider._pending_counts == {fact: 1}  # kept, not lost, and the call did not wait
+    assert provider._pending[""] == {fact: 1}  # kept, not lost, and the call did not wait
     blocker.execute("ROLLBACK")
     blocker.close()
     provider._flush_counts()
-    assert provider._pending_counts == {}
+    assert provider._pending[""] == {}
     assert provider._store.read("SELECT retrieval_count FROM facts")[0][0] == 1
     provider.shutdown()
 

@@ -67,32 +67,55 @@ def content_stems(text: str) -> set[str]:
     return {stem(w) for w in words(text) if is_identifier(w) or (w not in STOPWORDS and len(w) > 1)}
 
 
+# FTS5 syntax characters (quotes, grouping, prefix, column filter, NOT/required). Never interpolated into a MATCH
+# expression: inside a token they split it into a phrase of the tokens unicode61 indexes ("pve-01" -> "pve 01").
+FTS_OPERATORS = str.maketrans({c: " " for c in '"()*^:-+'})
+NEGATORS = frozenset("""not no never nobody nothing cannot don't doesn't didn't isn't aren't wasn't weren't won't can't
+    couldn't shouldn't haven't hasn't dont doesnt didnt isnt cant wont не нет никогда ни""".split())
+
+
 @dataclass(frozen=True)
 class Term:
-    """One informative query term: the exact word, its stem (search key), and whether it is an identifier."""
+    """One informative query term: the exact word, its stem (search key), whether it is an identifier, and the
+    FTS-safe tokens it is searched as (operator characters removed)."""
     word: str
     stem: str
     identifier: bool
+    tokens: tuple[str, ...] = ()
 
-    def fts(self, operators: dict) -> str:
-        """FTS5 expression: the exact word as a phrase, OR its stem as a prefix when that adds recall."""
-        exact = '"' + " ".join(self.word.translate(operators).split()) + '"'
-        if self.identifier or len(self.stem) < _MIN_STEM:
+    def fts(self, operators: dict | None = None) -> str:
+        """FTS5 expression built only from operator-free tokens: the exact word (a phrase when it splits into
+        several tokens), OR its stem as a prefix when the word is one plain token and the stem is long enough."""
+        tokens = self.tokens or tuple(self.word.translate(FTS_OPERATORS).split())
+        exact = '"' + " ".join(tokens) + '"'
+        if self.identifier or len(tokens) != 1 or len(self.stem) < _MIN_STEM or self.stem != stem(tokens[0]):
             return exact
-        if self.stem == self.word:  # "байк" must still find "байке"
+        if self.stem == tokens[0]:  # "байк" must still find "байке"
             return f'"{self.stem}"*'
         return f'({exact} OR "{self.stem}"*)'
+
+    def found_in(self, fact_words: set[str], fact_stems: set[str], text: str) -> bool:
+        """Does a fact contain this term: the same word, the same stem, or (identifiers and multi-token words) the
+        same token run with word boundaries, so "pve-01" does not match inside "pve-010"."""
+        if self.word in fact_words:
+            return True
+        if not self.identifier and len(self.tokens) <= 1 and self.stem in fact_stems:
+            return True
+        return re.search(r"(?<![\w-])" + re.escape(self.word) + r"(?![\w-])", text) is not None
 
 
 def query_terms(text: str) -> list[Term]:
     """Distinct informative terms of a natural-language query, in order of appearance."""
     seen, terms = set(), []
     for w in words(text):
+        tokens = tuple(w.translate(FTS_OPERATORS).split())
+        if not tokens:
+            continue
         ident = is_identifier(w)
         if not ident and (w in STOPWORDS or len(w) < 2):
             continue
-        s = stem(w)
+        s = stem(tokens[0]) if len(tokens) == 1 else w
         if s not in seen:
             seen.add(s)
-            terms.append(Term(w, s, ident))
+            terms.append(Term(w, s, ident, tokens))
     return terms

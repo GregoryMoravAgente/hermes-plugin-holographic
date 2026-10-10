@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.4.1 — 2026-10-11
+
+Fixes from a second independent review (Codex CLI, whole branch 0.1.1..0.4.0), each with a regression test.
+
+### Fixed
+
+- **User scope failed open**: an anonymous turn in a shared chat kept the previous person's store active, and a bot
+  without an id passed the bot check. Now a bot, or an anonymous turn once the conversation has had authors, is
+  nobody (no recall, no writes); a conversation that never had authors is the user Hermes named at start.
+- **Extraction mixed people**: in user scope, session-end and pre-compression extraction stored every participant's
+  sentences in the active person's store. Extraction now runs per turn in `sync_turn`, filed under `turn_author`;
+  unattributable turns and whole transcripts are skipped.
+- **Thread safety**: a scope switch could happen in the middle of a recall or tool call (the gateway calls hooks from
+  several threads, and core leaves a timed-out prefetch running). Provider entry points are serialized.
+- **Buffered recall counts** could be written to another user's or profile's database (fact ids are per database).
+  Buffers are kept per database, and dropped rather than transferred if it stays busy until shutdown.
+- **Migration lost legacy aliases** when it merged two entities with the same key; they are imported first now, and
+  every merge keeps the merged entity's name as an alias of the survivor.
+- **Aliases of entities an older version deleted** still resolved to the dead id, and new facts were linked to it.
+  They are dropped on open, and alias lookups only follow live entities.
+- **Alias collisions**: giving an alias that already belongs to another entity merged that whole entity and lost its
+  name; it is refused now with a hint to merge explicitly.
+- **Entity cache after a rollback** could link a fact to the wrong entity (a rolled-back id reused). The cache now
+  follows a generation counter (bumped on every entity change and rollback) and SQLite's `data_version`.
+- **Merges** keep the declared flag, re-encode the vectors of the facts involved, drop the category banks and copy
+  the moved aliases into the legacy column older versions read.
+- **Vectors of another size** written by an older version or setting are re-encoded on open (checked from the blobs,
+  not only from the recorded dimension). Subagent, cron and flush contexts never migrate or repair a store.
+- **Search**: no user query can produce an FTS5 syntax error (every MATCH token is operator-free, with or without the
+  stemmer); a stem prefix match is kept only if the fact really contains the word or its stem ("walk" no longer
+  returns "walker").
+- **Recall gate**: words of the message that no fact contains now count against coverage ("do submarines deploy on
+  Jupiter?" is not about "we deploy software"); a message naming an identifier recalls only facts with that exact
+  identifier ("pve-01" is not "pve-010").
+- **reason** with a known and an unknown name intersects the known entity's facts (aliases included) with the unknown
+  name's words.
+- **update** with only `entities` links them; rewording a fact keeps the entities declared for it.
+- **Conflicts** see negation ("likes apples" / "does not like apples"); such a pair is never reported as a duplicate.
+- **No-repeat window** keys facts by content revision (two edits in the same second are different), drops recent
+  facts before the top five are taken, and resets on context compression.
+- **Validator** catches requests to send credentials somewhere and ignores phrases inside quotes.
+- `backup_paths()` lists per-user stores next to an external `db_path`; at most 16 per-user stores stay open.
+- Bounded work: `write_check` looks at 50 facts per entity at most, `review` and `contradict` load only what they
+  compare, entity mentions are looked up by stem instead of scanning every name.
+
+### Known limits
+
+- A timed-out recall is discarded by core, but the provider cannot tell: its facts count as recalled and the recall
+  indicator may show them.
+- Word forms are stems used as prefixes, not lemmas: an irregular form may miss (`studies` vs `study`).
+
 ## 0.4.0 — 2026-10-11
 
 Schema version 2, additive: older versions (0.1.1, the bundled core copy) keep working on the same file, and what

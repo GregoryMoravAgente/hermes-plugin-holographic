@@ -93,11 +93,17 @@ find shared fragments, not meaning: a Chinese question with no word in common wi
 ## Database and downgrades
 
 Schema changes are additive: 0.4.0 adds a `meta` table (schema version, HRR dimension), an `entity_aliases` table and
-an `entities.name_key` column; nothing older is dropped or rewritten. Every earlier version, including the copy
-bundled in Hermes core, keeps reading and writing the file. What an older version writes in between is reconciled
-when this one opens it (keys filled in, entities with the same key merged, vectors re-encoded if `hrr_dim` changed).
-CI runs this release, then 0.1.1, then this release again on one database. With `scope: user`, an older version only
-ever sees the shared `db_path`, never the per-user files.
+an `entities.name_key` column; nothing older is dropped or rewritten, and the new column is nullable, so earlier
+versions (including the copy bundled in Hermes core) keep reading and writing the file. When this version opens a
+file an older one wrote to, it reconciles: missing keys are filled in, entities with the same key are merged (links,
+aliases and names kept), aliases of entities the older version deleted are dropped, and vectors whose size does not
+match `hrr_dim` are re-encoded. Only a writable agent does this; subagents, cron and flush contexts never migrate.
+
+What is tested: this release, then 0.1.1, then this release on one database in CI (adds, edits, removals, aliases, a
+keyless duplicate entity written by 0.1.1), plus the reconciliation cases above. What a downgrade does not keep:
+aliases made after 0.4.0 are visible to 0.1.1 only through the legacy `entities.aliases` column; and with
+`scope: user`, an older version knows nothing of per-user files, so it reads and writes the shared `db_path` again.
+The per-user files stay untouched (no leak), but new facts would land in the shared store.
 
 ## Development
 
