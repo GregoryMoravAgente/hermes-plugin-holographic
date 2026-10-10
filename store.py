@@ -10,7 +10,7 @@ import unicodedata
 from pathlib import Path
 
 from . import holographic as hrr
-from .text import stem, words
+from .text import UNSEGMENTED, stem, words
 
 logger = logging.getLogger(__name__)
 
@@ -698,6 +698,9 @@ class MemoryStore:
                         key = tuple(stem(w) for w in words(name))
                         if len(key) > 1 or (key and row["entity_type"] == "declared"):
                             index.setdefault(key[0], []).append((int(row["entity_id"]), key))
+                        glued = name.strip().lower()
+                        if UNSEGMENTED.search(glued) and len(glued) >= 2 and (len(key) > 1 or row["entity_type"] == "declared"):
+                            index.setdefault("", []).append((int(row["entity_id"]), glued))  # "" = substring names
                 cached = self._entry["entities"] = (version, index)
             return cached[1]
 
@@ -710,6 +713,11 @@ class MemoryStore:
         for i, first in enumerate(sequence):
             for entity_id, key in index.get(first, ()):
                 if tuple(sequence[i:i + len(key)]) == key:
+                    found.add(entity_id)
+        if UNSEGMENTED.search(text or ""):  # a name in Chinese/Thai text has no spaces around it: substring match
+            lowered = text.lower()
+            for entity_id, name in index.get("", ()):
+                if name in lowered:
                     found.add(entity_id)
         return found
 

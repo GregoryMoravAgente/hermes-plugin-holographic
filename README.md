@@ -79,6 +79,26 @@ In `config.yaml` under `plugins.hermes-memory-store`:
 Stems are a search key, not a dictionary: an irregular form may still miss (`ponies` vs `pony`). Character n-grams
 find shared fragments, not meaning: a Chinese question with no word in common with the fact will not find it.
 
+## Languages
+
+Measured on stores of 20 everyday facts per language (people, school, work, servers, plans) with labelled questions,
+then on two further question sets written after tuning and run once, the third with 15 unrelated facts added per
+language. One rule came after the third set: greetings ("good morning", "доброе утро", "早上好") recalled facts about
+mornings in all three languages, so whole-message greetings now recall nothing; the "quiet" row includes that fix. "Found" = the right fact among the first five search results; "recalled" = injected before the turn;
+"quiet" = chit-chat, greetings and off-topic questions recall nothing.
+
+| | English | Russian | Chinese |
+|---|---|---|---|
+| Found, main set (20 questions) | 100 % | 100 % | 100 % |
+| Recalled, main set | 100 % | 100 % | 100 % |
+| Found / recalled, second set (10) | 90 % / 90 % | 90 % / 100 % | 100 % / 100 % |
+| Found / recalled, third set with distractors (8) | 100 % / 100 % | 88 % / 88 % | 100 % / 100 % |
+| Quiet on chit-chat and off-topic (all sets) | 14 / 14 | 14 / 14 | 14 / 14 |
+
+What it does not do: find a fact through a synonym with no shared word ("relocating" for "move", "бэкапы" for
+"резервные копии", 十月 for 10月), and it can surface a fact that shares a word in another sense ("nightly backups"
+→ "night market"). The main set runs in CI (`tests/test_holographic_languages.py`).
+
 ## Data and privacy
 
 - Facts live in one SQLite file (`db_path`), in the Hermes home of the profile, readable by its owner only (POSIX

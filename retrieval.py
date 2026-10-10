@@ -13,7 +13,8 @@ if TYPE_CHECKING:
     from .store import MemoryStore
 
 from . import holographic as hrr
-from .text import NEGATORS, content_stems, query_terms, stems, words
+from .text import (CJK_NEGATORS, NEGATORS, UNSEGMENTED, content_chars, content_stems, gram_coverage, is_greeting,
+                   query_grams, query_terms, stems, words)
 
 logger = logging.getLogger(__name__)
 
@@ -24,25 +25,7 @@ _PUNCT = ".,;:!?\"'()[]{}#@<>"
 # FTS5 operator characters. Inside a token they become spaces of a quoted phrase: "pve-01" -> "pve 01", the same two
 # tokens unicode61 indexed, adjacent (deleting them gave "pve01", which matches nothing).
 _FTS_OPERATORS = str.maketrans({c: " " for c in '"()*^:-+'})
-# Scripts written without spaces between words (Thai, Lao, Khmer, Myanmar, Chinese, Japanese) and Korean, whose
-# particles attach to the word: the FTS5 unicode61 tokenizer indexes a whole run as one token, so these are matched
-# by character n-grams against the text instead (bigrams for CJK and Hangul, trigrams for Southeast Asian scripts).
-_RE_UNSEGMENTED = re.compile(r"[\u0e00-\u0eff\u1000-\u109f\u1780-\u17ff]+|[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]+")
-_RE_SEA = re.compile(r"[\u0e00-\u0eff\u1000-\u109f\u1780-\u17ff]")
-_MAX_NGRAMS = 24
-
-
-def ngrams(text: str) -> list[str]:
-    """Distinct character n-grams of the unsegmented runs in *text* (a run shorter than n is kept whole)."""
-    grams: list[str] = []
-    for run in _RE_UNSEGMENTED.findall(text or ""):
-        n = 3 if _RE_SEA.match(run) else 2
-        grams += [run] if len(run) <= n else [run[i:i + n] for i in range(len(run) - n + 1)]
-    return list(dict.fromkeys(grams))[:_MAX_NGRAMS]
-
-
-def ngram_coverage(grams: list[str], text: str) -> float:
-    return sum(g in text for g in grams) / len(grams) if grams else 0.0
+_RE_UNSEGMENTED = UNSEGMENTED
 
 
 def _shift(sim: float) -> float:
@@ -103,17 +86,18 @@ class FactRetriever:
         """Facts sharing character n-grams with the query's unsegmented runs, ranked by the share of n-grams they
         contain ('fts_rank'). A substring scan: no extra index, so nothing to migrate or keep in sync; at the size
         this store is meant for (hundreds to thousands of facts) it takes milliseconds."""
-        grams = ngrams(query)
+        grams = query_grams(query)
         if not grams:
             return []
-        hits = " + ".join("(instr(content, ?) > 0)" for _ in grams)
+        hits = " + ".join(f"(instr(lower(content), ?) > 0) * {weight}" for _, weight in grams)
         sql = (f"SELECT * FROM (SELECT f.*, ({hits}) AS gram_hits FROM facts f WHERE f.trust_score >= ?"
                + (" AND f.category = ?" if category else "") + ") WHERE gram_hits > 0 ORDER BY gram_hits DESC LIMIT ?")
-        rows = self.store.read(sql, [*grams, min_trust, *([category] if category else []), limit])
+        rows = self.store.read(sql, [*(g for g, _ in grams), min_trust, *([category] if category else []), limit])
+        total = sum(weight for _, weight in grams)
         results = []
         for row in rows:
             fact = dict(row)
-            fact["fts_rank"] = fact.pop("gram_hits") / len(grams)
+            fact["fts_rank"] = fact.pop("gram_hits") / total
             results.append(fact)
         return results
 
@@ -169,11 +153,22 @@ class FactRetriever:
         if all(groups):
             return self._linked_facts(groups, category, min_trust, limit)
         unknown = [name for name, ids in zip(names, groups) if not ids]
-        phrases = [self._fts_phrase(name) for name in unknown]
-        if not all(phrases):
-            return []
         known = [ids for ids in groups if ids]
-        lexical = self._fts_query(" AND ".join(phrases), category, min_trust, 500 if known else limit * 3)
+        spaced = [n for n in unknown if not UNSEGMENTED.search(n)]
+        glued = [n.strip().lower() for n in unknown if UNSEGMENTED.search(n)]
+        expressions = []
+        for name in spaced:  # every word of the name, in any word form ("allergy" finds "allergic")
+            terms = query_terms(name)
+            if not terms:
+                return []
+            expressions.append("(" + " AND ".join(t.fts() for t in terms) + ")")
+        if expressions:
+            lexical = self._fts_query(" AND ".join(expressions), category, min_trust, 500)
+        elif known:
+            lexical = self._linked_facts(known, category, min_trust, 500)
+        else:
+            lexical = self._ngram_candidates(" ".join(glued), category, min_trust, 500)
+        lexical = [f for f in lexical if all(g in (f.get("content") or "").lower() for g in glued)]
         if known:  # known names by identity (aliases included), unknown names by their words
             allowed = {f["fact_id"] for f in self._linked_facts(known, category, min_trust, 10_000)}
             lexical = [f for f in lexical if f["fact_id"] in allowed]
@@ -314,11 +309,21 @@ class FactRetriever:
         Terms no fact contains are left out of the total (they cannot be matched by anything), and a matched
         identifier (pve-01, v0.21.6) is decisive on its own. A query with no informative term ("ok, thanks",
         "да, это так") recalls nothing. Order is preserved."""
-        grams = ngrams(query or "")
-        if grams and candidates:  # unsegmented script: coverage of the query's character n-grams decides
-            gram_kept = [f for f in candidates if ngram_coverage(grams, f.get("content", "")) >= min_coverage]
-        else:
-            gram_kept = []
+        if is_greeting(query):  # "good morning", "доброе утро", "早上好": a courtesy, not a question about mornings
+            return []
+        grams = query_grams(query or "")
+        gram_kept = []
+        if grams and candidates:
+            # Unsegmented script: weighted coverage of the query's n-grams, or (stricter, since one character says
+            # less than a word) IDF-weighted coverage of its meaningful characters: in Chinese a one-character
+            # word (猫, cat) or a reordered phrase (名字 / 名叫) shares characters, not bigrams.
+            char_weights = self._char_weights(content_chars(query))
+            char_total = sum(char_weights.values())
+            for f in candidates:
+                text = f'{f.get("content", "")} {f.get("tags") or ""}'.lower()
+                char_cov = sum(w for c, w in char_weights.items() if c in text) / char_total if char_total else 0.0
+                if gram_coverage(grams, text) >= min_coverage or char_cov >= max(0.5, min_coverage):
+                    gram_kept.append(f)
         terms = [t for t in query_terms(_RE_UNSEGMENTED.sub(" ", query or "")) if t.word]
         if not terms or not candidates:
             return gram_kept
@@ -348,13 +353,48 @@ class FactRetriever:
                 kept.append(fact)
         return kept
 
+    def _char_weights(self, chars: list[str]) -> dict[str, float]:
+        """IDF weight of each character over the store; a character no fact contains weighs like the most common
+        one that is present (it still says what the message is about)."""
+        if not chars:
+            return {}
+        total = max(self.store.count_facts(), 1)
+        weights, missing = {}, []
+        for c in chars[:16]:
+            df = self.store.read("SELECT COUNT(*) FROM facts WHERE instr(lower(content), ?) > 0", (c,))[0][0]
+            if df:
+                weights[c] = math.log(1.0 + total / df)
+            else:
+                missing.append(c)
+        if weights:
+            floor = min(weights.values())
+            weights.update({c: floor for c in missing})
+        return weights
+
     # -- write-time checks and housekeeping ----------------------------------------------------------------------
 
     @staticmethod
     def _claim(text: str, entity_words: set[str]) -> tuple[frozenset, bool]:
-        """(stems of the claim without the entity words and negators, negated?)."""
-        ws = [w for w in words(text) if w not in entity_words]
-        return frozenset(stems(" ".join(w for w in ws if w not in NEGATORS))), any(w in NEGATORS for w in ws)
+        """(the claim without the entity names and negators, negated?). Words compare by stem; unsegmented text
+        (Chinese, Thai) by its characters, which is what a short claim shares with a contradicting one."""
+        claim, negated = set(), False
+        for w in words(text):
+            if w in entity_words:
+                continue
+            if UNSEGMENTED.search(w):
+                for name in entity_words:
+                    if UNSEGMENTED.search(name):
+                        w = w.replace(name, " ")
+                for ch in w:
+                    if ch in CJK_NEGATORS:
+                        negated = True
+                    elif ch.isalnum():
+                        claim.add(ch)
+            elif w in NEGATORS:
+                negated = True
+            else:
+                claim |= stems(w)
+        return frozenset(claim), negated
 
     @classmethod
     def _conflicting(cls, a: tuple[frozenset, bool], b: tuple[frozenset, bool]) -> float:

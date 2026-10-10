@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.2 — 2026-10-11
+
+Language quality, measured on English, Russian and Chinese stores (see README, "Languages").
+
+### Fixed
+
+- **Chinese**: function characters (可以, 什么, 怎么, 我们) no longer count as topic; a chit-chat line such as
+  "可以，继续吧" recalled a fact that also said 可以. Recall before the turn also accepts IDF-weighted coverage of the
+  meaningful characters (stricter, 0.5), since a one-character word (猫) or a reordered phrase (名字 / 名叫) shares
+  characters rather than bigrams. Main-set recall 75 % → 100 %.
+- **Latin words inside Chinese text** ("猎头公司HR24", "服务器hr-ovh运行") are found: the tokenizer glues them to the
+  characters around them, so they are matched as substrings, and an ASCII identifier's word boundary is ASCII-only.
+- **Declared Chinese names** are recognised inside a message (no spaces around them), so their facts join the recall.
+- **reason** with a name that is not an entity matches it in any word form ("allergy" finds "allergic"; was an exact
+  phrase), and Chinese words by substring.
+- **Conflicts in Chinese**: claims compare by characters with 不/没/无 as negation ("安东喝黑咖啡，不加糖" vs
+  "安东喝咖啡加牛奶和糖" is flagged).
+- **Russian derivations** Snowball keeps apart ("переезжаем" / "переезд") meet on their shared beginning (stems of
+  7+ letters, first len-2 letters, at least 5).
+- **Greetings** ("good morning", "доброе утро", "早上好") are courtesies: they no longer recall facts about mornings.
+  "чём" and other ё-forms are stopwords.
+
 ## 0.4.1 — 2026-10-11
 
 Fixes from a second independent review (Codex CLI, whole branch 0.1.1..0.4.0), each with a regression test.
