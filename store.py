@@ -10,7 +10,7 @@ import unicodedata
 from pathlib import Path
 
 from . import holographic as hrr
-from .text import UNSEGMENTED, stem, words
+from .text import UNSEGMENTED, analyze, name_keys
 
 logger = logging.getLogger(__name__)
 
@@ -679,8 +679,8 @@ class MemoryStore:
                     self._bump()
                 self._write("INSERT OR IGNORE INTO fact_entities (fact_id, entity_id) VALUES (?, ?)", (fact_id, entity_id))
 
-    def _known_entities(self) -> dict[str, list[tuple[int, tuple[str, ...]]]]:
-        """{first stem: [(entity_id, stem sequence of a name or alias)]} for entities safe to match in free text:
+    def _known_entities(self) -> dict[str, list[tuple[int, tuple]]]:
+        """{key of the first word: [(entity_id, key sets of a name's words)]} for entities safe to match in free text:
         multi-word names, and one-word names only when declared (older stores hold one-word junk such as a quoted
         "Done", which would otherwise attach itself to every fact saying "done"). Cached per connection and rebuilt
         after any entity change here, a rollback, or a commit by another connection (PRAGMA data_version)."""
@@ -688,16 +688,17 @@ class MemoryStore:
             version = (self._entry.get("generation", 0), self._one("PRAGMA data_version")[0])
             cached = self._entry.get("entities")
             if cached is None or cached[0] != version:
-                index: dict[str, list[tuple[int, tuple[str, ...]]]] = {}
+                index: dict[str, list[tuple[int, tuple]]] = {}
                 names: dict[int, list[str]] = {}
                 if self._entry.get("migrated"):
                     for row in self._conn.execute("SELECT entity_id, alias FROM entity_aliases"):
                         names.setdefault(row["entity_id"], []).append(row["alias"])
                 for row in self._conn.execute("SELECT entity_id, name, aliases, entity_type FROM entities"):
                     for name in [row["name"], *((row["aliases"] or "").split(",")), *names.get(row["entity_id"], [])]:
-                        key = tuple(stem(w) for w in words(name))
+                        key = name_keys(name)
                         if len(key) > 1 or (key and row["entity_type"] == "declared"):
-                            index.setdefault(key[0], []).append((int(row["entity_id"]), key))
+                            for first in key[0]:
+                                index.setdefault(first, []).append((int(row["entity_id"]), key))
                         glued = name.strip().lower()
                         if UNSEGMENTED.search(glued) and len(glued) >= 2 and (len(key) > 1 or row["entity_type"] == "declared"):
                             index.setdefault("", []).append((int(row["entity_id"]), glued))  # "" = substring names
@@ -705,15 +706,18 @@ class MemoryStore:
             return cached[1]
 
     def mentioned_entity_ids(self, text: str) -> set[int]:
-        """Known entities whose name (or alias) occurs in *text* as a run of words, compared by stem: "Маши" and
-        "Машу" mention the entity "Маша"; "машина" does not. Looked up by each word's stem, not by scanning names."""
-        sequence = [stem(w) for w in words(text)]
+        """Known entities whose name (or alias) occurs in *text* as a run of words, compared by their keys (word and
+        stem): "Маши" and "Машу" mention the entity "Маша", "لإيفا" mentions "إيفا"; "машина" does not. Looked up by
+        each word's keys, not by scanning names."""
+        sequence = [w.keys for w in analyze(text).words]
         index = self._known_entities()
         found = set()
-        for i, first in enumerate(sequence):
-            for entity_id, key in index.get(first, ()):
-                if tuple(sequence[i:i + len(key)]) == key:
-                    found.add(entity_id)
+        for i, keys in enumerate(sequence):
+            for first in keys:
+                for entity_id, key in index.get(first, ()):
+                    if entity_id not in found and len(sequence) - i >= len(key) and \
+                            all(name & sequence[i + j] for j, name in enumerate(key)):
+                        found.add(entity_id)
         if UNSEGMENTED.search(text or ""):  # a name in Chinese/Thai text has no spaces around it: substring match
             lowered = text.lower()
             for entity_id, name in index.get("", ()):

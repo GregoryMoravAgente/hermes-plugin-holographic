@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.5.0 — 2026-10-11
+
+Seven more languages: Spanish, Hindi, Arabic, French, Bengali, Portuguese, Indonesian (the most spoken after English,
+Chinese and Russian). Measured on the same kind of stores as 0.4.2 (README, "Languages"): before, Arabic recalled the
+right fact before the turn for 50 % of questions, French 75 %, Spanish 85 %, and chit-chat recalled facts in four
+languages; now 100 % on the main sets, 100 % found and recalled on unseen sets.
+
+### Added
+
+- **Stems per language**: Snowball for Spanish, French, Portuguese, Indonesian and Hindi (Latin words were all stemmed
+  as English); Arabic light10 with Snowball's Arabic and a variant without a glued preposition; a light Bengali suffix
+  stripper. The language of Latin text is told by its function words; text with none gets all five Latin stems.
+- **Function words per language** (ten lists): a Spanish or Hindi "thanks" recalls nothing, and a word is dropped only
+  as a function word of the text's own language.
+- **Arabic, Indic scripts and Indonesian are matched word by word** against the facts' text: the FTS5 index splits
+  Devanagari and Bengali words into letters and cannot see past Arabic (`ال`, `ل`, `بال`) or Indonesian (`me-`,
+  `di-`) prefixes. About 0.04 s per search at 5,000 facts; facts are re-read only when their text changed.
+- **Folding**: Latin accents, Arabic vowel marks and letter variants (`أ` = `ا`, `ة` = `ه`), the Indic nukta, native
+  digits (searched in each digit system too, so `2027` finds `২০২৭`).
+- **Tokens**: Unicode punctuation stripped (`¿`, `؟`, `।`); French elision (`d'Eva`) and inversion (`prend-il`);
+  reduplication (`anak-anak`); a hyphen between scripts splits (`hr-ovh-এর`). A hyphen alone no longer makes an
+  identifier, so `prend-il` or `sexta-feira` is not required to match exactly.
+- **Greetings** in the seven languages; negators (`no`, `pas`, `não`, `tidak`, `لا`, `नहीं`, `না`).
+
+### Changed
+
+- Possible conflicts compare claims by word keys without function words, so "Ana come carne todos los días" and "Ana
+  no come carne" are flagged, as are claims whose texts were told apart as different languages.
+- Facts of a named entity come back newest first when their timestamps tie (were in arbitrary order; the second-set
+  numbers published with 0.4.2 were partly that luck and are corrected in the README).
+
 ## 0.4.2 — 2026-10-11
 
 Language quality, measured on English, Russian and Chinese stores (see README, "Languages").

@@ -48,8 +48,8 @@ In `config.yaml` under `plugins.hermes-memory-store`:
 | `fact_store` | add, search, probe, related, reason, contradict, update, remove, list, stats, export, review, entities, alias |
 | `fact_feedback` | Rate a fact helpful or unhelpful (moves its trust score) |
 
-- **search**: keyword (FTS5) candidates, any word form (English and Russian stems: `Маши` finds `Маша`, `deploys`
-  finds `deploy`), reranked by word overlap and HRR similarity, weighted by trust.
+- **search**: keyword candidates in any word form (`Маши` finds `Маша`, `deploys` finds `deploy`, `kucingnya` finds
+  `kucing`; see [Languages](#languages)), reranked by word overlap and HRR similarity, weighted by trust.
 - **Before each turn** the provider recalls up to five facts: search candidates that pass a relevance gate (the fact
   must cover enough of the message's informative words; "ok, thanks" recalls nothing) plus the top facts of entities
   the message names. A fact already injected in this session is not repeated for `prefetch_repeat_turns` turns.
@@ -63,8 +63,6 @@ In `config.yaml` under `plugins.hermes-memory-store`:
   (clean-up candidates: low trust, never recalled for 60 days, near-duplicates).
 - **entities** lists names with their aliases and fact counts; **alias** gives an entity a second name (or merges
   two entities). Spelling variants are one entity (`Hermes Agent` = `hermes-agent`), and `X aka Y` makes `Y` an alias.
-- Thai, Chinese, Japanese and Korean (text without spaces between words, or with attached particles) are matched by
-  character n-grams.
 - **probe**: every fact linked to a named entity, from the entity index (name or alias, any letter case).
   **reason**: facts linked to *all* of several entities; when a name is not a known entity, keyword search that still
   requires every name. Entities are linked when a fact is stored: capitalized names of two to five words in any cased
@@ -76,34 +74,70 @@ In `config.yaml` under `plugins.hermes-memory-store`:
 - **contradict**: candidate conflicts, i.e. pairs about the same subject that make a similar but not identical
   claim ("lives in Paris" / "lives in London"). It suggests; it never edits.
 
-Stems are a search key, not a dictionary: an irregular form may still miss (`ponies` vs `pony`). Character n-grams
-find shared fragments, not meaning: a Chinese question with no word in common with the fact will not find it.
-
 ## Languages
+
+A word matches another when they share its plain form or its stem in the language of the text:
+
+- **Stems**: Snowball for English, Russian, Spanish, French, Portuguese, Indonesian and Hindi; for Arabic, Larkey's
+  light stemmer (the one Lucene ships) next to Snowball's, plus a variant without a glued one-letter preposition
+  (`لإيفا` is "for Eva"); for Bengali, a light suffix stripper (Snowball has none).
+- **Which language**: the script decides for Cyrillic, Arabic, Devanagari and Bengali. Latin text is English, Spanish,
+  French, Portuguese or Indonesian by the function words it uses ("the", "el", "le", "o", "yang"); text with none of
+  them is stemmed in all five. Each language has its own function words, so French "son" is not dropped from an
+  English question about a son.
+- **Folding**: Latin accents (`esta` finds `está`), Arabic vowel marks and letter variants, the Indic nukta, and
+  native digits (`2027` finds `২০২৭`). French elision and inversion (`d'Eva`, `prend-il`), Indonesian reduplication
+  (`anak-anak`) and suffixes after a hyphen (`hr-ovh-এর`) are taken apart.
+- **Chinese, Japanese, Korean, Thai** (no spaces between words): character n-grams.
+- **Arabic, Indic scripts and Indonesian** are matched word by word against the text of the facts instead of the SQLite
+  FTS5 index, which splits Indic words at their vowel signs and cannot see past Arabic and Indonesian prefixes. Measured
+  at 5,000 facts: about 0.04 s per search plus 0.03 s for the relevance gate, and about one second once per process
+  to read the facts.
 
 Measured on stores of 20 everyday facts per language (people, school, work, servers, plans). "Found" = the right
 fact among the first five search results; "recalled" = injected before the turn; "quiet" = chit-chat, greetings and
-off-topic questions recall nothing. How the numbers were obtained, honestly:
+off-topic questions recall nothing.
 
-- **Main set** (20 questions): the fixes in 0.4.2 were made against it.
-- **Second set** (10 questions) was written afterwards and first run without changes: Russian recall 90 %, Chinese
-  70 %. Two more fixes followed from its misses (Russian derivations, Chinese characters), so its row shows the
-  numbers after them.
-- **Third set** (8 questions, 15 unrelated facts added per language) was written after that and run once. It found
-  one more problem, greetings ("good morning", "доброе утро", "早上好") recalling facts about mornings in all three
-  languages; whole-message greetings now recall nothing, and the "quiet" row includes that fix.
-
-| | English | Russian | Chinese |
+| | Main set (20 questions): found / recalled | Unseen set (8 questions, 15 unrelated facts added): found / recalled | Quiet (all sets) |
 |---|---|---|---|
-| Found, main set (20 questions) | 100 % | 100 % | 100 % |
-| Recalled, main set | 100 % | 100 % | 100 % |
-| Found / recalled, second set (10) | 90 % / 90 % | 90 % / 100 % | 100 % / 100 % |
-| Found / recalled, third set with distractors (8) | 100 % / 100 % | 88 % / 88 % | 100 % / 100 % |
-| Quiet on chit-chat and off-topic (all sets) | 14 / 14 | 14 / 14 | 14 / 14 |
+| English | 100 % / 100 % | 100 % / 100 % | 14 / 14 |
+| Russian | 100 % / 100 % | 88 % / 88 % | 14 / 14 |
+| Chinese | 100 % / 100 % | 100 % / 100 % | 14 / 14 |
+| Spanish | 100 % / 100 % | 100 % / 100 % | 10 / 10 |
+| Hindi | 100 % / 100 % | 100 % / 100 % | 9 / 10 |
+| Arabic | 100 % / 100 % | 100 % / 100 % | 10 / 10 |
+| French | 100 % / 100 % | 100 % / 100 % | 10 / 10 |
+| Bengali | 100 % / 100 % | 100 % / 100 % | 10 / 10 |
+| Portuguese | 100 % / 100 % | 100 % / 100 % | 10 / 10 |
+| Indonesian | 100 % / 100 % | 100 % / 100 % | 10 / 10 |
 
-What it does not do: find a fact through a synonym with no shared word ("relocating" for "move", "бэкапы" for
-"резервные копии", 十月 for 10月), and it can surface a fact that shares a word in another sense ("nightly backups"
-→ "night market"). The main set runs in CI (`tests/test_holographic_languages.py`).
+In the unseen sets the right fact is first in 75–100 % of questions, and 0–1 of the 15 unrelated facts is injected
+per language. English, Russian and Chinese also have a second set (10 questions): found 90 / 90 / 100 %, recalled
+80 / 90 / 90 %.
+
+How the numbers were obtained, honestly:
+
+- **Main sets are tuned on.** English, Russian and Chinese: the fixes in 0.4.2 were made against them. The other seven:
+  the set was first run on 0.4.2, where it found 85–100 % and recalled 50–100 % (Arabic 50 %, French 75 %, Spanish
+  85 %), and chit-chat recalled facts in four languages; 0.5.0 fixes were made against those misses. The fixes are
+  per language and per script (function words, stemmers, folding, how a word is matched), not per question.
+- **Unseen sets were written after the fixes and run once.** English, Russian, Chinese: after it, whole-message
+  greetings were made to recall nothing ("good morning" recalled facts about mornings), and the quiet column includes
+  that fix. The other seven: three fixes followed from unit tests written afterwards (native digits in search,
+  `rendez-vous`, conflicts in claims with extra words); the set was run again and gave the same numbers.
+- **The second set was written after the main set of 0.4.2**, first run without changes (Russian recall 90 %, Chinese
+  70 %), and two fixes followed. Its numbers published with 0.4.2 (recalled 90 / 100 / 100 %) were partly luck: facts
+  of a named person saved in the same second came back in arbitrary order. They now come back newest first, every
+  time, and the numbers above are what that gives.
+- **Not measured**: Japanese, Korean, Thai (n-grams, as Chinese), German and other languages (exact words, no stems,
+  no function-word list).
+
+What it does not do: find a fact through a synonym or a word of another root ("relocating" for "move", "бэкапы" for
+"резервные копии", Spanish `nada` for `natación`, 十月 for 10月). It can surface a fact that shares a word in another
+sense: "nightly backups" → "night market"; Hindi `बनाना` is both "to cook" and "to make a plan"; Portuguese `dirigir`
+is "to drive" and "to run a company". Stems are search keys, not lemmas: an irregular form can miss (`ponies` /
+`pony`). `auto_extract` and the refusal of instruction-like text recognise English and Russian phrasing only. The main
+sets of all ten languages run in CI (`tests/test_holographic_languages.py`).
 
 ## Data and privacy
 
