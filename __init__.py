@@ -2,7 +2,7 @@
 resolution, trust scoring, and HRR-based compositional retrieval. Original plugin by dusterbloom (PR #2351).
 Config in $HERMES_HOME/config.yaml under plugins.hermes-memory-store: db_path ($HERMES_HOME/memory_store.db),
 auto_extract (false), default_trust (0.5), min_trust_threshold (0.3), temporal_decay_half_life (0),
-hrr_dim (1024), hrr_weight (0.3)."""
+hrr_dim (1024), hrr_weight (0.3), mirror_memory_writes (false)."""
 
 from __future__ import annotations
 
@@ -35,7 +35,8 @@ FACT_STORE_SCHEMA = {
         "• probe — Entity recall: ALL facts about a person/thing.\n• related — What connects to an entity? Structural adjacency.\n"
         "• reason — Compositional: facts connected to MULTIPLE entities simultaneously.\n"
         "• contradict — Memory hygiene: find facts making conflicting claims.\n• update/remove/list — CRUD operations.\n\n"
-        "IMPORTANT: Before answering questions about the user, ALWAYS probe or reason first."
+        "Before answering questions about the user, search first; probe a named person or thing for everything "
+        "linked to it, reason for facts linking several. Fact ids (#N) in recalled memory are what fact_feedback takes."
     ),
     "parameters": {
         "type": "object",
@@ -134,6 +135,9 @@ class HolographicMemoryProvider(MemoryProvider):
             {"key": "auto_extract", "description": "Auto-extract facts at session end", "default": "false", "choices": ["true", "false"]},
             {"key": "default_trust", "description": "Default trust score for new facts", "default": "0.5"},
             {"key": "hrr_dim", "description": "HRR vector dimensions", "default": "1024"},
+            {"key": "mirror_memory_writes", "description": "Also store every built-in memory 'add' (MEMORY.md / USER.md) "
+             "as a fact. Off: those entries are already in the system prompt in full", "default": "false",
+             "choices": ["true", "false"]},
         ]
 
     def initialize(self, session_id: str, **kwargs) -> None:
@@ -166,8 +170,9 @@ class HolographicMemoryProvider(MemoryProvider):
         if not self._retriever or not query:
             return ""
         try:
-            results = self._retriever.search(query, min_trust=self._min_trust, limit=5)
-            lines = [f"- [{r.get('trust_score', r.get('trust', 0)):.1f}] {r.get('content', '')}" for r in results]
+            results = self._counted(self._retriever.search(query, min_trust=self._min_trust, limit=5))
+            lines = [f"- #{r.get('fact_id')} [{r.get('trust_score', r.get('trust', 0)):.1f}] {r.get('content', '')}"
+                     for r in results]
             return "## Holographic Memory\n" + "\n".join(lines) if results else ""
         except Exception as e:
             logger.debug("Holographic prefetch failed: %s", e)
@@ -192,7 +197,13 @@ class HolographicMemoryProvider(MemoryProvider):
             self._auto_extract_facts(messages)
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
-        """Mirror built-in memory writes as facts."""
+        """Mirror built-in memory writes as facts, only with ``mirror_memory_writes`` on.
+
+        Off by default: MEMORY.md / USER.md already sit in the system prompt in full, so the copy added no
+        knowledge. prefetch injected the same sentence a second time, and the copy outlived the entry when it was
+        later reworded or removed (only ``add`` was mirrored)."""
+        if not is_truthy_value(self._config.get("mirror_memory_writes", False)):
+            return
         if action == "add" and self._store and content:
             try:
                 self._store.add_fact(content, category="user_pref" if target == "user" else "general")
@@ -211,19 +222,31 @@ class HolographicMemoryProvider(MemoryProvider):
     # Tool handlers (self, args) -> str. KeyError from args[...] / Exception -> tool_error in handle_tool_call;
     # argument coercion order (and therefore which error surfaces first) mirrors the underlying call order.
 
+    def _counted(self, results: list) -> list:
+        """Count the facts handed to the model as recall (prefetch, search/probe/related/reason; never list or
+        contradict). ``retrieval_count`` was declared and never written, so "nobody ever used this fact" was true
+        of every fact. A failed count never breaks retrieval."""
+        try:
+            self._store.record_retrievals(r.get("fact_id") for r in results)
+        except Exception as e:
+            logger.debug("Holographic retrieval count failed: %s", e)
+        return results
+
     def _entity_query(self, method: str, a: dict) -> str:
         """'probe' / 'related': single-entity retriever queries."""
-        return _results(getattr(self._retriever, method)(a["entity"], category=a.get("category"), limit=_limit(a)))
+        return _results(self._counted(
+            getattr(self._retriever, method)(a["entity"], category=a.get("category"), limit=_limit(a))))
 
     _TOOL_HANDLERS = {
         "fact_store": _tool_handler({
             "add": lambda self, a: json.dumps({"fact_id": self._store.add_fact(
                 a["content"], category=a.get("category", "general"), tags=a.get("tags", "")), "status": "added"}),
-            "search": lambda self, a: _results(self._retriever.search(
-                a["query"], category=a.get("category"), min_trust=float(a.get("min_trust", self._min_trust)), limit=_limit(a))),
+            "search": lambda self, a: _results(self._counted(self._retriever.search(
+                a["query"], category=a.get("category"), min_trust=float(a.get("min_trust", self._min_trust)), limit=_limit(a)))),
             "probe": lambda self, a: self._entity_query("probe", a),
             "related": lambda self, a: self._entity_query("related", a),
-            "reason": lambda self, a: _results(self._retriever.reason(a["entities"], category=a.get("category"), limit=_limit(a)))
+            "reason": lambda self, a: _results(self._counted(
+                self._retriever.reason(a["entities"], category=a.get("category"), limit=_limit(a))))
             if a.get("entities") else tool_error("reason requires 'entities' list"),
             "contradict": lambda self, a: _results(self._retriever.contradict(category=a.get("category"), limit=_limit(a))),
             "update": lambda self, a: json.dumps({"updated": self._store.update_fact(

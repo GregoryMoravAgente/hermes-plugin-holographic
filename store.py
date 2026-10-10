@@ -72,9 +72,13 @@ CREATE TABLE IF NOT EXISTS memory_banks (
 
 _HELPFUL_DELTA, _UNHELPFUL_DELTA = 0.05, -0.10
 
-# Entity extraction patterns, applied in order: capitalized multi-word phrases ("John Doe"), double-quoted terms,
-# single-quoted terms, then "X aka Y" (both sides).
-_RE_SINGLE_ENTITY = (re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b'), re.compile(r'"([^"]+)"'), re.compile(r"'([^']+)'"))
+# Entity extraction, applied in order: capitalized multi-word phrases in any cased script ("John Doe", "Мария
+# Иванова"), short quoted terms (straight, curly, guillemets), then "X aka Y" (both sides).
+_RE_WORD = re.compile(r"[^\W\d_]+(?:-[^\W\d_]+)*")  # letters only; hyphenated names stay one word
+_RE_QUOTED = (re.compile(r'"([^"]+)"'), re.compile(r"'([^']+)'"), re.compile(r"\u00ab([^\u00bb]+)\u00bb"),
+              re.compile(r"\u201c([^\u201d]+)\u201d"), re.compile(r"\u201e([^\u201c\u201d]+)[\u201c\u201d]"))
+# A quoted span longer than this is a quotation ("she said: 'see you on Friday'"), not a name.
+_QUOTED_MAX_WORDS, _QUOTED_MAX_CHARS = 3, 60
 _RE_AKA = re.compile(r'(\w+(?:\s+\w+)*)\s+(?:aka|also known as)\s+(\w+(?:\s+\w+)*)', re.IGNORECASE)
 _ENTITY_NAMES_SQL = "SELECT e.name FROM entities e JOIN fact_entities fe ON fe.entity_id = e.entity_id WHERE fe.fact_id = ?"
 # Entity lookup order: exact name, then aliases (comma-separated; wrapped in commas for whole-alias matching).
@@ -84,6 +88,35 @@ _ENTITY_LOOKUPS = ("SELECT entity_id FROM entities WHERE name LIKE ?",
 
 def _clamp_trust(value: float) -> float:
     return max(0.0, min(1.0, value))
+
+
+def _is_capitalized(word: str) -> bool:
+    """'John', 'Мария', 'Jean-Luc': each hyphen part an upper-case letter followed by lower-case ones (so not
+    'NASA', 'I' or 'iPhone')."""
+    return all(len(part) > 1 and part[0].isupper() and part[1:].islower() for part in word.split("-"))
+
+
+def _capitalized_phrases(text: str) -> list[str]:
+    """Runs of two or more capitalized words separated only by whitespace, in any cased script."""
+    phrases, run, run_end = [], [], None
+    for m in _RE_WORD.finditer(text):
+        if _is_capitalized(m.group(0)) and (not run or text[run_end:m.start()].isspace()):
+            run.append(m)
+        else:
+            if len(run) > 1:
+                phrases.append(text[run[0].start():run[-1].end()])
+            run = [m] if _is_capitalized(m.group(0)) else []
+        run_end = m.end()
+    if len(run) > 1:
+        phrases.append(text[run[0].start():run[-1].end()])
+    return phrases
+
+
+def _as_int(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class MemoryStore:
@@ -199,6 +232,19 @@ class MemoryStore:
                    "ORDER BY trust_score DESC LIMIT ?")
             return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
 
+    def record_retrievals(self, fact_ids) -> int:
+        """retrieval_count += 1 for facts handed to the model; returns the number of rows touched.
+
+        Only the counter changes: ``updated_at`` drives temporal decay and recall is not an edit. Non-integer ids
+        are skipped, duplicates count once."""
+        ids = sorted({v for raw in fact_ids or () if not isinstance(raw, bool) and (v := _as_int(raw)) is not None})
+        if not ids:
+            return 0
+        with self._lock:
+            cur = self._write(f"UPDATE facts SET retrieval_count = retrieval_count + 1 "
+                              f"WHERE fact_id IN ({','.join('?' * len(ids))})", ids)
+            return max(cur.rowcount, 0)
+
     def record_feedback(self, fact_id: int, helpful: bool) -> dict:
         """Adjust trust asymmetrically: helpful -> +0.05 and helpful_count += 1; unhelpful -> -0.10.
         Returns {fact_id, old_trust, new_trust, helpful_count}. Raises KeyError if fact_id is unknown."""
@@ -215,7 +261,9 @@ class MemoryStore:
 
     def _extract_entities(self, text: str) -> list[str]:
         """Regex entity candidates (see the pattern table), deduplicated case-insensitively in first-seen order."""
-        raw = [m.group(1) for pattern in _RE_SINGLE_ENTITY for m in pattern.finditer(text)]
+        raw = _capitalized_phrases(text) + [
+            m.group(1) for pattern in _RE_QUOTED for m in pattern.finditer(text)
+            if len(m.group(1)) <= _QUOTED_MAX_CHARS and len(m.group(1).split()) <= _QUOTED_MAX_WORDS]
         for m in _RE_AKA.finditer(text):
             raw += [m.group(1), m.group(2)]
         uniq: dict[str, str] = {}  # lower-cased key -> first-seen spelling, insertion-ordered
