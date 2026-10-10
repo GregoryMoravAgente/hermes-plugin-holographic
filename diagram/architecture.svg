@@ -1,0 +1,199 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 640">
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&amp;display=swap');
+    text { font-family: 'JetBrains Mono', 'SF Mono', 'Cascadia Code', 'DejaVu Sans Mono', monospace; }
+    .title { fill: #f8fafc; font-size: 16px; font-weight: 700; }
+    .subtitle { fill: #94a3b8; font-size: 9px; }
+    .region { font-size: 9px; font-weight: 600; }
+    .name { fill: #ffffff; font-size: 11px; font-weight: 600; }
+    .sub { fill: #94a3b8; font-size: 9px; }
+    .label { fill: #cbd5e1; font-size: 8px; }
+    .note { fill: #94a3b8; font-size: 8px; }
+  </style>
+  <defs>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.5"/>
+    </pattern>
+    <marker id="arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#64748b"/>
+    </marker>
+    <marker id="arrow-blue" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#60a5fa"/>
+    </marker>
+    <marker id="arrow-rose" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#fb7185"/>
+    </marker>
+    <marker id="arrow-open" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polyline points="0 0, 10 3.5, 0 7" fill="none" stroke="#60a5fa" stroke-width="1.5"/>
+    </marker>
+  </defs>
+
+  <!-- 1. background -->
+  <rect width="100%" height="100%" fill="#0f172a"/>
+  <rect width="100%" height="100%" fill="url(#grid)"/>
+
+  <!-- 8. title (top-left, outside content) -->
+  <text x="30" y="38" class="title">holographic: how it fits into Hermes Agent</text>
+  <text x="30" y="56" class="subtitle">One SQLite file per profile (or per user). No network, no API key, no model calls.</text>
+
+  <!-- 2. column regions -->
+  <rect x="30" y="103" width="230" height="2" rx="1" fill="#fbbf24" opacity="0.7"/>
+  <text x="42" y="96" class="region" fill="#fbbf24">Hermes Agent core</text>
+  <rect x="290" y="103" width="230" height="2" rx="1" fill="#34d399" opacity="0.7"/>
+  <text x="302" y="96" class="region" fill="#34d399">provider · __init__.py</text>
+  <rect x="550" y="103" width="250" height="2" rx="1" fill="#22d3ee" opacity="0.7"/>
+  <text x="562" y="96" class="region" fill="#22d3ee">retrieval.py · text.py · store.py</text>
+  <rect x="830" y="103" width="220" height="2" rx="1" fill="#a78bfa" opacity="0.7"/>
+  <text x="842" y="96" class="region" fill="#a78bfa">$HERMES_HOME/memory_store.db</text>
+
+  <!-- 3. arrows -->
+  <!-- lane 1: message in, facts out -->
+  <line x1="245" y1="165" x2="303" y2="165" stroke="#60a5fa" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
+  <text x="275" y="159" class="label" text-anchor="middle">message</text>
+  <line x1="305" y1="200" x2="247" y2="200" stroke="#60a5fa" stroke-width="1.2" stroke-dasharray="4,3" marker-end="url(#arrow-open)"/>
+  <text x="275" y="214" class="label" text-anchor="middle">≤ 5 facts</text>
+  <line x1="505" y1="165" x2="563" y2="165" stroke="#60a5fa" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
+  <text x="535" y="159" class="label" text-anchor="middle">terms</text>
+  <line x1="565" y1="200" x2="507" y2="200" stroke="#60a5fa" stroke-width="1.2" stroke-dasharray="4,3" marker-end="url(#arrow-open)"/>
+  <text x="535" y="214" class="label" text-anchor="middle">ranked</text>
+  <line x1="785" y1="175" x2="848" y2="175" stroke="#60a5fa" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
+  <text x="817" y="169" class="label" text-anchor="middle">MATCH</text>
+  <text x="817" y="190" class="label" text-anchor="middle">or scan</text>
+  <!-- lane 2: writes -->
+  <line x1="245" y1="325" x2="303" y2="325" stroke="#fb7185" stroke-width="1.5" marker-end="url(#arrow-rose)"/>
+  <text x="275" y="319" class="label" text-anchor="middle">add</text>
+  <line x1="505" y1="325" x2="563" y2="325" stroke="#fb7185" stroke-width="1.5" marker-end="url(#arrow-rose)"/>
+  <text x="535" y="319" class="label" text-anchor="middle">valid</text>
+  <line x1="785" y1="325" x2="848" y2="325" stroke="#fb7185" stroke-width="1.5" marker-end="url(#arrow-rose)"/>
+  <text x="817" y="319" class="label" text-anchor="middle">one</text>
+  <text x="817" y="340" class="label" text-anchor="middle">transaction</text>
+  <!-- lane 3: recall tools -->
+  <line x1="245" y1="475" x2="303" y2="475" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="275" y="469" class="label" text-anchor="middle">action</text>
+  <line x1="505" y1="475" x2="563" y2="475" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="535" y="469" class="label" text-anchor="middle">min_trust</text>
+  <line x1="785" y1="475" x2="848" y2="475" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="817" y="469" class="label" text-anchor="middle">read</text>
+
+  <!-- 4+5+6. boxes: mask, then styled box, then text -->
+  <!-- lane 1 -->
+  <rect x="45" y="120" width="200" height="110" rx="6" fill="#0f172a"/>
+  <rect x="45" y="120" width="200" height="110" rx="6" fill="rgba(59,130,246,0.3)" stroke="#60a5fa" stroke-width="1.5"/>
+  <text x="145" y="142" class="name" text-anchor="middle">Memory manager</text>
+  <text x="145" y="160" class="sub" text-anchor="middle">prefetch(message)</text>
+  <text x="145" y="173" class="sub" text-anchor="middle">before each turn;</text>
+  <text x="145" y="186" class="sub" text-anchor="middle">facts go into</text>
+  <text x="145" y="199" class="sub" text-anchor="middle">&lt;memory-context&gt;</text>
+  <text x="145" y="212" class="sub" text-anchor="middle">as data, not instructions</text>
+
+  <rect x="305" y="120" width="200" height="110" rx="6" fill="#0f172a"/>
+  <rect x="305" y="120" width="200" height="110" rx="6" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.5"/>
+  <text x="405" y="142" class="name" text-anchor="middle">Relevance gate</text>
+  <text x="405" y="160" class="sub" text-anchor="middle">greetings recall nothing</text>
+  <text x="405" y="173" class="sub" text-anchor="middle">IDF share of the words</text>
+  <text x="405" y="186" class="sub" text-anchor="middle">identifiers must match</text>
+  <text x="405" y="199" class="sub" text-anchor="middle">no repeat for 6 turns</text>
+  <text x="405" y="212" class="sub" text-anchor="middle">+ facts of named entities</text>
+
+  <rect x="565" y="120" width="220" height="110" rx="6" fill="#0f172a"/>
+  <rect x="565" y="120" width="220" height="110" rx="6" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+  <text x="675" y="142" class="name" text-anchor="middle">Search</text>
+  <text x="675" y="160" class="sub" text-anchor="middle">language → stems, folding</text>
+  <text x="675" y="173" class="sub" text-anchor="middle">FTS5 prefix: Latin, Cyrillic</text>
+  <text x="675" y="186" class="sub" text-anchor="middle">n-grams: CJK, Thai</text>
+  <text x="675" y="199" class="sub" text-anchor="middle">word scan: Arabic, Indic, id</text>
+  <text x="675" y="212" class="sub" text-anchor="middle">rank: overlap + HRR + trust</text>
+
+  <!-- lane 2 -->
+  <rect x="45" y="270" width="200" height="110" rx="6" fill="#0f172a"/>
+  <rect x="45" y="270" width="200" height="110" rx="6" fill="rgba(30,41,59,0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="145" y="292" class="name" text-anchor="middle">Model tool calls</text>
+  <text x="145" y="310" class="sub" text-anchor="middle">fact_store add · update</text>
+  <text x="145" y="323" class="sub" text-anchor="middle">remove · alias</text>
+  <text x="145" y="336" class="sub" text-anchor="middle">fact_feedback</text>
+  <text x="145" y="349" class="sub" text-anchor="middle">auto_extract after turns</text>
+  <text x="145" y="362" class="sub" text-anchor="middle">(off by default)</text>
+
+  <rect x="305" y="270" width="200" height="110" rx="6" fill="#0f172a"/>
+  <rect x="305" y="270" width="200" height="110" rx="6" fill="rgba(136,19,55,0.4)" stroke="#fb7185" stroke-width="1.5"/>
+  <text x="405" y="292" class="name" text-anchor="middle">Write validator</text>
+  <text x="405" y="310" class="sub" text-anchor="middle">refuses instructions,</text>
+  <text x="405" y="323" class="sub" text-anchor="middle">tool JSON, role markup,</text>
+  <text x="405" y="336" class="sub" text-anchor="middle">secret requests, blobs</text>
+  <text x="405" y="349" class="sub" text-anchor="middle">subagents and cron:</text>
+  <text x="405" y="362" class="sub" text-anchor="middle">read-only</text>
+
+  <rect x="565" y="270" width="220" height="110" rx="6" fill="#0f172a"/>
+  <rect x="565" y="270" width="220" height="110" rx="6" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+  <text x="675" y="292" class="name" text-anchor="middle">Store and check</text>
+  <text x="675" y="310" class="sub" text-anchor="middle">fact, entity links and</text>
+  <text x="675" y="323" class="sub" text-anchor="middle">HRR vector in one commit</text>
+  <text x="675" y="336" class="sub" text-anchor="middle">answer lists similar facts</text>
+  <text x="675" y="349" class="sub" text-anchor="middle">and possible conflicts;</text>
+  <text x="675" y="362" class="sub" text-anchor="middle">the agent decides</text>
+
+  <!-- lane 3 -->
+  <rect x="45" y="420" width="200" height="110" rx="6" fill="#0f172a"/>
+  <rect x="45" y="420" width="200" height="110" rx="6" fill="rgba(30,41,59,0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="145" y="442" class="name" text-anchor="middle">Recall tools</text>
+  <text x="145" y="460" class="sub" text-anchor="middle">search · probe · reason</text>
+  <text x="145" y="473" class="sub" text-anchor="middle">related · contradict</text>
+  <text x="145" y="486" class="sub" text-anchor="middle">entities · stats</text>
+  <text x="145" y="499" class="sub" text-anchor="middle">export · review</text>
+
+  <rect x="305" y="420" width="200" height="110" rx="6" fill="#0f172a"/>
+  <rect x="305" y="420" width="200" height="110" rx="6" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.5"/>
+  <text x="405" y="442" class="name" text-anchor="middle">Provider</text>
+  <text x="405" y="460" class="sub" text-anchor="middle">store per profile</text>
+  <text x="405" y="473" class="sub" text-anchor="middle">or per user (scope)</text>
+  <text x="405" y="486" class="sub" text-anchor="middle">min_trust everywhere</text>
+  <text x="405" y="499" class="sub" text-anchor="middle">thread-safe entry points</text>
+
+  <rect x="565" y="420" width="220" height="110" rx="6" fill="#0f172a"/>
+  <rect x="565" y="420" width="220" height="110" rx="6" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+  <text x="675" y="442" class="name" text-anchor="middle">Entities and vectors</text>
+  <text x="675" y="460" class="sub" text-anchor="middle">entity index + aliases</text>
+  <text x="675" y="473" class="sub" text-anchor="middle">HRR: bind · unbind · bundle</text>
+  <text x="675" y="486" class="sub" text-anchor="middle">noise floor for related</text>
+  <text x="675" y="499" class="sub" text-anchor="middle">claims compared by keys</text>
+
+  <!-- database cylinder -->
+  <g transform="translate(850, 118)">
+    <rect x="0" y="14" width="180" height="400" fill="#0f172a"/>
+    <ellipse cx="90" cy="14" rx="90" ry="14" fill="#0f172a"/>
+    <ellipse cx="90" cy="414" rx="90" ry="14" fill="#0f172a"/>
+    <rect x="0" y="14" width="180" height="400" fill="rgba(76,29,149,0.4)"/>
+    <ellipse cx="90" cy="414" rx="90" ry="14" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+    <ellipse cx="90" cy="14" rx="90" ry="14" fill="rgba(76,29,149,0.6)" stroke="#a78bfa" stroke-width="1.5"/>
+    <line x1="0" y1="14" x2="0" y2="414" stroke="#a78bfa" stroke-width="1.5"/>
+    <line x1="180" y1="14" x2="180" y2="414" stroke="#a78bfa" stroke-width="1.5"/>
+    <text x="90" y="52" class="name" text-anchor="middle">SQLite, WAL</text>
+    <text x="90" y="66" class="sub" text-anchor="middle">owner-only (0600)</text>
+    <text x="90" y="100" class="name" text-anchor="middle">facts</text>
+    <text x="90" y="114" class="sub" text-anchor="middle">content · trust · counts</text>
+    <text x="90" y="127" class="sub" text-anchor="middle">hrr_vector</text>
+    <text x="90" y="161" class="name" text-anchor="middle">facts_fts</text>
+    <text x="90" y="175" class="sub" text-anchor="middle">FTS5 index, kept in</text>
+    <text x="90" y="188" class="sub" text-anchor="middle">sync by triggers</text>
+    <text x="90" y="222" class="name" text-anchor="middle">entities</text>
+    <text x="90" y="236" class="sub" text-anchor="middle">entity_aliases</text>
+    <text x="90" y="249" class="sub" text-anchor="middle">fact_entities</text>
+    <text x="90" y="283" class="name" text-anchor="middle">meta</text>
+    <text x="90" y="297" class="sub" text-anchor="middle">schema version · hrr_dim</text>
+    <text x="90" y="335" class="note" text-anchor="middle">older versions keep</text>
+    <text x="90" y="348" class="note" text-anchor="middle">working on this file:</text>
+    <text x="90" y="361" class="note" text-anchor="middle">additive schema,</text>
+    <text x="90" y="374" class="note" text-anchor="middle">reconciled on open</text>
+  </g>
+
+  <!-- 7. legend -->
+  <g transform="translate(30, 578)">
+    <line x1="0" y1="0" x2="26" y2="0" stroke="#60a5fa" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
+    <text x="34" y="3" class="note">request</text>
+    <line x1="100" y1="0" x2="126" y2="0" stroke="#60a5fa" stroke-width="1.2" stroke-dasharray="4,3" marker-end="url(#arrow-open)"/>
+    <text x="134" y="3" class="note">result</text>
+    <line x1="200" y1="0" x2="226" y2="0" stroke="#fb7185" stroke-width="1.5" marker-end="url(#arrow-rose)"/>
+    <text x="234" y="3" class="note">write</text>
+    <text x="300" y="3" class="note">Every action honours min_trust; subagent, cron and flush contexts read but never write.</text>
+  </g>
+</svg>

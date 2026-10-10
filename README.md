@@ -10,6 +10,15 @@ shipped inside Hermes core as `plugins/memory/holographic/`; Nous Research
 copy was scheduled to leave core (announced for October 15, 2026). Same provider name, same config, same database:
 users who have `memory.provider: holographic` keep their facts. See [CHANGELOG.md](CHANGELOG.md) for what changed.
 
+## How it works
+
+![Architecture: before each turn Hermes core sends the message through the relevance gate and search; writes pass a
+validator and land in one SQLite transaction; recall tools read the same file](diagram/architecture.svg)
+
+![Recall before a turn: greetings recall nothing; the message's words become keys; candidates come from FTS5, character
+n-grams or a word scan; a relevance gate and a repeat window decide; up to five facts plus entity facts go into the
+turn as data](diagram/recall.svg)
+
 ## Install
 
 While your Hermes still bundles `holographic`, the bundled copy is used and this plugin stays dormant. After core
@@ -75,6 +84,9 @@ In `config.yaml` under `plugins.hermes-memory-store`:
   claim ("lives in Paris" / "lives in London"). It suggests; it never edits.
 
 ## Languages
+
+![How a word is matched in ten languages: words, language, function words, keys, match, with examples that match and
+examples that do not](diagram/languages.svg)
 
 A word matches another when they share its plain form or its stem in the language of the text:
 

@@ -1,0 +1,133 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1140 640">
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&amp;display=swap');
+    text { font-family: 'JetBrains Mono', 'SF Mono', 'Cascadia Code', 'DejaVu Sans Mono', 'Noto Sans', 'Noto Sans Arabic', 'Noto Sans Devanagari', 'Noto Sans Bengali', 'Noto Sans SC', monospace; }
+    .title { fill: #f8fafc; font-size: 16px; font-weight: 700; }
+    .subtitle { fill: #94a3b8; font-size: 9px; }
+    .name { fill: #ffffff; font-size: 11px; font-weight: 600; }
+    .sub { fill: #94a3b8; font-size: 9px; }
+    .th { fill: #64748b; font-size: 8px; font-weight: 600; }
+    .td { fill: #cbd5e1; font-size: 9px; }
+    .key { fill: #34d399; font-size: 9px; font-weight: 600; }
+    .why { fill: #fb7185; font-size: 9px; }
+    .note { fill: #94a3b8; font-size: 8px; }
+  </style>
+  <defs>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.5"/>
+    </pattern>
+    <marker id="arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <rect width="100%" height="100%" fill="#0f172a"/>
+  <rect width="100%" height="100%" fill="url(#grid)"/>
+
+  <text x="30" y="38" class="title">How a word is matched in ten languages</text>
+  <text x="30" y="56" class="subtitle">Two words match when their keys meet: the folded word, or its stem in the language of the text.</text>
+
+  <!-- pipeline arrows -->
+  <line x1="226" y1="165" x2="249" y2="165" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="447" y1="165" x2="470" y2="165" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="668" y1="165" x2="691" y2="165" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="889" y1="165" x2="912" y2="165" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- 1 tokens -->
+  <rect x="30" y="90" width="196" height="150" rx="6" fill="#0f172a"/>
+  <rect x="30" y="90" width="196" height="150" rx="6" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+  <text x="128" y="112" class="name" text-anchor="middle">1 · Words</text>
+  <text x="128" y="132" class="sub" text-anchor="middle">punctuation off: ¿ ؟ ।</text>
+  <text x="128" y="146" class="sub" text-anchor="middle">d'Eva → eva</text>
+  <text x="128" y="160" class="sub" text-anchor="middle">prend-il → prend (French)</text>
+  <text x="128" y="174" class="sub" text-anchor="middle">anak-anak → anak</text>
+  <text x="128" y="188" class="sub" text-anchor="middle">hr-ovh-এর → hr-ovh + এর</text>
+  <text x="128" y="202" class="sub" text-anchor="middle">hr-ovh: an identifier,</text>
+  <text x="128" y="216" class="sub" text-anchor="middle">matched exactly</text>
+
+  <!-- 2 language -->
+  <rect x="251" y="90" width="196" height="150" rx="6" fill="#0f172a"/>
+  <rect x="251" y="90" width="196" height="150" rx="6" fill="rgba(120,53,15,0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+  <text x="349" y="112" class="name" text-anchor="middle">2 · Language</text>
+  <text x="349" y="132" class="sub" text-anchor="middle">by script: Cyrillic → ru,</text>
+  <text x="349" y="146" class="sub" text-anchor="middle">Arabic → ar,</text>
+  <text x="349" y="160" class="sub" text-anchor="middle">Devanagari → hi, Bengali → bn</text>
+  <text x="349" y="174" class="sub" text-anchor="middle">Latin by function words:</text>
+  <text x="349" y="188" class="sub" text-anchor="middle">the · el · le · o · yang</text>
+  <text x="349" y="202" class="sub" text-anchor="middle">→ en · es · fr · pt · id;</text>
+  <text x="349" y="216" class="sub" text-anchor="middle">none found: all five</text>
+
+  <!-- 3 function words -->
+  <rect x="472" y="90" width="196" height="150" rx="6" fill="#0f172a"/>
+  <rect x="472" y="90" width="196" height="150" rx="6" fill="rgba(136,19,55,0.4)" stroke="#fb7185" stroke-width="1.5"/>
+  <text x="570" y="112" class="name" text-anchor="middle">3 · Function words</text>
+  <text x="570" y="132" class="sub" text-anchor="middle">dropped in the language</text>
+  <text x="570" y="146" class="sub" text-anchor="middle">the other words show:</text>
+  <text x="570" y="160" class="sub" text-anchor="middle">"my son": son is kept,</text>
+  <text x="570" y="174" class="sub" text-anchor="middle">"il boit son café": dropped</text>
+  <text x="570" y="188" class="sub" text-anchor="middle">a lone word: English list</text>
+  <text x="570" y="202" class="sub" text-anchor="middle">Chinese 的 是 了 什么</text>
+  <text x="570" y="216" class="sub" text-anchor="middle">weigh nothing</text>
+
+  <!-- 4 keys -->
+  <rect x="693" y="90" width="196" height="150" rx="6" fill="#0f172a"/>
+  <rect x="693" y="90" width="196" height="150" rx="6" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.5"/>
+  <text x="791" y="112" class="name" text-anchor="middle">4 · Keys</text>
+  <text x="791" y="132" class="sub" text-anchor="middle">folded word + stem</text>
+  <text x="791" y="146" class="sub" text-anchor="middle">Snowball: en ru es fr pt id hi</text>
+  <text x="791" y="160" class="sub" text-anchor="middle">Arabic: light10 + Snowball</text>
+  <text x="791" y="174" class="sub" text-anchor="middle">Bengali: suffix stripper</text>
+  <text x="791" y="188" class="sub" text-anchor="middle">fold: accents (é = e), Arabic</text>
+  <text x="791" y="202" class="sub" text-anchor="middle">letter forms, nukta, ২০২৭ = 2027</text>
+  <text x="791" y="216" class="sub" text-anchor="middle">CJK, Thai: n-grams</text>
+
+  <!-- 5 match -->
+  <rect x="914" y="90" width="196" height="150" rx="6" fill="#0f172a"/>
+  <rect x="914" y="90" width="196" height="150" rx="6" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+  <text x="1012" y="112" class="name" text-anchor="middle">5 · Match</text>
+  <text x="1012" y="132" class="sub" text-anchor="middle">keys meet: same word</text>
+  <text x="1012" y="146" class="sub" text-anchor="middle">found through</text>
+  <text x="1012" y="160" class="sub" text-anchor="middle">FTS5: Latin, Cyrillic</text>
+  <text x="1012" y="174" class="sub" text-anchor="middle">scan: Arabic, Indic, id</text>
+  <text x="1012" y="188" class="sub" text-anchor="middle">n-grams: CJK, Thai</text>
+  <text x="1012" y="202" class="sub" text-anchor="middle">names in Latin script:</text>
+  <text x="1012" y="216" class="sub" text-anchor="middle">as written</text>
+
+  <!-- examples: match -->
+  <text x="30" y="280" class="name" fill="#34d399">Match</text>
+  <text x="30" y="300" class="th">LANGUAGE</text>
+  <text x="140" y="300" class="th">IN A FACT</text>
+  <text x="330" y="300" class="th">IN A QUESTION</text>
+  <text x="500" y="300" class="th">SHARED KEY</text>
+  <line x1="30" y1="306" x2="690" y2="306" stroke="#1e293b" stroke-width="1"/>
+  <text x="30" y="322" class="td">Russian</text><text x="140" y="322" class="td">Маша любит кофе</text><text x="330" y="322" class="td">Маши</text><text x="500" y="322" class="key">маш</text>
+  <text x="30" y="343" class="td">Spanish</text><text x="140" y="343" class="td">La gata se llama Mia</text><text x="330" y="343" class="td">¿el gato?</text><text x="500" y="343" class="key">gat</text>
+  <text x="30" y="364" class="td">Portuguese</text><text x="140" y="364" class="td">a ação foi rápida</text><text x="330" y="364" class="td">ações</text><text x="500" y="364" class="key">aca</text><text x="530" y="364" class="note">(-ões as -ão)</text>
+  <text x="30" y="385" class="td">Indonesian</text><text x="140" y="385" class="td">Skrip dijalankan …</text><text x="330" y="385" class="td">jalankan</text><text x="500" y="385" class="key">jalan</text><text x="545" y="385" class="note">(word scan)</text>
+  <text x="30" y="406" class="td">Arabic</text><text x="140" y="406" class="td">تدرس إيفا هنا</text><text x="330" y="406" class="td">لإيفا  (for Eva)</text><text x="500" y="406" class="key">ايفا</text>
+  <text x="30" y="427" class="td">Hindi</text><text x="140" y="427" class="td">एंटोन कॉफ़ी पीते हैं</text><text x="330" y="427" class="td">कॉफी</text><text x="500" y="427" class="key">कॉफ</text><text x="540" y="427" class="note">(nukta folded)</text>
+  <text x="30" y="448" class="td">Bengali</text><text x="140" y="448" class="td">চিয়াং মাইতে যাবে</text><text x="330" y="448" class="td">মাই</text><text x="500" y="448" class="key">মাই</text><text x="540" y="448" class="note">(case ending off)</text>
+  <text x="30" y="469" class="td">Bengali</text><text x="140" y="469" class="td">পরিবার ২০২৭ সালে</text><text x="330" y="469" class="td">2027</text><text x="500" y="469" class="key">2027</text>
+  <text x="30" y="490" class="td">French</text><text x="140" y="490" class="td">le cœur de la ville</text><text x="330" y="490" class="td">coeur</text><text x="500" y="490" class="key">coeur</text>
+  <text x="30" y="511" class="td">English</text><text x="140" y="511" class="td">Eva is allergic</text><text x="330" y="511" class="td">allergy</text><text x="500" y="511" class="key">allergi…</text><text x="560" y="511" class="note">(whole stem, extended)</text>
+  <text x="30" y="532" class="td">Chinese</text><text x="140" y="532" class="td">伊娃对花生过敏</text><text x="330" y="532" class="td">伊娃对什么过敏？</text><text x="500" y="532" class="key">伊娃 · 过敏</text><text x="575" y="532" class="note">(n-grams)</text>
+
+  <!-- examples: no match -->
+  <text x="740" y="280" class="name" fill="#fb7185">No match</text>
+  <text x="740" y="300" class="th">IN A FACT</text>
+  <text x="850" y="300" class="th">IN A QUESTION</text>
+  <text x="960" y="300" class="th">WHY</text>
+  <line x1="740" y1="306" x2="1110" y2="306" stroke="#1e293b" stroke-width="1"/>
+  <text x="740" y="322" class="td">hr-other</text><text x="850" y="322" class="td">hr-ovh</text><text x="960" y="322" class="why">identifier: exact</text>
+  <text x="740" y="343" class="td">jeans</text><text x="850" y="343" class="td">Jean (name)</text><text x="960" y="343" class="why">names: as written</text>
+  <text x="740" y="364" class="td">contrast</text><text x="850" y="364" class="td">contract</text><text x="960" y="364" class="why">whole stem only</text>
+  <text x="740" y="385" class="td">মাটি (soil)</text><text x="850" y="385" class="td">মা (mother)</text><text x="960" y="385" class="why">3 letters kept</text>
+  <text x="740" y="406" class="td">كتاب (book)</text><text x="850" y="406" class="td">تاب</text><text x="960" y="406" class="why">ك here is no clitic</text>
+
+  <text x="740" y="450" class="note">Not matched either: synonyms and words of</text>
+  <text x="740" y="463" class="note">another root (relocating / move, nada /</text>
+  <text x="740" y="476" class="note">natación). No embeddings, no model calls.</text>
+
+  <text x="30" y="580" class="note">Every pair above was run against the code; most are unit tests (tests/test_holographic_v050.py, test_holographic_languages.py).</text>
+  <text x="30" y="596" class="note">Japanese, Korean and Thai are matched like Chinese but not measured; other languages compare exact words.</text>
+</svg>
