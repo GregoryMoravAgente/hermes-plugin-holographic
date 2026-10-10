@@ -81,11 +81,17 @@ find shared fragments, not meaning: a Chinese question with no word in common wi
 
 ## Languages
 
-Measured on stores of 20 everyday facts per language (people, school, work, servers, plans) with labelled questions,
-then on two further question sets written after tuning and run once, the third with 15 unrelated facts added per
-language. One rule came after the third set: greetings ("good morning", "доброе утро", "早上好") recalled facts about
-mornings in all three languages, so whole-message greetings now recall nothing; the "quiet" row includes that fix. "Found" = the right fact among the first five search results; "recalled" = injected before the turn;
-"quiet" = chit-chat, greetings and off-topic questions recall nothing.
+Measured on stores of 20 everyday facts per language (people, school, work, servers, plans). "Found" = the right
+fact among the first five search results; "recalled" = injected before the turn; "quiet" = chit-chat, greetings and
+off-topic questions recall nothing. How the numbers were obtained, honestly:
+
+- **Main set** (20 questions): the fixes in 0.4.2 were made against it.
+- **Second set** (10 questions) was written afterwards and first run without changes: Russian recall 90 %, Chinese
+  70 %. Two more fixes followed from its misses (Russian derivations, Chinese characters), so its row shows the
+  numbers after them.
+- **Third set** (8 questions, 15 unrelated facts added per language) was written after that and run once. It found
+  one more problem, greetings ("good morning", "доброе утро", "早上好") recalling facts about mornings in all three
+  languages; whole-message greetings now recall nothing, and the "quiet" row includes that fix.
 
 | | English | Russian | Chinese |
 |---|---|---|---|
