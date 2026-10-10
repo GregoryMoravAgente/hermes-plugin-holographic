@@ -1,48 +1,46 @@
 # Maintenance notes — hermes-plugin-holographic
 
-**Status: unmaintained, looking for an owner.** The bundled copy leaves Hermes core on **October 15, 2026**. Nous Research does not maintain memory providers. This
-repository is a standalone copy of the `holographic` memory provider that ships inside `NousResearch/hermes-agent`
-under `plugins/memory/holographic/`, prepared so someone else can take it over. It is **not** listed in the
-Hermes plugin catalog and Nous publishes no further fixes or releases here. The last sync with core is
-tag `v0.1.1`.
+**Status: maintained by [itpartypattaya](https://github.com/itpartypattaya)** (since 2026-10-10). This repository
+started as Nous Research's standalone copy of the `holographic` memory provider bundled in
+`NousResearch/hermes-agent` under `plugins/memory/holographic/`, published so someone could take it over
+([original handoff note](https://github.com/NousResearch/hermes-plugin-holographic/blob/main/HANDOFF.md),
+[takeover request](https://github.com/NousResearch/hermes-plugin-holographic/issues/1)).
 
-## Taking it over
+## Catalog and migration
 
-Anyone who wants to maintain this provider: open an issue in this repo. We can
-transfer the repository to you, or you can fork it. Once you maintain it, submit a catalog entry to
-`NousResearch/hermes-agent` (`plugin-catalog/holographic.yaml`, see the
-[plugin catalog guide](https://hermes-agent.nousresearch.com/docs/user-guide/features/plugin-catalog)) under the
-name `holographic`. That exact name matters: when core later drops its bundled copy, `hermes update` installs the
-catalog plugin of the same name for users who have `memory.provider: holographic`, keeping their config and data.
+The plugin is submitted to the Hermes plugin catalog as `plugin-catalog/holographic.yaml` under the name
+`holographic`. That exact name matters: once core drops its bundled copy, `hermes update` (and agent start) install
+the catalog plugin of the same name for users with `memory.provider: holographic`
+(`hermes_cli/memory_provider_migration.py`, `_LEFT_CORE`), keeping their config and data.
 
-## Install (as a user)
+Releases are tags `vX.Y.Z` matching `version` in `plugin.yaml` and `pyproject.toml`; the catalog entry pins the
+tag's commit by `sha:` and `version:`. A new release reaches users only through a SHA-bump PR to hermes-agent.
 
-Until October 15, 2026 Hermes Agent still bundles this provider (`hermes memory setup`, or
-`memory.provider: holographic` in config.yaml). After that, unless a new owner has listed it in the catalog, install this
-unmaintained copy by hand: `hermes plugins install NousResearch/hermes-plugin-holographic --ref 9ea1cf9b9eab4d35881a5e49343276e9f2eaf015` (tag `v0.1.1`).
-Same provider name, config and data, so nothing else changes.
+## Differences from the in-tree copy
 
-## Keeping it in sync with core
+- Self-imports are relative so the package loads from `~/.hermes/plugins/holographic/` under the loader's synthetic
+  namespace.
+- `pyproject.toml` is the dependency authority (no `tools.lazy_deps` calls: they pinned an old version in the
+  lazy-deps registry and downgraded newer installs, hermes-agent#86992).
+- Behaviour changes since 0.2.0 are listed in [CHANGELOG.md](CHANGELOG.md).
 
-Code here tracks the last in-tree copy (`git log -- plugins/memory/holographic` in hermes-agent) verbatim.
-Every release is a tag `vX.Y.Z` matching `version` in `plugin.yaml` and `pyproject.toml`. A future catalog entry would pin a tag by `sha:` and `version:`.
+While a Hermes install still carries the bundled `plugins/memory/holographic`, that copy wins on name and this plugin
+is dormant; it takes over once core drops the bundled directory.
 
-Differences versus the in-tree copy (mechanical only; behaviour is identical):
+## Tests
 
-- Self-imports are relative so the package loads from `~/.hermes/plugins/holographic/` under the loader's
-  synthetic namespace.
-- `pyproject.toml` is the dependency authority (no `tools.lazy_deps` calls).
+`tests/` holds the in-tree tests (`tests/plugins/memory/test_holographic*.py` in hermes-agent) with the import path
+switched to the package `tests/conftest.py` loads from this repo, plus `test_holographic_v020.py`. Run locally with
+`HERMES_AGENT_REPO=~/.hermes/hermes-agent PYTHONPATH=~/.hermes/hermes-agent python -m pytest -q`. The checkout
+directory name must be a valid Python identifier (CI uses `plugin`): pytest imports the repository root as a package.
+CI runs the suite on Linux, macOS and Windows against hermes-agent `main`, and `hermes plugins validate
+--install-deps`, the catalog's admission check.
 
-## For maintainers
+## Open work
 
-- The in-tree `tools.lazy_deps.ensure("memory.holographic")` calls were removed: they pinned the exact
-  (old) version in Hermes' lazy-deps registry and downgraded newer installs (hermes-agent#86992).
-  `pyproject.toml` is now the only dependency authority; bump it when you need a newer client.
-- `tests/` holds the in-tree tests (`tests/plugins/memory/test_holographic*.py` in hermes-agent) with the
-  import path switched to the package `tests/conftest.py` loads from this repo. Run them locally with
-  `HERMES_AGENT_REPO=~/.hermes/hermes-agent PYTHONPATH=~/.hermes/hermes-agent python -m pytest -q`;
-  CI runs the same on Linux, macOS and Windows against hermes-agent `main`.
-- While a Hermes install still carries the bundled `plugins/memory/holographic`, that copy wins on name and
-  this plugin is dormant; it takes over once core drops the bundled directory.
+- Keyword search has no stemming, so inflected languages (Russian etc.) match exact word forms only.
+- One-word names are not linked as entities; probe falls back to keyword search for them.
+- Upstream PRs to the bundled copy that were never merged and are worth reviewing here: hermes-agent#133389
+  (retrieval contract tests), #123599 (setup offers saved config).
 
 Original authors are preserved in hermes-agent's history: `git log -- plugins/memory/holographic`.
