@@ -25,12 +25,13 @@ from hermes_plugin_holographic.store import MemoryStore
         ("what happened with the deployment rollback", {"happened", "deployment", "rollback"}),
         # single content word passes through
         ("compaction", {"compaction"}),
-        # all stopwords → falls back to raw
-        ("the and of", None),  # None = sentinel for fallback-to-raw
+        # all stopwords → nothing to search (never a raw MATCH)
+        ("the and of", ""),
         # empty string → empty output
         ("", ""),
-        # FTS5 operator characters stripped
-        ("context: length-probe", {"context", "lengthprobe"}),
+        # FTS5 operator characters inside a token become a phrase of the tokens unicode61 indexed
+        ("context: length-probe", {"context", "length probe"}),
+        ("ssh pve-01:22", {"ssh", "pve 01 22"}),
         # trailing punctuation stripped by tokenizer
         ("hello, world!", {"hello", "world"}),
     ],

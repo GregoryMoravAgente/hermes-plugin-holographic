@@ -15,7 +15,7 @@ from typing import Any, Dict, List
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
 from utils import is_truthy_value
-from .store import MemoryStore
+from .store import DuplicateContentError, MemoryStore
 from .retrieval import FactRetriever
 from hermes_cli.config import cfg_get
 
@@ -91,8 +91,17 @@ def _results(items: list, key: str = "results") -> str:
     return json.dumps({key: items, "count": len(items)})
 
 
+_MAX_LIMIT = 100
+# Agent contexts that may write (contract: skip writes for subagent / cron / flush contexts).
+_WRITER_CONTEXTS = frozenset({"", "primary"})
+
+
 def _limit(args: dict) -> int:
-    return int(args.get("limit", 10))
+    """'limit' clamped to 1..100: a negative LIMIT means 'no limit' to SQLite and slices from the end in Python."""
+    return max(1, min(_MAX_LIMIT, int(args.get("limit", 10))))
+
+
+_WRITE_ACTIONS = frozenset({"add", "update", "remove"})
 
 
 def _tool_handler(actions: dict):
@@ -108,6 +117,7 @@ class HolographicMemoryProvider(MemoryProvider):
         self._config = config or _load_plugin_config()
         self._store = self._retriever = None
         self._min_trust = float(self._config.get("min_trust_threshold", 0.3))
+        self._writable = True
 
     @property
     def name(self) -> str:
@@ -117,37 +127,72 @@ class HolographicMemoryProvider(MemoryProvider):
         return True  # SQLite is always available, numpy is optional
 
     def save_config(self, values, hermes_home):
-        """Write config to config.yaml under plugins.hermes-memory-store."""
+        """Write config to *hermes_home*'s config.yaml under plugins.hermes-memory-store."""
         # The canonical writer: config lock, managed-mode refusal, default stripping, atomic replace.
-        # ``merge_existing`` keeps every other section; *hermes_home* is the active profile already.
+        # ``merge_existing`` keeps every other section. The home override makes it write the profile being
+        # configured, not whichever profile is active in this process.
         from hermes_cli.config import save_config
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         values = dict(values)
         # This profile's own DB spelled out (older setups wrote it; the dashboard form re-submits what it
         # read) pins every clone and rename of the profile to this file, so it is stored as the placeholder.
         db_path = values.get("db_path")
         if isinstance(db_path, str) and Path(db_path).expanduser() == Path(hermes_home) / "memory_store.db":
             values["db_path"] = _DEFAULT_DB_PATH
-        save_config({"plugins": {"hermes-memory-store": values}}, merge_existing=True)
+        token = set_hermes_home_override(hermes_home)
+        try:
+            save_config({"plugins": {"hermes-memory-store": values}}, merge_existing=True)
+        finally:
+            reset_hermes_home_override(token)
 
     def get_config_schema(self):
+        """Setup fields. ``default`` is the value saved now (falling back to the factory default), so re-running
+        ``hermes memory setup`` keeps the current database and switches instead of resetting them."""
+        def current(key: str, factory: str) -> str:
+            value = self._config.get(key, factory)
+            return ("true" if value else "false") if isinstance(value, bool) else str(value)
+
         return [
-            {"key": "db_path", "description": "SQLite database path", "default": _DEFAULT_DB_PATH},
-            {"key": "auto_extract", "description": "Auto-extract facts at session end", "default": "false", "choices": ["true", "false"]},
-            {"key": "default_trust", "description": "Default trust score for new facts", "default": "0.5"},
-            {"key": "hrr_dim", "description": "HRR vector dimensions", "default": "1024"},
+            {"key": "db_path", "description": "SQLite database path", "default": current("db_path", _DEFAULT_DB_PATH)},
+            {"key": "auto_extract", "description": "Auto-extract facts at session end",
+             "default": current("auto_extract", "false"), "choices": ["true", "false"]},
+            {"key": "default_trust", "description": "Default trust score for new facts", "default": current("default_trust", "0.5")},
+            {"key": "hrr_dim", "description": "HRR vector dimensions", "default": current("hrr_dim", "1024")},
             {"key": "mirror_memory_writes", "description": "Also store every built-in memory 'add' (MEMORY.md / USER.md) "
-             "as a fact. Off: those entries are already in the system prompt in full", "default": "false",
-             "choices": ["true", "false"]},
+             "as a fact. Off: those entries are already in the system prompt in full",
+             "default": current("mirror_memory_writes", "false"), "choices": ["true", "false"]},
         ]
+
+    def _db_path(self, hermes_home: str) -> str:
+        db_path = self._config.get("db_path", _DEFAULT_DB_PATH)
+        if isinstance(db_path, str):  # expand $HERMES_HOME so paths resolve to the profile that opens it
+            db_path = db_path.replace("$HERMES_HOME", hermes_home).replace("${HERMES_HOME}", hermes_home)
+        return db_path
+
+    def backup_paths(self) -> list[str]:
+        """The database when it lives outside HERMES_HOME (``hermes backup`` already covers the home)."""
+        from hermes_constants import get_hermes_home
+        home = get_hermes_home()
+        db_path = self._db_path(str(home))
+        if not isinstance(db_path, str) or db_path == ":memory:":
+            return []
+        path = Path(db_path).expanduser()
+        try:
+            path.resolve().relative_to(home.resolve())
+            return []
+        except (ValueError, OSError):
+            return [str(path.resolve())] if path.is_absolute() or path.exists() else []
 
     def initialize(self, session_id: str, **kwargs) -> None:
         from hermes_constants import get_hermes_home
-        _hermes_home = str(get_hermes_home())
-        db_path = self._config.get("db_path", _hermes_home + "/memory_store.db")
-        if isinstance(db_path, str):  # expand $HERMES_HOME so paths resolve to the active profile
-            db_path = db_path.replace("$HERMES_HOME", _hermes_home).replace("${HERMES_HOME}", _hermes_home)
+        _hermes_home = str(kwargs.get("hermes_home") or get_hermes_home())
+        if self._store is not None:  # re-initialised: release the previous handle first
+            self.shutdown()
+        # Contract: subagent / cron / flush contexts read but never write (facts, feedback, counters, extraction).
+        self._writable = str(kwargs.get("agent_context") or "primary") in _WRITER_CONTEXTS
         hrr_dim = int(self._config.get("hrr_dim", 1024))
-        self._store = MemoryStore(db_path=db_path, default_trust=float(self._config.get("default_trust", 0.5)), hrr_dim=hrr_dim)
+        self._store = MemoryStore(db_path=self._db_path(_hermes_home), default_trust=float(self._config.get("default_trust", 0.5)),
+                                  hrr_dim=hrr_dim)
         self._retriever = FactRetriever(store=self._store, hrr_dim=hrr_dim, hrr_weight=float(self._config.get("hrr_weight", 0.3)),
                                         temporal_decay_half_life=int(self._config.get("temporal_decay_half_life", 0)))
         self._session_id = session_id
@@ -156,7 +201,7 @@ class HolographicMemoryProvider(MemoryProvider):
         if not self._store:
             return ""
         try:
-            total = self._store._conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+            total = self._store.count_facts()
         except Exception:
             total = 0
         body = ("Active. Empty fact store — proactively add facts the user would expect you to remember.\n"
@@ -184,31 +229,51 @@ class HolographicMemoryProvider(MemoryProvider):
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         if tool_name not in self._TOOL_HANDLERS:
             return tool_error(f"Unknown tool: {tool_name}")
+        if not self._writable and (tool_name == "fact_feedback" or args.get("action") in _WRITE_ACTIONS):
+            return tool_error("The fact store is read-only in this context (subagent, cron or flush); "
+                              "only the main agent writes facts.")
         try:
             return self._TOOL_HANDLERS[tool_name](self, args)
         except KeyError as exc:
             return tool_error(f"Missing required argument: {exc}")
+        except DuplicateContentError as exc:
+            return json.dumps({"updated": False, "duplicate_of": exc.fact_id,
+                               "reason": "another fact already says exactly this; remove one of them instead"})
         except Exception as exc:
             return tool_error(str(exc))
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         # is_truthy_value: auto_extract is a string enum ("false"/"true"); plain truthiness would treat "false" as on.
-        if is_truthy_value(self._config.get("auto_extract", False)) and self._store and messages:
+        if self._writable and is_truthy_value(self._config.get("auto_extract", False)) and self._store and messages:
             self._auto_extract_facts(messages)
 
-    def on_memory_write(self, action: str, target: str, content: str) -> None:
+    def on_memory_write(self, action: str, target: str, content: str, metadata: dict | None = None) -> None:
         """Mirror built-in memory writes as facts, only with ``mirror_memory_writes`` on.
 
         Off by default: MEMORY.md / USER.md already sit in the system prompt in full, so the copy added no
-        knowledge. prefetch injected the same sentence a second time, and the copy outlived the entry when it was
-        later reworded or removed (only ``add`` was mirrored)."""
-        if not is_truthy_value(self._config.get("mirror_memory_writes", False)):
+        knowledge, prefetch injected the same sentence a second time, and the copy outlived the entry when it was
+        reworded or removed. When on, ``replace`` and ``remove`` follow the entry through
+        ``metadata["previous_content"]`` (the exact old entry; ``old_text`` is only a search fragment)."""
+        if not (self._writable and self._store and is_truthy_value(self._config.get("mirror_memory_writes", False))):
             return
-        if action == "add" and self._store and content:
-            try:
-                self._store.add_fact(content, category="user_pref" if target == "user" else "general")
-            except Exception as e:
-                logger.debug("Holographic memory_write mirror failed: %s", e)
+        category = "user_pref" if target == "user" else "general"
+        previous = (metadata or {}).get("previous_content") or ""
+        try:
+            old = self._store.read("SELECT fact_id FROM facts WHERE content = ?", (previous.strip(),)) if previous.strip() else []
+            if action == "add" and content:
+                self._store.add_fact(content, category=category)
+            elif action == "replace" and content:
+                if old:
+                    try:
+                        self._store.update_fact(old[0]["fact_id"], content=content)
+                    except DuplicateContentError:
+                        self._store.remove_fact(old[0]["fact_id"])  # the new text is already a fact
+                else:
+                    self._store.add_fact(content, category=category)
+            elif action == "remove" and old:
+                self._store.remove_fact(old[0]["fact_id"])
+        except Exception as e:
+            logger.debug("Holographic memory_write mirror failed: %s", e)
 
     def shutdown(self) -> None:
         # Close on the caller's thread: leaving the shared connection (+ write lock) to GC keeps it alive on a gateway.
@@ -225,7 +290,9 @@ class HolographicMemoryProvider(MemoryProvider):
     def _counted(self, results: list) -> list:
         """Count the facts handed to the model as recall (prefetch, search/probe/related/reason; never list or
         contradict). ``retrieval_count`` was declared and never written, so "nobody ever used this fact" was true
-        of every fact. A failed count never breaks retrieval."""
+        of every fact. A failed count never breaks retrieval; read-only contexts do not count."""
+        if not self._writable:
+            return results
         try:
             self._store.record_retrievals(r.get("fact_id") for r in results)
         except Exception as e:
@@ -234,21 +301,33 @@ class HolographicMemoryProvider(MemoryProvider):
 
     def _entity_query(self, method: str, a: dict) -> str:
         """'probe' / 'related': single-entity retriever queries."""
-        return _results(self._counted(
-            getattr(self._retriever, method)(a["entity"], category=a.get("category"), limit=_limit(a))))
+        return _results(self._counted(getattr(self._retriever, method)(
+            a["entity"], category=a.get("category"), limit=_limit(a), min_trust=self._trust_floor(a))))
+
+    def _trust_floor(self, a: dict) -> float:
+        return float(a.get("min_trust", self._min_trust))
+
+    def _add(self, a: dict) -> str:
+        fact_id, created = self._store.add_fact_status(a["content"], category=a.get("category", "general"), tags=a.get("tags", ""))
+        return json.dumps({"fact_id": fact_id, "status": "added" if created else "exists"})
+
+    def _feedback(self, a: dict) -> str:
+        if a["action"] not in ("helpful", "unhelpful"):
+            return tool_error("action must be 'helpful' or 'unhelpful'")
+        return json.dumps(self._store.record_feedback(int(a["fact_id"]), helpful=a["action"] == "helpful"))
 
     _TOOL_HANDLERS = {
         "fact_store": _tool_handler({
-            "add": lambda self, a: json.dumps({"fact_id": self._store.add_fact(
-                a["content"], category=a.get("category", "general"), tags=a.get("tags", "")), "status": "added"}),
+            "add": lambda self, a: self._add(a),
             "search": lambda self, a: _results(self._counted(self._retriever.search(
-                a["query"], category=a.get("category"), min_trust=float(a.get("min_trust", self._min_trust)), limit=_limit(a)))),
+                a["query"], category=a.get("category"), min_trust=self._trust_floor(a), limit=_limit(a)))),
             "probe": lambda self, a: self._entity_query("probe", a),
             "related": lambda self, a: self._entity_query("related", a),
             "reason": lambda self, a: _results(self._counted(
-                self._retriever.reason(a["entities"], category=a.get("category"), limit=_limit(a))))
+                self._retriever.reason(a["entities"], category=a.get("category"), limit=_limit(a), min_trust=self._trust_floor(a))))
             if a.get("entities") else tool_error("reason requires 'entities' list"),
-            "contradict": lambda self, a: _results(self._retriever.contradict(category=a.get("category"), limit=_limit(a))),
+            "contradict": lambda self, a: _results(self._retriever.contradict(
+                category=a.get("category"), limit=_limit(a), min_trust=float(a.get("min_trust", 0.0)))),
             "update": lambda self, a: json.dumps({"updated": self._store.update_fact(
                 int(a["fact_id"]), content=a.get("content"), trust_delta=float(a["trust_delta"]) if "trust_delta" in a else None,
                 tags=a.get("tags"), category=a.get("category"))}),
@@ -256,7 +335,7 @@ class HolographicMemoryProvider(MemoryProvider):
             "list": lambda self, a: _results(self._store.list_facts(
                 category=a.get("category"), min_trust=float(a.get("min_trust", 0.0)), limit=_limit(a)), key="facts"),
         }),
-        "fact_feedback": lambda self, a: json.dumps(self._store.record_feedback(int(a["fact_id"]), helpful=a["action"] == "helpful")),
+        "fact_feedback": lambda self, a: self._feedback(a),
     }
 
     def _auto_extract_facts(self, messages: list) -> None:

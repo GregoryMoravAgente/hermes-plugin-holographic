@@ -177,12 +177,14 @@ class TestConcurrency:
         try:
             monkeypatch.setattr(
                 MemoryStore,
-                "_rebuild_bank",
+                "_invalidate_bank",
                 lambda self, category: (_ for _ in ()).throw(RuntimeError("boom")),
             )
             with pytest.raises(RuntimeError, match="boom"):
                 broken.add_fact("write that fails after the INSERT")
             monkeypatch.undo()
+            # Atomic: the INSERT before the failure was rolled back with the rest.
+            assert broken.list_facts() == []
 
             # No dangling transaction: the connection reports autocommit state
             # and the sibling can write immediately.

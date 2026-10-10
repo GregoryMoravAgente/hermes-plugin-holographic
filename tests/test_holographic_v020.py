@@ -182,6 +182,14 @@ def test_builtin_memory_mirror_can_be_turned_on(tmp_path, value):
 
 def test_fts_failure_is_logged_not_silent(store, caplog):
     store.add_fact("Alice Smith lives in Paris")
+    store._write("DROP TABLE facts_fts")  # a damaged index
     with caplog.at_level(logging.WARNING):
-        assert FactRetriever(store, hrr_dim=DIM).search('"') == []  # nothing survives sanitising: raw '"' is invalid FTS5
+        assert FactRetriever(store, hrr_dim=DIM).search("Paris") == []
     assert any("FTS5 search failed" in r.getMessage() for r in caplog.records)
+
+
+def test_unsearchable_query_skips_fts_quietly(store, caplog):
+    store.add_fact("Alice Smith lives in Paris")
+    with caplog.at_level(logging.WARNING):
+        assert FactRetriever(store, hrr_dim=DIM).search('" the of') == []
+    assert not caplog.records

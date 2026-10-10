@@ -47,11 +47,14 @@ In `config.yaml` under `plugins.hermes-memory-store`:
 
 - **search**: keyword (FTS5) candidates reranked by word overlap and HRR similarity, weighted by trust. Before each
   turn the provider runs it on the user's message and adds up to five facts to the context (`#id [trust] text`).
-- **probe**: every fact linked to a named entity. **reason**: facts linked to all of several entities. Entities
-  are linked when a fact is stored: capitalized names of two or more words in any cased script (`Alice Smith`,
-  `Мария Иванова`), short quoted terms (`"Phoenix"`, `«Сбер Бизнес»`) and `X aka Y`. A one-word name is not
-  linked; probing it falls back to keyword search.
-- **related**: facts that share structure with an entity.
+- **probe**: every fact linked to a named entity, from the entity index (name or alias, any letter case).
+  **reason**: facts linked to *all* of several entities; when a name is not a known entity, keyword search that still
+  requires every name. Entities are linked when a fact is stored: capitalized names of two to five words in any cased
+  script (`Alice Smith`, `Мария Иванова`, `Jean-Luc Picard`), short quoted terms (`"Phoenix"`, `«Сбер Бизнес»`)
+  and both sides of `X aka Y`; flags, `key=value`, paths, URLs and IPs are not names. A one-word name is not linked;
+  probing it falls back to keyword search.
+- **related**: facts structurally tied to an entity in their HRR vector, above a noise floor.
+- Every recall action honours `min_trust` (default `min_trust_threshold`).
 - **contradict**: candidate conflicts, i.e. pairs about the same subject that make a similar but not identical
   claim ("lives in Paris" / "lives in London"). It suggests; it never edits.
 
@@ -60,7 +63,10 @@ holds for inflected languages).
 
 ## Data and privacy
 
-- Facts live in one SQLite file (`db_path`), in the Hermes home of the profile. Nothing is sent anywhere.
+- Facts live in one SQLite file (`db_path`), in the Hermes home of the profile, readable by its owner only (POSIX
+  `0600`). Nothing is sent anywhere. A `db_path` outside the Hermes home is listed for `hermes backup`.
+- Subagents, cron jobs and flush contexts read the store but never write to it (facts, feedback, counters,
+  extraction).
 - With `auto_extract` on, user messages matching the preference/decision patterns are stored at session end.
 - `retrieval_count` counts how often a fact was handed to the model; nothing else is tracked.
 - Dependency: `numpy` (HRR algebra). Without it the provider still works with keyword search only.

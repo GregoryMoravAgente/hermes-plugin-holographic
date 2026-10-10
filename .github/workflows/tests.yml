@@ -23,6 +23,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: plugin
+          fetch-depth: 0  # tags: tests/test_holographic_compat.py runs v0.1.1 from its tag
       # The plugin imports Hermes core (agent, tools, hermes_cli) from a checkout, the way an installed plugin does.
       - uses: actions/checkout@v4
         with:
