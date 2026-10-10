@@ -9,6 +9,7 @@ import threading
 from pathlib import Path
 
 from . import holographic as hrr
+from .text import stem, words
 
 logger = logging.getLogger(__name__)
 
@@ -279,24 +280,42 @@ class MemoryStore:
         """Insert a fact and return its fact_id; on duplicate content (UNIQUE) return the existing fact_id untouched."""
         return self.add_fact_status(content, category=category, tags=tags)[0]
 
-    def add_fact_status(self, content: str, category: str = "general", tags: str = "") -> tuple[int, bool]:
-        """(fact_id, created). Links extracted entities and stores the HRR vector in the same transaction."""
+    def add_fact_status(self, content: str, category: str = "general", tags: str = "", *,
+                        trust: float | None = None, entities=()) -> tuple[int, bool]:
+        """(fact_id, created). Links extracted, declared (*entities*) and already known entities and stores the HRR
+        vector in the same transaction. *trust* overrides the default trust of a new fact."""
         content = (content or "").strip()
         if not content:
             raise ValueError("content must not be empty")
         with self._tx():
             try:
-                fact_id: int = self._write("INSERT INTO facts (content, category, tags, trust_score) VALUES (?, ?, ?, ?)",
-                                           (content, category, tags, self.default_trust)).lastrowid  # type: ignore[assignment]
+                fact_id: int = self._write(
+                    "INSERT INTO facts (content, category, tags, trust_score) VALUES (?, ?, ?, ?)",
+                    (content, category, tags, _clamp_trust(self.default_trust if trust is None else trust))).lastrowid  # type: ignore[assignment]
             except sqlite3.IntegrityError:
                 return int(self._one("SELECT fact_id FROM facts WHERE content = ?", (content,))["fact_id"]), False
-            self._link_entities(fact_id, content)
+            self._link_entities(fact_id, content, entities)
             self._compute_hrr_vector(fact_id, content)
             self._invalidate_bank(category)
             return fact_id, True
 
+    def replace_fact(self, old_id: int, content: str, category: str = "general", tags: str = "", *,
+                     entities=()) -> tuple[int, bool]:
+        """Supersede fact *old_id* with *content* in one transaction: the new fact is stored (or found, if that text
+        already exists) and the old one removed. Returns (fact_id, created). KeyError if *old_id* does not exist.
+        The new fact starts at the default trust: a correction has not earned the old fact's feedback."""
+        with self._tx():
+            old = self._one("SELECT fact_id, content FROM facts WHERE fact_id = ?", (old_id,))
+            if old is None:
+                raise KeyError(f"fact_id {old_id} not found")
+            if old["content"] == (content or "").strip():
+                return int(old_id), False
+            fact_id, created = self.add_fact_status(content, category=category, tags=tags, entities=entities)
+            self.remove_fact(old_id)
+            return fact_id, created
+
     def update_fact(self, fact_id: int, content: str | None = None, trust_delta: float | None = None,
-                    tags: str | None = None, category: str | None = None) -> bool:
+                    tags: str | None = None, category: str | None = None, *, entities=()) -> bool:
         """Partially update a fact (trust clamped to [0, 1]). Returns True if the row existed. Raises ValueError for
         empty content and DuplicateContentError when another fact already has the new content."""
         if content is not None:
@@ -319,7 +338,7 @@ class MemoryStore:
                 raise DuplicateContentError(int(other["fact_id"]) if other else -1) from None
             if content is not None:  # re-extract entities and recompute the HRR vector
                 self._write("DELETE FROM fact_entities WHERE fact_id = ?", (fact_id,))
-                self._link_entities(fact_id, content)
+                self._link_entities(fact_id, content, entities)
                 self._compute_hrr_vector(fact_id, content)
                 self._drop_orphan_entities()
             self._invalidate_bank(row["category"])
@@ -366,6 +385,25 @@ class MemoryStore:
                               f"WHERE fact_id IN ({','.join('?' * len(ids))})", ids)
             return max(cur.rowcount, 0)
 
+    def add_retrieval_counts(self, counts: dict) -> bool:
+        """Add buffered recall counts ({fact_id: n}) in one transaction without waiting on another process's write
+        lock (busy timeout 0 for this write only). False when the database was busy: the caller keeps the counts."""
+        rows = [(int(n), int(i)) for i, n in counts.items()
+                if isinstance(i, int) and not isinstance(i, bool) and isinstance(n, int) and n > 0]
+        if not rows:
+            return True
+        with self._lock:
+            self._conn.execute("PRAGMA busy_timeout = 0")
+            try:
+                with self._tx():
+                    self._conn.executemany("UPDATE facts SET retrieval_count = retrieval_count + ? WHERE fact_id = ?", rows)
+                return True
+            except sqlite3.OperationalError as exc:
+                logger.debug("holographic: recall counts deferred (%s)", exc)
+                return False
+            finally:
+                self._conn.execute("PRAGMA busy_timeout = 10000")
+
     def record_feedback(self, fact_id: int, helpful: bool) -> dict:
         """Adjust trust asymmetrically: helpful -> +0.05 and helpful_count += 1; unhelpful -> -0.10.
         Returns {fact_id, old_trust, new_trust, helpful_count}. Raises KeyError if fact_id is unknown."""
@@ -406,11 +444,49 @@ class MemoryStore:
                 uniq.setdefault(fold(name), name)
         return list(uniq.values())
 
-    def _link_entities(self, fact_id: int, content: str) -> None:
-        """Extract entities from content, resolve/create them, and link each to the fact."""
-        for name in self._extract_entities(content):
-            self._write("INSERT OR IGNORE INTO fact_entities (fact_id, entity_id) VALUES (?, ?)",
-                        (fact_id, self._resolve_entity(name)))
+    def _link_entities(self, fact_id: int, content: str, declared=()) -> None:
+        """Link the fact to its entities: names extracted from the text, names the caller declared (a one-word name
+        such as "Masha" is accepted here), and entities already known that the text mentions in any word form."""
+        ids = {self._resolve_entity(name) for name in self._extract_entities(content)}
+        for name in declared or ():
+            name = name.strip(" .,;:!?") if isinstance(name, str) else ""
+            if _valid_entity(name):
+                entity_id = self._resolve_entity(name)
+                self._write("UPDATE entities SET entity_type = 'declared' WHERE entity_id = ? AND entity_type != 'declared'",
+                            (entity_id,))
+                ids.add(entity_id)
+        ids |= self.mentioned_entity_ids(content)
+        for entity_id in sorted(ids):
+            self._write("INSERT OR IGNORE INTO fact_entities (fact_id, entity_id) VALUES (?, ?)", (fact_id, entity_id))
+
+    def _known_entities(self) -> list[tuple[int, tuple[str, ...]]]:
+        """(entity_id, stem sequence of its name or an alias) for entities safe to match in free text: multi-word
+        names, and one-word names only when declared (older stores hold one-word junk such as a quoted "Done", which
+        would otherwise attach itself to every fact saying "done"). Cached until the entity table changes."""
+        with self._lock:
+            signature = tuple(self._one("SELECT COUNT(*), COALESCE(MAX(entity_id), 0), COALESCE(SUM(LENGTH(aliases)), 0), "
+                                        "COALESCE(SUM(entity_type = 'declared'), 0) FROM entities"))
+            cached = self._entry.get("entities")
+            if cached is None or cached[0] != signature:
+                known = []
+                for row in self._conn.execute("SELECT entity_id, name, aliases, entity_type FROM entities"):
+                    for name in [row["name"], *((row["aliases"] or "").split(","))]:
+                        key = tuple(stem(w) for w in words(name))
+                        if len(key) > 1 or (key and row["entity_type"] == "declared"):
+                            known.append((int(row["entity_id"]), key))
+                cached = self._entry["entities"] = (signature, known)
+            return cached[1]
+
+    def mentioned_entity_ids(self, text: str) -> set[int]:
+        """Known entities whose name (or alias) occurs in *text* as a run of words, compared by stem: "Маши" and
+        "Машу" mention the entity "Маша"; "машина" does not."""
+        sequence = [stem(w) for w in words(text)]
+        found = set()
+        for entity_id, key in self._known_entities():
+            n = len(key)
+            if any(tuple(sequence[i:i + n]) == key for i in range(len(sequence) - n + 1)):
+                found.add(entity_id)
+        return found
 
     def _resolve_entity(self, name: str) -> int:
         """Return the entity_id for a casefold name or alias match, creating the entity if absent."""

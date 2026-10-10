@@ -1,6 +1,6 @@
 [project]
 name = "hermes-plugin-holographic"
-version = "0.2.1"
+version = "0.3.0"
 description = "Hermes Agent memory provider plugin: holographic"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -9,6 +9,7 @@ license = { text = "MIT" }
 # and refuses a plugin whose requirements cannot resolve against them.
 dependencies = [
     "numpy>=1.26,<3",
+    "snowballstemmer>=2.2,<4",  # word forms in search (English, Russian); pure Python
 ]
 
 [tool.pytest.ini_options]

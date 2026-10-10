@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from .store import MemoryStore
 
 from . import holographic as hrr
+from .text import content_stems, query_terms, stems, words
 
 logger = logging.getLogger(__name__)
 
@@ -22,17 +23,6 @@ _PUNCT = ".,;:!?\"'()[]{}#@<>"
 # FTS5 operator characters. Inside a token they become spaces of a quoted phrase: "pve-01" -> "pve 01", the same two
 # tokens unicode61 indexed, adjacent (deleting them gave "pve01", which matches nothing).
 _FTS_OPERATORS = str.maketrans({c: " " for c in '"()*^:-+'})
-# Stopwords dropped before FTS5 OR-expansion: short English function words that
-# carry no retrieval signal and force false-negative AND matches.
-_FTS_STOPWORDS = frozenset("""
-    a about above after again all am an and any are as at be because been before being between both but by can could
-    did do does doing don down during each few for from further had has have having he her here hers herself him himself
-    his how i if in into is it its itself just me more most my myself no nor not now of off on once only or other our
-    ours ourselves out over own same she should so some such than that the their theirs them themselves then there these
-    they this those through to too under until up very was we were what when where which while who whom why will with
-    would you your yours yourself yourselves""".split())
-
-
 def _shift(sim: float) -> float:
     """Cosine similarity [-1, 1] -> [0, 1]."""
     return (sim + 1.0) / 2.0
@@ -72,12 +62,12 @@ class FactRetriever:
         return self._rerank(query, self._fts_candidates(query, category, min_trust, limit * 3), limit)
 
     def _rerank(self, query: str, candidates: list[dict], limit: int) -> list[dict]:
-        query_tokens = self._tokenize(query)
+        query_tokens = content_stems(query)
         # Query vector is loop-invariant; encode lazily on the first candidate that carries an HRR vector
         # so stores whose hrr_vector was never backfilled don't pay for it.
         query_vec = None  # bind(encode_text(query), ROLE_CONTENT): the shape a fact's content is stored in
         for fact in candidates:
-            jaccard = self._jaccard_similarity(query_tokens, self._tokenize(fact["content"]) | self._tokenize(fact.get("tags", "")))
+            jaccard = self._jaccard_similarity(query_tokens, content_stems(f'{fact["content"]} {fact.get("tags") or ""}'))
             hrr_sim = 0.5  # neutral
             fact_vec = self._phases(fact["hrr_vector"]) if self.hrr_weight > 0 and fact.get("hrr_vector") else None
             if fact_vec is not None:
@@ -234,19 +224,115 @@ class FactRetriever:
 
     @staticmethod
     def _sanitize_fts_query(query: str) -> str:
-        """Natural-language query -> FTS5-safe OR expression of quoted tokens. FTS5 AND-joins a multi-word
-        MATCH by default, which tanks recall on prose: drop stopwords and <2-char tokens, turn FTS5 operator
-        chars inside a token into a phrase ("pve-01" -> "pve 01"). Nothing left -> "" (no search, never a raw MATCH)."""
-        if not query:
-            return ""
-        tokens = []
-        for raw in query.lower().split():
-            parts = [p.strip(_PUNCT) for p in raw.strip(_PUNCT).translate(_FTS_OPERATORS).split()]
-            parts = [p for p in parts if p]
-            if not parts or (len(parts) == 1 and (len(parts[0]) < 2 or parts[0] in _FTS_STOPWORDS)):
+        """Natural-language query -> FTS5-safe OR expression. FTS5 AND-joins a multi-word MATCH by default, which
+        tanks recall on prose: informative terms only (English and Russian stopwords dropped), each as its exact
+        word OR its stem as a prefix ("маши" -> ("маши" OR "маш"*)), FTS5 operator characters inside a token
+        turned into a phrase ("pve-01" -> "pve 01"). Nothing left -> "" (no search, never a raw MATCH)."""
+        return " OR ".join(term.fts(_FTS_OPERATORS) for term in query_terms(query or ""))
+
+    # -- prefetch relevance --------------------------------------------------------------------------------------
+
+    def _doc_freq(self, term) -> int:
+        try:
+            return int(self.store.read("SELECT COUNT(*) FROM facts_fts WHERE facts_fts MATCH ?", (term.fts(_FTS_OPERATORS),))[0][0])
+        except Exception:
+            return 0
+
+    def relevant(self, query: str, candidates: list[dict], min_coverage: float = 0.3) -> list[dict]:
+        """Keep the candidates that answer the query, not merely share a word with it.
+
+        Coverage = IDF-weighted share of the query's informative terms the fact contains (exact word or same stem).
+        Terms no fact contains are left out of the total (they cannot be matched by anything), and a matched
+        identifier (pve-01, v0.21.6) is decisive on its own. A query with no informative term ("ok, thanks",
+        "да, это так") recalls nothing. Order is preserved."""
+        terms = query_terms(query or "")
+        if not terms or not candidates:
+            return []
+        total_facts = max(self.store.count_facts(), 1)
+        weights = {}
+        for term in terms:
+            df = self._doc_freq(term)
+            if df:
+                weights[term] = math.log(1.0 + total_facts / df)
+        total = sum(weights.values())
+        if not total:
+            return []
+        kept = []
+        for fact in candidates:
+            text = f'{fact.get("content", "")} {fact.get("tags") or ""}'
+            fact_words, fact_stems = set(words(text)), stems(text)
+            matched = [t for t in weights if t.word in fact_words or t.stem in fact_stems
+                       or (t.identifier and t.word in text.lower())]
+            if any(t.identifier for t in matched) or sum(weights[t] for t in matched) / total >= min_coverage:
+                kept.append(fact)
+        return kept
+
+    # -- write-time checks and housekeeping ----------------------------------------------------------------------
+
+    def write_check(self, fact_id: int, limit: int = 3) -> dict:
+        """Facts that look like a near-duplicate of fact *fact_id* or a possible conflict with it (advisory: the
+        agent decides; nothing is changed). Candidates: facts sharing an entity, plus the keyword neighbours."""
+        rows = self.store.read("SELECT fact_id, content FROM facts WHERE fact_id = ?", (fact_id,))
+        if not rows:
+            return {"similar": [], "possible_conflicts": []}
+        content = rows[0]["content"]
+        own_entities = {r[0] for r in self.store.read("SELECT entity_id FROM fact_entities WHERE fact_id = ?", (fact_id,))}
+        candidate_ids = {r[0] for r in self.store.read(
+            "SELECT DISTINCT fact_id FROM fact_entities WHERE entity_id IN ({}) AND fact_id != ?".format(
+                ",".join("?" * len(own_entities)) or "NULL"), [*own_entities, fact_id])}
+        candidate_ids |= {f["fact_id"] for f in self.search(content, min_trust=0.0, limit=10)} - {fact_id}
+        if not candidate_ids:
+            return {"similar": [], "possible_conflicts": []}
+        entity_names = {r["entity_id"]: r["name"] for r in self.store.read("SELECT entity_id, name FROM entities")}
+        links: dict[int, set[int]] = {}
+        for r in self.store.read("SELECT fact_id, entity_id FROM fact_entities WHERE fact_id IN ({})".format(
+                ",".join("?" * len(candidate_ids))), sorted(candidate_ids)):
+            links.setdefault(r["fact_id"], set()).add(r["entity_id"])
+        own_words = {w for e in own_entities for w in self._tokenize(entity_names.get(e, ""))}
+        own_stems, own_claim = content_stems(content), self._tokenize(content) - own_words
+        similar, conflicts = [], []
+        for other in self.store.read("SELECT fact_id, content FROM facts WHERE fact_id IN ({})".format(
+                ",".join("?" * len(candidate_ids))), sorted(candidate_ids)):
+            other_entities = links.get(other["fact_id"], set())
+            overlap = self._jaccard_similarity(own_stems, content_stems(other["content"]))
+            entry = {"fact_id": other["fact_id"], "content": other["content"], "word_overlap": round(overlap, 2)}
+            if overlap >= 0.7:
+                similar.append(entry)
                 continue
-            tokens.append(f'"{" ".join(parts)}"')
-        return " OR ".join(dict.fromkeys(tokens))
+            shared = own_entities & other_entities
+            other_words = {w for e in other_entities for w in self._tokenize(entity_names.get(e, ""))}
+            other_claim = self._tokenize(other["content"]) - other_words
+            if own_claim <= other_claim or other_claim <= own_claim:
+                continue  # one only adds detail to the other
+            if (shared and self._jaccard_similarity(own_claim, other_claim) >= 0.3) or (
+                    not own_entities and not other_entities and overlap >= 0.5):
+                conflicts.append(entry)
+        by_overlap = lambda xs: sorted(xs, key=lambda e: e["word_overlap"], reverse=True)[:limit]  # noqa: E731
+        return {"similar": by_overlap(similar), "possible_conflicts": by_overlap(conflicts)}
+
+    def review(self, limit: int = 20, stale_days: int = 60) -> list[dict]:
+        """Clean-up candidates with a reason each: low trust; never recalled and older than *stale_days*; a
+        near-duplicate of a more trusted fact. Advisory: nothing is removed."""
+        out, seen = [], set()
+        def add(fact, reason):
+            if fact["fact_id"] not in seen:
+                seen.add(fact["fact_id"])
+                out.append({"fact_id": fact["fact_id"], "content": fact["content"], "trust_score": fact["trust_score"],
+                            "retrieval_count": fact["retrieval_count"], "reason": reason})
+        facts = [dict(r) for r in self.store.read(f"SELECT {_FACT_COLUMNS} FROM facts ORDER BY trust_score DESC")]
+        for fact in facts:
+            if fact["trust_score"] < 0.3:
+                add(fact, "low trust (rated unhelpful)")
+        for fact in self.store.read(
+                f"SELECT {_FACT_COLUMNS} FROM facts WHERE retrieval_count = 0 AND julianday('now') - julianday(created_at) > ?",
+                (stale_days,)):
+            add(dict(fact), f"never recalled in {stale_days}+ days")
+        keyed = [(f, content_stems(f["content"])) for f in facts[:500]]
+        for i, (better, a) in enumerate(keyed):
+            for worse, b in keyed[i + 1:]:
+                if self._jaccard_similarity(a, b) >= 0.8:
+                    add(worse, f"near-duplicate of #{better['fact_id']}")
+        return out[:limit]
 
     @staticmethod
     def _jaccard_similarity(set_a: set, set_b: set) -> float:

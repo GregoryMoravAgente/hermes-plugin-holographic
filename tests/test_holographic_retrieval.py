@@ -32,8 +32,8 @@ from hermes_plugin_holographic.store import MemoryStore
         # FTS5 operator characters inside a token become a phrase of the tokens unicode61 indexed
         ("context: length-probe", {"context", "length probe"}),
         ("ssh pve-01:22", {"ssh", "pve 01 22"}),
-        # trailing punctuation stripped by tokenizer
-        ("hello, world!", {"hello", "world"}),
+        # trailing punctuation stripped by tokenizer; greetings are stopwords (0.3.0)
+        ("hello, world!", {"world"}),
     ],
 )
 def test_sanitize_fts_query_extracts_content_tokens(query, expected_tokens):
@@ -51,8 +51,10 @@ def test_sanitize_fts_query_extracts_content_tokens(query, expected_tokens):
     # OR-joined phrase literals: `"tok1" OR "tok2" OR ...`
     # Extract the tokens between quotes, order-independent.
     import re
-    matches = re.findall(r'"([^"]+)"', result)
-    assert set(matches) == expected_tokens, f"got {result!r}"
+    # Every content word is searched (exactly, or as a "stem"* prefix that covers it, 0.3.0); stopwords are not.
+    matches = set(re.findall(r'"([^"]+)"', result))
+    assert all(tok in matches or any(tok.startswith(m) for m in matches) for tok in expected_tokens), f"got {result!r}"
+    assert not matches & {"what", "with", "the"}, f"got {result!r}"
 
 # ---------------------------------------------------------------------------
 # Integration test — actually run _fts_candidates against an in-memory DB

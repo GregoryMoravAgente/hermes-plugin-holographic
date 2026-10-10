@@ -38,8 +38,8 @@ CI runs the suite on Linux, macOS and Windows against hermes-agent `main`, and `
 
 ## Open work
 
-- Keyword search has no stemming, so inflected languages (Russian etc.) match exact word forms only.
-- One-word names are not linked as entities; probe falls back to keyword search for them.
+- Scripts without spaces (Thai, Chinese, Japanese) are not segmented: planned trigram index (0.4.0).
+- Entity names are compared by casefold, without a normalised key or alias management (0.4.0).
 - Upstream PRs to the bundled copy that were never merged and are worth reviewing here: hermes-agent#133389
   (retrieval contract tests), #123599 (setup offers saved config).
 

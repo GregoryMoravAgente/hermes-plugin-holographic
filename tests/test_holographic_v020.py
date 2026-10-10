@@ -148,13 +148,16 @@ def test_recall_paths_count_and_browsing_does_not(tmp_path):
     count = lambda: provider._store._one("SELECT retrieval_count FROM facts WHERE fact_id = ?", (fact_id,))[0]  # noqa: E731
 
     block = provider.prefetch("where does Alice live, Paris?")
+    provider._flush_counts()  # counts are buffered (0.3.0) and written at flush points
     assert f"#{fact_id} " in block and count() == 1
     for args in ({"action": "search", "query": "Paris"}, {"action": "probe", "entity": "Alice Smith"},
                  {"action": "related", "entity": "Alice Smith"}, {"action": "reason", "entities": ["Alice Smith"]}):
         provider.handle_tool_call("fact_store", args)
+    provider._flush_counts()
     assert count() == 5
     provider.handle_tool_call("fact_store", {"action": "list"})
     provider.handle_tool_call("fact_store", {"action": "contradict"})
+    provider._flush_counts()
     assert count() == 5
     provider.shutdown()
 

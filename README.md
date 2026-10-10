@@ -30,23 +30,36 @@ In `config.yaml` under `plugins.hermes-memory-store`:
 | Key | Default | Description |
 |-----|---------|-------------|
 | `db_path` | `$HERMES_HOME/memory_store.db` | SQLite database path |
-| `auto_extract` | `false` | Store user sentences that look like preferences or decisions at session end |
+| `auto_extract` | `false` | Store user sentences that state a preference or decision (English, Russian) at session end and before context compression, at trust 0.4 |
 | `mirror_memory_writes` | `false` | Also store every built-in memory `add` (MEMORY.md / USER.md) as a fact |
 | `default_trust` | `0.5` | Trust score of a new fact |
 | `min_trust_threshold` | `0.3` | Facts below this trust are not recalled |
 | `temporal_decay_half_life` | `0` | Days; `0` turns recency decay off |
 | `hrr_dim` | `1024` | HRR vector dimensions |
 | `hrr_weight` | `0.3` | Weight of the HRR term in search ranking |
+| `prefetch_min_coverage` | `0.3` | Share of a message's informative words (rarer words weigh more) a fact must match to be recalled before the turn |
+| `prefetch_repeat_turns` | `6` | A fact recalled before a turn is not injected again for this many turns of the session |
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
-| `fact_store` | 9 actions: add, search, probe, related, reason, contradict, update, remove, list |
+| `fact_store` | add, search, probe, related, reason, contradict, update, remove, list, stats, export, review |
 | `fact_feedback` | Rate a fact helpful or unhelpful (moves its trust score) |
 
-- **search**: keyword (FTS5) candidates reranked by word overlap and HRR similarity, weighted by trust. Before each
-  turn the provider runs it on the user's message and adds up to five facts to the context (`#id [trust] text`).
+- **search**: keyword (FTS5) candidates, any word form (English and Russian stems: `Маши` finds `Маша`, `deploys`
+  finds `deploy`), reranked by word overlap and HRR similarity, weighted by trust.
+- **Before each turn** the provider recalls up to five facts: search candidates that pass a relevance gate (the fact
+  must cover enough of the message's informative words; "ok, thanks" recalls nothing) plus the top facts of entities
+  the message names. A fact already injected in this session is not repeated for `prefetch_repeat_turns` turns.
+  Facts are framed as data (`#id [trust] text`), one line each.
+- **add** takes `entities` (who the fact is about; needed for one-word names such as a first name, so later facts
+  mentioning it in any form link to it) and `supersedes` (the id of the fact it replaces). Its answer lists
+  `similar` facts and `possible_conflicts` (same subject, a different claim); the agent decides. Text that is not a
+  fact (JSON, tool or chat-role markup, instruction-like phrasing, invisible characters, long blobs, >1000
+  characters) is refused with the reason.
+- **stats** (what is stored and how much of it was ever recalled), **export** (Markdown view), **review**
+  (clean-up candidates: low trust, never recalled for 60 days, near-duplicates).
 - **probe**: every fact linked to a named entity, from the entity index (name or alias, any letter case).
   **reason**: facts linked to *all* of several entities; when a name is not a known entity, keyword search that still
   requires every name. Entities are linked when a fact is stored: capitalized names of two to five words in any cased
@@ -58,8 +71,8 @@ In `config.yaml` under `plugins.hermes-memory-store`:
 - **contradict**: candidate conflicts, i.e. pairs about the same subject that make a similar but not identical
   claim ("lives in Paris" / "lives in London"). It suggests; it never edits.
 
-Keyword search matches whole words: there is no stemming, so `Masha` and `Mashas` are different words (the same
-holds for inflected languages).
+Stems are a search key, not a dictionary: an irregular form may still miss (`ponies` vs `pony`). Scripts without
+letter case or spaces (Chinese, Japanese, Thai) are not segmented yet.
 
 ## Data and privacy
 
@@ -69,7 +82,8 @@ holds for inflected languages).
   extraction).
 - With `auto_extract` on, user messages matching the preference/decision patterns are stored at session end.
 - `retrieval_count` counts how often a fact was handed to the model; nothing else is tracked.
-- Dependency: `numpy` (HRR algebra). Without it the provider still works with keyword search only.
+- Dependencies: `numpy` (HRR algebra) and `snowballstemmer` (word forms; pure Python). Without numpy the provider
+  works with keyword search only and says so in its prompt block; without snowballstemmer words compare exactly.
 
 ## Development
 
