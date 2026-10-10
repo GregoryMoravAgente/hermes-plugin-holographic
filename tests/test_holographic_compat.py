@@ -60,6 +60,8 @@ def test_new_old_new_on_one_database(tmp_path, old):
     new = MemoryStore(str(db), hrr_dim=DIM)
     a = new.add_fact("Alice Smith lives in Paris", category="user_pref")
     new.add_fact("Alice Smith and Bob Brown run a coffee shop", category="project")
+    hermes = new.add_fact("Hermes Agent runs on the server", category="project")
+    new.add_alias("Bob Brown", "Bobby Brown")
     new.update_fact(a, content="Alice Smith lives in London")
     new.record_retrievals([a])
     new.record_feedback(a, helpful=True)
@@ -68,10 +70,13 @@ def test_new_old_new_on_one_database(tmp_path, old):
     legacy = old_store.MemoryStore(str(db), hrr_dim=DIM)
     legacy_retriever = old_retrieval.FactRetriever(legacy, hrr_dim=DIM)
     assert {f["content"] for f in legacy.list_facts()} == {"Alice Smith lives in London",
-                                                            "Alice Smith and Bob Brown run a coffee shop"}
+                                                            "Alice Smith and Bob Brown run a coffee shop",
+                                                            "Hermes Agent runs on the server"}
     assert [f["content"] for f in legacy_retriever.search("London", min_trust=0)] == ["Alice Smith lives in London"]
     legacy_retriever.probe("Alice Smith", category="user_pref")  # the bank path must not fail on what we left
     b = legacy.add_fact("Bob Brown teaches yoga", category="project")
+    repo = legacy.add_fact('The "hermes-agent" repo moved', category="project")  # a second, keyless entity
+    assert legacy_retriever.probe("Bobby Brown")  # old alias lookup reads the legacy column we keep in step
     legacy.update_fact(b, content="Bob Brown teaches yoga on Mondays")
     _fts_ok(legacy._conn)
     legacy.close()
@@ -79,7 +84,10 @@ def test_new_old_new_on_one_database(tmp_path, old):
     new = MemoryStore(str(db), hrr_dim=DIM)
     retriever = FactRetriever(new, hrr_dim=DIM)
     assert _contents(new._conn) == {"Alice Smith lives in London", "Alice Smith and Bob Brown run a coffee shop",
-                                    "Bob Brown teaches yoga on Mondays"}
+                                    "Bob Brown teaches yoga on Mondays", "Hermes Agent runs on the server",
+                                    'The "hermes-agent" repo moved'}
+    assert {f["fact_id"] for f in retriever.probe("hermes-agent", min_trust=0)} == {hermes, repo}  # merged on open
+    assert new.read("SELECT COUNT(*) FROM entities WHERE name_key = 'hermes agent'")[0][0] == 1
     assert [f["content"] for f in retriever.search("Mondays", min_trust=0)] == ["Bob Brown teaches yoga on Mondays"]
     assert {f["content"] for f in retriever.probe("bob brown", min_trust=0)} == {
         "Alice Smith and Bob Brown run a coffee shop", "Bob Brown teaches yoga on Mondays"}
@@ -89,6 +97,6 @@ def test_new_old_new_on_one_database(tmp_path, old):
     new.close()
 
     legacy = old_store.MemoryStore(str(db), hrr_dim=DIM)
-    assert len(legacy.list_facts()) == 2
+    assert len(legacy.list_facts()) == 4
     _fts_ok(legacy._conn)
     legacy.close()

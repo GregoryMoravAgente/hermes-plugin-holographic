@@ -39,12 +39,13 @@ In `config.yaml` under `plugins.hermes-memory-store`:
 | `hrr_weight` | `0.3` | Weight of the HRR term in search ranking |
 | `prefetch_min_coverage` | `0.3` | Share of a message's informative words (rarer words weigh more) a fact must match to be recalled before the turn |
 | `prefetch_repeat_turns` | `6` | A fact recalled before a turn is not injected again for this many turns of the session |
+| `scope` | `profile` | `user`: a separate database per user (`holographic-users/<platform>-<user id>.db` next to `db_path`); in a shared chat the store follows the author of each turn, and with no user identity nothing is recalled or written |
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
-| `fact_store` | add, search, probe, related, reason, contradict, update, remove, list, stats, export, review |
+| `fact_store` | add, search, probe, related, reason, contradict, update, remove, list, stats, export, review, entities, alias |
 | `fact_feedback` | Rate a fact helpful or unhelpful (moves its trust score) |
 
 - **search**: keyword (FTS5) candidates, any word form (English and Russian stems: `Маши` finds `Маша`, `deploys`
@@ -60,6 +61,10 @@ In `config.yaml` under `plugins.hermes-memory-store`:
   characters) is refused with the reason.
 - **stats** (what is stored and how much of it was ever recalled), **export** (Markdown view), **review**
   (clean-up candidates: low trust, never recalled for 60 days, near-duplicates).
+- **entities** lists names with their aliases and fact counts; **alias** gives an entity a second name (or merges
+  two entities). Spelling variants are one entity (`Hermes Agent` = `hermes-agent`), and `X aka Y` makes `Y` an alias.
+- Thai, Chinese, Japanese and Korean (text without spaces between words, or with attached particles) are matched by
+  character n-grams.
 - **probe**: every fact linked to a named entity, from the entity index (name or alias, any letter case).
   **reason**: facts linked to *all* of several entities; when a name is not a known entity, keyword search that still
   requires every name. Entities are linked when a fact is stored: capitalized names of two to five words in any cased
@@ -71,8 +76,8 @@ In `config.yaml` under `plugins.hermes-memory-store`:
 - **contradict**: candidate conflicts, i.e. pairs about the same subject that make a similar but not identical
   claim ("lives in Paris" / "lives in London"). It suggests; it never edits.
 
-Stems are a search key, not a dictionary: an irregular form may still miss (`ponies` vs `pony`). Scripts without
-letter case or spaces (Chinese, Japanese, Thai) are not segmented yet.
+Stems are a search key, not a dictionary: an irregular form may still miss (`ponies` vs `pony`). Character n-grams
+find shared fragments, not meaning: a Chinese question with no word in common with the fact will not find it.
 
 ## Data and privacy
 
@@ -84,6 +89,15 @@ letter case or spaces (Chinese, Japanese, Thai) are not segmented yet.
 - `retrieval_count` counts how often a fact was handed to the model; nothing else is tracked.
 - Dependencies: `numpy` (HRR algebra) and `snowballstemmer` (word forms; pure Python). Without numpy the provider
   works with keyword search only and says so in its prompt block; without snowballstemmer words compare exactly.
+
+## Database and downgrades
+
+Schema changes are additive: 0.4.0 adds a `meta` table (schema version, HRR dimension), an `entity_aliases` table and
+an `entities.name_key` column; nothing older is dropped or rewritten. Every earlier version, including the copy
+bundled in Hermes core, keeps reading and writing the file. What an older version writes in between is reconciled
+when this one opens it (keys filled in, entities with the same key merged, vectors re-encoded if `hrr_dim` changed).
+CI runs this release, then 0.1.1, then this release again on one database. With `scope: user`, an older version only
+ever sees the shared `db_path`, never the per-user files.
 
 ## Development
 

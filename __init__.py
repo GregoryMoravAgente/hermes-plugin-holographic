@@ -3,10 +3,11 @@ resolution, trust scoring, and HRR-based compositional retrieval. Original plugi
 Config in $HERMES_HOME/config.yaml under plugins.hermes-memory-store: db_path ($HERMES_HOME/memory_store.db),
 auto_extract (false), default_trust (0.5), min_trust_threshold (0.3), temporal_decay_half_life (0),
 hrr_dim (1024), hrr_weight (0.3), mirror_memory_writes (false), prefetch_min_coverage (0.3),
-prefetch_repeat_turns (6)."""
+prefetch_repeat_turns (6), scope (profile | user)."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -45,13 +46,15 @@ FACT_STORE_SCHEMA = {
         "• add {content, entities?, supersedes?} — one short standalone sentence. The result lists similar facts "
         "and possible conflicts: if the new fact replaces one, add it with supersedes=<old id>.\n"
         "• update / remove {fact_id} · list · stats · export · review (clean-up candidates) · related · contradict.\n"
+        "• entities — known names and aliases · alias {entity, content=<other name>} — one entity, two names "
+        "(merges them if both exist).\n"
         "Recalled facts show their id as #N: pass it to fact_feedback."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {"type": "string", "enum": ["add", "search", "probe", "related", "reason", "contradict", "update",
-                                                  "remove", "list", "stats", "export", "review"]},
+                                                  "remove", "list", "stats", "export", "review", "entities", "alias"]},
             "content": {"type": "string", "description": "Fact text for 'add' / 'update': one short standalone sentence."},
             "query": {"type": "string", "description": "Search query (required for 'search')."},
             "entity": {"type": "string", "description": "Entity name for 'probe'/'related'."},
@@ -151,7 +154,8 @@ def _results(items: list, key: str = "results") -> str:
 _MAX_LIMIT = 100
 # Agent contexts that may write (contract: skip writes for subagent / cron / flush contexts).
 _WRITER_CONTEXTS = frozenset({"", "primary"})
-_WRITE_ACTIONS = frozenset({"add", "update", "remove"})
+_WRITE_ACTIONS = frozenset({"add", "update", "remove", "alias"})
+_SCOPES = frozenset({"profile", "user"})
 _PREFETCH_CANDIDATES, _PREFETCH_FACTS, _ENTITY_FACTS = 15, 5, 2
 _PREFETCH_LINE_CHARS = 300
 _COUNT_FLUSH_AT = 25  # buffered recall counts are written in one go at this many, and at session boundaries
@@ -191,6 +195,11 @@ class HolographicMemoryProvider(MemoryProvider):
         self._injected: OrderedDict[str, OrderedDict] = OrderedDict()
         self._turns: dict[str, int] = {}
         self._last_recall = 0
+        scope = str(self._config.get("scope", "profile")).strip().lower()
+        self._scope = scope if scope in _SCOPES else "profile"
+        self._scope_key = ""  # "" = the profile store; otherwise the user whose store is active
+        self._stores: dict[str, tuple] = {}  # scope key -> (MemoryStore, FactRetriever)
+        self._home, self._platform = "", ""
 
     @property
     def name(self) -> str:
@@ -262,27 +271,70 @@ class HolographicMemoryProvider(MemoryProvider):
     def initialize(self, session_id: str, **kwargs) -> None:
         from hermes_constants import get_hermes_home
         _hermes_home = str(kwargs.get("hermes_home") or get_hermes_home())
-        if self._store is not None:  # re-initialised: release the previous handle first
+        if self._stores:  # re-initialised: release the previous handles first
             self.shutdown()
         # Contract: subagent / cron / flush contexts read but never write (facts, feedback, counters, extraction).
         self._writable = str(kwargs.get("agent_context") or "primary") in _WRITER_CONTEXTS
         self._session_id, self._init_error = session_id, ""
-        hrr_dim = int(self._config.get("hrr_dim", 1024))
-        db_path = self._db_path(_hermes_home)
-        try:
-            self._store = MemoryStore(db_path=db_path, default_trust=float(self._config.get("default_trust", 0.5)), hrr_dim=hrr_dim)
-        except Exception as exc:  # a damaged or unreadable database: keep the agent up, say why memory is off
-            self._init_error = (f"cannot open {db_path} ({type(exc).__name__}: {exc}). If the file is damaged, "
-                                f"recover it with: sqlite3 {db_path} \".recover\" | sqlite3 recovered.db")
-            logger.error("holographic: %s", self._init_error)
-            self._store = self._retriever = None
+        self._home, self._platform = _hermes_home, str(kwargs.get("platform") or "")
+        if self._scope == "user":
+            self._activate(self._user_key(kwargs.get("user_id")))
+        else:
+            self._activate("")
+
+    @staticmethod
+    def _safe_part(value: str) -> str:
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", value)[:60]
+        return safe if safe == value else f"{safe}-{hashlib.sha256(value.encode()).hexdigest()[:10]}"
+
+    def _user_key(self, user_id) -> str | None:
+        """Per-user store key "<platform>-<user id>", or None when there is no identity (user scope then fails
+        closed: nothing is recalled or written rather than falling back to a shared store)."""
+        user = str(user_id or "").strip()
+        return self._safe_part(f"{self._platform or 'unknown'}-{user}") if user else None
+
+    def _scoped_db_path(self, key: str) -> str:
+        base = self._db_path(self._home)
+        if not key:
+            return base
+        return str(Path(base).expanduser().parent / "holographic-users" / f"{key}.db")
+
+    def _activate(self, key: str | None) -> None:
+        """Make the store of *key* ("" = profile store, None = no identity in user scope) the active one."""
+        self._flush_counts()
+        if key is None:
+            self._scope_key, self._store, self._retriever = None, None, None
             return
-        self._retriever = FactRetriever(store=self._store, hrr_dim=hrr_dim, hrr_weight=float(self._config.get("hrr_weight", 0.3)),
-                                        temporal_decay_half_life=int(self._config.get("temporal_decay_half_life", 0)))
+        if key not in self._stores:
+            hrr_dim = int(self._config.get("hrr_dim", 1024))
+            db_path = self._scoped_db_path(key)
+            try:
+                store = MemoryStore(db_path=db_path, default_trust=float(self._config.get("default_trust", 0.5)), hrr_dim=hrr_dim)
+            except Exception as exc:  # a damaged or unreadable database: keep the agent up, say why memory is off
+                self._init_error = (f"cannot open {db_path} ({type(exc).__name__}: {exc}). If the file is damaged, "
+                                    f"recover it with: sqlite3 {db_path} \".recover\" | sqlite3 recovered.db")
+                logger.error("holographic: %s", self._init_error)
+                self._scope_key, self._store, self._retriever = key, None, None
+                return
+            retriever = FactRetriever(store=store, hrr_dim=hrr_dim, hrr_weight=float(self._config.get("hrr_weight", 0.3)),
+                                      temporal_decay_half_life=int(self._config.get("temporal_decay_half_life", 0)))
+            self._stores[key] = (store, retriever)
+        self._scope_key = key
+        self._store, self._retriever = self._stores[key]
+
+    def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+        """In user scope, a shared conversation switches to the store of whoever wrote this turn."""
+        if self._scope == "user" and self._home and kwargs.get("author_id") is not None:
+            if kwargs.get("author_is_bot"):
+                self._activate(None)
+            else:
+                self._activate(self._user_key(kwargs.get("author_id")))
 
     def system_prompt_block(self) -> str:
         if self._init_error:
             return f"# Holographic Memory\nUnavailable this session: {self._init_error}"
+        if self._scope == "user" and self._scope_key is None:
+            return "# Holographic Memory\nPer-user memory: off in this context (no user identity)."
         if not self._store:
             return ""
         try:
@@ -299,6 +351,8 @@ class HolographicMemoryProvider(MemoryProvider):
                  "- Rate recalled facts (#id) with fact_feedback when they help or are wrong."]
         if not hrr._HAS_NUMPY:
             lines.append("- numpy is not installed: keyword recall only (no structural 'related').")
+        if self._scope == "user":
+            lines.append("- Facts are kept per user: what one person tells you is not recalled for another.")
         return "# Holographic Memory\n" + "\n".join(lines)
 
     # -- recall before the turn ----------------------------------------------------------------------------------
@@ -310,7 +364,7 @@ class HolographicMemoryProvider(MemoryProvider):
         if not self._retriever or not query:
             return ""
         try:
-            key = session_id or self._session_id or ""
+            key = f"{session_id or self._session_id or ''}|{self._scope_key or ''}"
             turn = self._turns[key] = self._turns.get(key, 0) + 1
             candidates = self._retriever.search(query, min_trust=self._min_trust, limit=_PREFETCH_CANDIDATES)
             chosen = self._retriever.relevant(query, candidates, self._min_coverage)[:_PREFETCH_FACTS]
@@ -361,7 +415,9 @@ class HolographicMemoryProvider(MemoryProvider):
         if tool_name not in self._TOOL_HANDLERS:
             return tool_error(f"Unknown tool: {tool_name}")
         if self._store is None:
-            return tool_error(f"Holographic memory is unavailable: {self._init_error or 'not initialised'}")
+            reason = self._init_error or ("no user identity in this context (per-user memory)"
+                                          if self._scope == "user" else "not initialised")
+            return tool_error(f"Holographic memory is unavailable: {reason}")
         if not self._writable and (tool_name == "fact_feedback" or args.get("action") in _WRITE_ACTIONS):
             return tool_error("The fact store is read-only in this context (subagent, cron or flush); "
                               "only the main agent writes facts.")
@@ -396,8 +452,9 @@ class HolographicMemoryProvider(MemoryProvider):
         old = self._session_id
         self._session_id = new_session_id
         if reset or rewound:
-            for key in {old, new_session_id}:
+            for key in [k for k in self._injected if k.split("|", 1)[0] in {old, new_session_id}]:
                 self._injected.pop(key, None)
+            for key in [k for k in self._turns if k.split("|", 1)[0] in {old, new_session_id}]:
                 self._turns.pop(key, None)
         self._flush_counts()
 
@@ -434,11 +491,12 @@ class HolographicMemoryProvider(MemoryProvider):
     def shutdown(self) -> None:
         # Close on the caller's thread: leaving the shared connection (+ write lock) to GC keeps it alive on a gateway.
         self._flush_counts()
-        if self._store is not None:
+        for store, _ in self._stores.values():
             try:
-                self._store.close()
+                store.close()
             except Exception as e:
                 logger.debug("Holographic shutdown close() failed: %s", e)
+        self._stores.clear()
         self._store = self._retriever = None
 
     # -- recall counting -----------------------------------------------------------------------------------------
@@ -570,6 +628,8 @@ class HolographicMemoryProvider(MemoryProvider):
             "stats": lambda self, a: self._stats(a),
             "export": lambda self, a: self._export(a),
             "review": lambda self, a: _results(self._retriever.review(limit=_limit(a)), key="candidates"),
+            "entities": lambda self, a: _results(self._store.list_entities(limit=_limit(a)), key="entities"),
+            "alias": lambda self, a: json.dumps(self._store.add_alias(a["entity"], a["content"])),
         }),
         "fact_feedback": lambda self, a: self._feedback(a),
     }

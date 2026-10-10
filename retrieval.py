@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -23,6 +24,27 @@ _PUNCT = ".,;:!?\"'()[]{}#@<>"
 # FTS5 operator characters. Inside a token they become spaces of a quoted phrase: "pve-01" -> "pve 01", the same two
 # tokens unicode61 indexed, adjacent (deleting them gave "pve01", which matches nothing).
 _FTS_OPERATORS = str.maketrans({c: " " for c in '"()*^:-+'})
+# Scripts written without spaces between words (Thai, Lao, Khmer, Myanmar, Chinese, Japanese) and Korean, whose
+# particles attach to the word: the FTS5 unicode61 tokenizer indexes a whole run as one token, so these are matched
+# by character n-grams against the text instead (bigrams for CJK and Hangul, trigrams for Southeast Asian scripts).
+_RE_UNSEGMENTED = re.compile(r"[\u0e00-\u0eff\u1000-\u109f\u1780-\u17ff]+|[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]+")
+_RE_SEA = re.compile(r"[\u0e00-\u0eff\u1000-\u109f\u1780-\u17ff]")
+_MAX_NGRAMS = 24
+
+
+def ngrams(text: str) -> list[str]:
+    """Distinct character n-grams of the unsegmented runs in *text* (a run shorter than n is kept whole)."""
+    grams: list[str] = []
+    for run in _RE_UNSEGMENTED.findall(text or ""):
+        n = 3 if _RE_SEA.match(run) else 2
+        grams += [run] if len(run) <= n else [run[i:i + n] for i in range(len(run) - n + 1)]
+    return list(dict.fromkeys(grams))[:_MAX_NGRAMS]
+
+
+def ngram_coverage(grams: list[str], text: str) -> float:
+    return sum(g in text for g in grams) / len(grams) if grams else 0.0
+
+
 def _shift(sim: float) -> float:
     """Cosine similarity [-1, 1] -> [0, 1]."""
     return (sim + 1.0) / 2.0
@@ -59,7 +81,29 @@ class FactRetriever:
     def search(self, query: str, category: str | None = None, min_trust: float = 0.3, limit: int = 10) -> list[dict]:
         """FTS5 candidates (limit*3) → Jaccard + HRR rerank → trust weighting → optional temporal decay
         0.5^(age_days / half_life). Returns fact dicts with 'score', sorted desc."""
-        return self._rerank(query, self._fts_candidates(query, category, min_trust, limit * 3), limit)
+        candidates = {f["fact_id"]: f for f in self._fts_candidates(query, category, min_trust, limit * 3)}
+        for fact in self._ngram_candidates(query, category, min_trust, limit * 3):
+            if fact["fact_id"] not in candidates or candidates[fact["fact_id"]].get("fts_rank", 0) < fact["fts_rank"]:
+                candidates[fact["fact_id"]] = fact
+        return self._rerank(query, list(candidates.values()), limit)
+
+    def _ngram_candidates(self, query: str, category: str | None, min_trust: float, limit: int) -> list[dict]:
+        """Facts sharing character n-grams with the query's unsegmented runs, ranked by the share of n-grams they
+        contain ('fts_rank'). A substring scan: no extra index, so nothing to migrate or keep in sync; at the size
+        this store is meant for (hundreds to thousands of facts) it takes milliseconds."""
+        grams = ngrams(query)
+        if not grams:
+            return []
+        hits = " + ".join("(instr(content, ?) > 0)" for _ in grams)
+        sql = (f"SELECT * FROM (SELECT f.*, ({hits}) AS gram_hits FROM facts f WHERE f.trust_score >= ?"
+               + (" AND f.category = ?" if category else "") + ") WHERE gram_hits > 0 ORDER BY gram_hits DESC LIMIT ?")
+        rows = self.store.read(sql, [*grams, min_trust, *([category] if category else []), limit])
+        results = []
+        for row in rows:
+            fact = dict(row)
+            fact["fts_rank"] = fact.pop("gram_hits") / len(grams)
+            results.append(fact)
+        return results
 
     def _rerank(self, query: str, candidates: list[dict], limit: int) -> list[dict]:
         query_tokens = content_stems(query)
@@ -163,22 +207,28 @@ class FactRetriever:
             if names:
                 entity_words = {w for name in names for w in self._tokenize(name)}
                 facts.append((dict(row), names, self._tokenize(row["content"]) - entity_words))
+        # Only pairs that share an entity can qualify: group by entity instead of comparing every pair.
+        by_entity: dict[str, list[int]] = {}
+        for index, (_, names, _) in enumerate(facts):
+            for name in names:
+                by_entity.setdefault(name, []).append(index)
+        pairs = sorted({(a, b) for group in by_entity.values() for i, a in enumerate(group) for b in group[i + 1:]})
         contradictions = []
-        for i, (f1, ents1, claim1) in enumerate(facts):
-            for f2, ents2, claim2 in facts[i + 1:]:
-                entity_overlap = len(ents1 & ents2) / len(ents1 | ents2)
-                if entity_overlap < 0.3 or claim1 <= claim2 or claim2 <= claim1:
-                    continue  # different subjects, the same claim, or one claim refining the other
-                claim_sim = self._jaccard_similarity(claim1, claim2)
-                contradiction_score = entity_overlap * claim_sim
-                if contradiction_score >= threshold:
-                    contradictions.append({
-                        "fact_a": f1, "fact_b": f2,
-                        "entity_overlap": round(entity_overlap, 3),
-                        "content_similarity": round(claim_sim, 3),
-                        "contradiction_score": round(contradiction_score, 3),
-                        "shared_entities": sorted(ents1 & ents2),
-                    })
+        for i, j in pairs:
+            (f1, ents1, claim1), (f2, ents2, claim2) = facts[i], facts[j]
+            entity_overlap = len(ents1 & ents2) / len(ents1 | ents2)
+            if entity_overlap < 0.3 or claim1 <= claim2 or claim2 <= claim1:
+                continue  # different subjects, the same claim, or one claim refining the other
+            claim_sim = self._jaccard_similarity(claim1, claim2)
+            contradiction_score = entity_overlap * claim_sim
+            if contradiction_score >= threshold:
+                contradictions.append({
+                    "fact_a": f1, "fact_b": f2,
+                    "entity_overlap": round(entity_overlap, 3),
+                    "content_similarity": round(claim_sim, 3),
+                    "contradiction_score": round(contradiction_score, 3),
+                    "shared_entities": sorted(ents1 & ents2),
+                })
         return sorted(contradictions, key=lambda x: x["contradiction_score"], reverse=True)[:limit]
 
     def _vector_rows(self, category: str | None, min_trust: float = 0.0) -> list:
@@ -245,9 +295,14 @@ class FactRetriever:
         Terms no fact contains are left out of the total (they cannot be matched by anything), and a matched
         identifier (pve-01, v0.21.6) is decisive on its own. A query with no informative term ("ok, thanks",
         "да, это так") recalls nothing. Order is preserved."""
-        terms = query_terms(query or "")
+        grams = ngrams(query or "")
+        if grams and candidates:  # unsegmented script: coverage of the query's character n-grams decides
+            gram_kept = [f for f in candidates if ngram_coverage(grams, f.get("content", "")) >= min_coverage]
+        else:
+            gram_kept = []
+        terms = [t for t in query_terms(_RE_UNSEGMENTED.sub(" ", query or "")) if t.word]
         if not terms or not candidates:
-            return []
+            return gram_kept
         total_facts = max(self.store.count_facts(), 1)
         weights = {}
         for term in terms:
@@ -256,14 +311,15 @@ class FactRetriever:
                 weights[term] = math.log(1.0 + total_facts / df)
         total = sum(weights.values())
         if not total:
-            return []
+            return gram_kept
         kept = []
         for fact in candidates:
             text = f'{fact.get("content", "")} {fact.get("tags") or ""}'
             fact_words, fact_stems = set(words(text)), stems(text)
             matched = [t for t in weights if t.word in fact_words or t.stem in fact_stems
                        or (t.identifier and t.word in text.lower())]
-            if any(t.identifier for t in matched) or sum(weights[t] for t in matched) / total >= min_coverage:
+            if any(t.identifier for t in matched) or sum(weights[t] for t in matched) / total >= min_coverage \
+                    or fact in gram_kept:
                 kept.append(fact)
         return kept
 

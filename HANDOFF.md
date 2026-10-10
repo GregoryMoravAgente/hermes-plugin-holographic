@@ -38,8 +38,10 @@ CI runs the suite on Linux, macOS and Windows against hermes-agent `main`, and `
 
 ## Open work
 
-- Scripts without spaces (Thai, Chinese, Japanese) are not segmented: planned trigram index (0.4.0).
-- Entity names are compared by casefold, without a normalised key or alias management (0.4.0).
+- Unsegmented scripts use a substring scan of character n-grams; an FTS5 trigram index would scale further but needs
+  a sync story for older versions writing the file (no triggers: they would fail on SQLite builds without trigram).
+  Not needed at this store's size; revisit if stores grow past ~50k facts.
+- Paraphrase recall (no shared words) needs embeddings; deliberately out of scope (no network, no model).
 - Upstream PRs to the bundled copy that were never merged and are worth reviewing here: hermes-agent#133389
   (retrieval contract tests), #123599 (setup offers saved config).
 

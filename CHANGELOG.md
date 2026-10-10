@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.4.0 — 2026-10-11
+
+Schema version 2, additive: older versions (0.1.1, the bundled core copy) keep working on the same file, and what
+they write is reconciled on the next open. CI: 0.4.0 → 0.1.1 → 0.4.0 on one database.
+
+### Added
+
+- **Entity identity**: `entities.name_key` (NFKC, casefold, hyphen/underscore as space) with a unique index, so
+  `Hermes Agent`, `hermes-agent` and `HERMES AGENT` are one entity. Entities an older version created without a key
+  are keyed on open and merged into an existing one with the same key.
+- **Aliases**: `entity_aliases` table; `X aka Y` makes `Y` an alias of `X` (it used to create two unrelated
+  entities); actions `entities` (names, aliases, fact counts) and `alias` (second name, or merge two entities).
+  Aliases are mirrored into the legacy `entities.aliases` column that older versions read.
+- **HRR dimension recorded** in `meta`: changing `hrr_dim` re-encodes the stored vectors on open instead of making
+  every vector query fail; the dimension of pre-0.4.0 stores is inferred from their blobs.
+- **Thai, Chinese, Japanese, Korean**: matched by character n-grams (trigrams for Thai/Lao/Khmer/Myanmar, bigrams for
+  CJK and Hangul) in search and in the recall gate. A substring scan, no extra index or migration.
+- **Per-user stores** (`scope: user`): one database per `<platform>-<user id>` under `holographic-users/`, chosen by
+  the user Hermes passes at start and switched to the author of each turn in shared chats (`on_turn_start`). No
+  identity, or a bot author: fails closed (no recall, no writes). Separate files instead of a scope column: the
+  global `UNIQUE(content)` keeps working per user, and an older version cannot expose one user's facts to another
+  because it never opens those files.
+
+### Changed
+
+- contradict compares only facts that share an entity (grouped), not every pair.
+
 ## 0.3.0 — 2026-10-11
 
 Recall and writing quality, from user reports (r/hermesagent: "can't tell if it works", "the agent never stores

@@ -6,6 +6,7 @@ import os
 import re
 import sqlite3
 import threading
+import unicodedata
 from pathlib import Path
 
 from . import holographic as hrr
@@ -68,6 +69,15 @@ END;
 
 """ + _FACTS_AU + """
 
+-- 0.4.0. Older versions ignore these tables; see _migrate() for how their writes are reconciled on open.
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS entity_aliases (
+    alias_key TEXT PRIMARY KEY,
+    entity_id INTEGER NOT NULL REFERENCES entities(entity_id),
+    alias     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_entity_aliases_entity ON entity_aliases(entity_id);
+
 CREATE TABLE IF NOT EXISTS memory_banks (
     bank_id    INTEGER PRIMARY KEY AUTOINCREMENT,
     bank_name  TEXT NOT NULL UNIQUE,
@@ -78,6 +88,7 @@ CREATE TABLE IF NOT EXISTS memory_banks (
 );
 """
 
+SCHEMA_VERSION = 2  # 1 = 0.1.x-0.3.x layout, 2 = + meta, entities.name_key, entity_aliases
 _HELPFUL_DELTA, _UNHELPFUL_DELTA = 0.05, -0.10
 _MAX_COUNTED_IDS = 500  # record_retrievals batch cap (far under SQLite's bound-parameter limit)
 
@@ -119,6 +130,14 @@ def fold(text):
     """Comparison key for names: Unicode casefold with whitespace collapsed. SQLite's lower()/LIKE fold ASCII only,
     so this is registered on the connection as hfold() for entity lookups."""
     return " ".join(text.casefold().split()) if isinstance(text, str) else text
+
+
+def entity_key(name: str) -> str:
+    """Identity key of an entity name: NFKC, casefold, hyphens/underscores as spaces, whitespace collapsed, edge
+    punctuation stripped. "Hermes Agent", "hermes-agent" and "HERMES  AGENT" are one entity; "coop" and "co-op" are
+    not merged into each other (a hyphen becomes a space, it is not deleted)."""
+    text = unicodedata.normalize("NFKC", name or "").casefold().replace("-", " ").replace("_", " ")
+    return " ".join(text.split()).strip(" .,;:!?'\"«»“”„")
 
 
 def _is_capitalized(word: str) -> bool:
@@ -248,6 +267,83 @@ class MemoryStore:
             with self._tx():
                 self._conn.execute("DROP TRIGGER facts_au")
                 self._conn.execute(_FACTS_AU)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Bring the store to SCHEMA_VERSION, idempotently, on every open. Additive only, so every older version
+        keeps working on the file; what an older version wrote in between is reconciled here:
+        - entities it created have no ``name_key``: keys are filled in, and entities that turn out to share a key
+          are merged (links and aliases moved to the oldest one);
+        - aliases it may have stored in the legacy ``entities.aliases`` column are copied into ``entity_aliases``;
+        - HRR vectors are re-encoded when ``hrr_dim`` differs from the dimension they were written with (recorded in
+          ``meta``; before 0.4.0, inferred from the stored blobs), so a changed setting no longer breaks queries."""
+        with self._tx():
+            if "name_key" not in {r[1] for r in self._conn.execute("PRAGMA table_info(entities)")}:
+                self._conn.execute("ALTER TABLE entities ADD COLUMN name_key TEXT")
+            self._reconcile_entity_keys()
+            for row in self._conn.execute("SELECT entity_id, aliases FROM entities WHERE aliases IS NOT NULL AND aliases != ''").fetchall():
+                for alias in row["aliases"].split(","):
+                    key = entity_key(alias)
+                    if key and not self._one("SELECT 1 FROM entities WHERE name_key = ?", (key,)):
+                        self._conn.execute("INSERT OR IGNORE INTO entity_aliases (alias_key, entity_id, alias) VALUES (?, ?, ?)",
+                                           (key, row["entity_id"], alias.strip()))
+            self._conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_key ON entities(name_key) WHERE name_key IS NOT NULL")
+            self._sync_hrr_dim()
+            self._conn.execute("INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
+                               "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(SCHEMA_VERSION),))
+
+    def _reconcile_entity_keys(self) -> None:
+        """Fill missing name keys; merge entities whose keys collide into the oldest of them."""
+        rows = self._conn.execute("SELECT entity_id, name, name_key, entity_type FROM entities ORDER BY entity_id").fetchall()
+        if all(r["name_key"] for r in rows):
+            return
+        canonical: dict[str, int] = {}
+        for r in rows:
+            if r["name_key"]:
+                canonical.setdefault(r["name_key"], r["entity_id"])
+        for r in rows:
+            if r["name_key"]:
+                continue
+            key = entity_key(r["name"]) or f"#{r['entity_id']}"
+            keep = canonical.get(key)
+            if keep is None:
+                canonical[key] = r["entity_id"]
+                self._conn.execute("UPDATE entities SET name_key = ? WHERE entity_id = ?", (key, r["entity_id"]))
+            else:
+                self._merge_into(r["entity_id"], keep, declared=r["entity_type"] == "declared")
+
+    def _merge_into(self, source: int, target: int, *, declared: bool = False) -> None:
+        """Move every link and alias of entity *source* to *target* and delete *source* (inside a transaction)."""
+        self._conn.execute("INSERT OR IGNORE INTO fact_entities (fact_id, entity_id) SELECT fact_id, ? FROM fact_entities "
+                           "WHERE entity_id = ?", (target, source))
+        self._conn.execute("DELETE FROM fact_entities WHERE entity_id = ?", (source,))
+        self._conn.execute("UPDATE OR IGNORE entity_aliases SET entity_id = ? WHERE entity_id = ?", (target, source))
+        self._conn.execute("DELETE FROM entity_aliases WHERE entity_id = ?", (source,))
+        if declared:
+            self._conn.execute("UPDATE entities SET entity_type = 'declared' WHERE entity_id = ?", (target,))
+        self._conn.execute("DELETE FROM entities WHERE entity_id = ?", (source,))
+
+    def _meta(self, key: str) -> str | None:
+        row = self._one("SELECT value FROM meta WHERE key = ?", (key,))
+        return row["value"] if row else None
+
+    def _sync_hrr_dim(self) -> None:
+        """Record hrr_dim; re-encode every vector when the configured dimension differs from the stored one."""
+        if not self._hrr_available:
+            return
+        stored = self._meta("hrr_dim")
+        if stored is None:  # before 0.4.0: infer from a stored blob (prefixed float32 or legacy float64)
+            blob = self._one("SELECT hrr_vector FROM facts WHERE hrr_vector IS NOT NULL LIMIT 1")
+            if blob is not None:
+                data = bytes(blob["hrr_vector"])
+                stored = str((len(data) - 4) // 4 if data.startswith(b"HRR1") else len(data) // 8)
+        if stored is not None and stored != str(self.hrr_dim):
+            logger.warning("holographic: hrr_dim changed (%s -> %s), re-encoding stored vectors", stored, self.hrr_dim)
+            for row in self._conn.execute("SELECT fact_id, content FROM facts").fetchall():
+                self._compute_hrr_vector(row["fact_id"], row["content"])
+            self._conn.execute("DELETE FROM memory_banks")
+        self._conn.execute("INSERT INTO meta (key, value) VALUES ('hrr_dim', ?) "
+                           "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(self.hrr_dim),))
 
     def _one(self, sql: str, params=()):
         return self._conn.execute(sql, params).fetchone()
@@ -419,16 +515,49 @@ class MemoryStore:
             return {"fact_id": fact_id, "old_trust": old_trust, "new_trust": new_trust, "helpful_count": row["helpful_count"] + increment}
 
     def entity_ids(self, name: str) -> list[int]:
-        """Entities whose name or an alias equals *name* under Unicode casefolding."""
-        key = fold(name or "")
+        """Entities whose name or an alias has the identity key of *name* (see entity_key). Entities an older
+        version created since this store was opened have no key yet; they are matched by casefolded name."""
+        key = entity_key(name or "")
         if not key:
             return []
         with self._lock:
-            ids = {r[0] for r in self._conn.execute("SELECT entity_id FROM entities WHERE hfold(name) = ?", (key,))}
-            for row in self._conn.execute("SELECT entity_id, aliases FROM entities WHERE aliases IS NOT NULL AND aliases != ''"):
-                if key in {fold(a) for a in row["aliases"].split(",")}:
-                    ids.add(row["entity_id"])
+            ids = {r[0] for r in self._conn.execute(
+                "SELECT entity_id FROM entities WHERE name_key = ? "
+                "UNION SELECT entity_id FROM entity_aliases WHERE alias_key = ? "
+                "UNION SELECT entity_id FROM entities WHERE name_key IS NULL AND hfold(name) = ?", (key, key, fold(name)))}
         return sorted(ids)
+
+    def add_alias(self, name: str, alias: str) -> dict:
+        """Make *alias* another name of the entity *name* (created if needed). If *alias* is already an entity of its
+        own, it is merged into *name*: links and aliases move, and its name becomes an alias."""
+        key, alias_key = entity_key(name), entity_key(alias)
+        if not key or not alias_key or key == alias_key:
+            raise ValueError("an alias needs two different non-empty names")
+        with self._tx():
+            target = self._resolve_entity(name.strip())
+            other = [i for i in self.entity_ids(alias) if i != target]
+            for source in other:
+                self._merge_into(source, target)
+            self._conn.execute("INSERT INTO entity_aliases (alias_key, entity_id, alias) VALUES (?, ?, ?) "
+                               "ON CONFLICT(alias_key) DO UPDATE SET entity_id = excluded.entity_id, alias = excluded.alias",
+                               (alias_key, target, alias.strip()))
+            # Older versions resolve aliases from the comma-separated column: keep it in step.
+            row = self._one("SELECT aliases FROM entities WHERE entity_id = ?", (target,))
+            legacy = [a for a in (row["aliases"] or "").split(",") if a.strip()]
+            if alias_key not in {entity_key(a) for a in legacy}:
+                self._conn.execute("UPDATE entities SET aliases = ? WHERE entity_id = ?", (",".join(legacy + [alias.strip()]), target))
+            return {"entity_id": target, "alias": alias.strip(), "merged": other}
+
+    def list_entities(self, limit: int = 50) -> list[dict]:
+        """Entities with their aliases and number of facts, most linked first."""
+        rows = self.read("SELECT e.entity_id, e.name, e.entity_type, COUNT(fe.fact_id) AS facts FROM entities e "
+                         "LEFT JOIN fact_entities fe ON fe.entity_id = e.entity_id GROUP BY e.entity_id "
+                         "ORDER BY facts DESC, e.name LIMIT ?", (limit,))
+        aliases: dict[int, list[str]] = {}
+        for r in self.read("SELECT entity_id, alias FROM entity_aliases ORDER BY alias"):
+            aliases.setdefault(r["entity_id"], []).append(r["alias"])
+        return [{"entity_id": r["entity_id"], "name": r["name"], "facts": r["facts"], "declared": r["entity_type"] == "declared",
+                 "aliases": aliases.get(r["entity_id"], [])} for r in rows]
 
     def _extract_entities(self, text: str) -> list[str]:
         """Entity candidates (see the pattern table) that pass _valid_entity, deduplicated by casefold in first-seen
@@ -436,18 +565,36 @@ class MemoryStore:
         raw = _capitalized_phrases(text) + [
             m.group(1) for pattern in _RE_QUOTED for m in pattern.finditer(text)
             if len(m.group(1)) <= _QUOTED_MAX_CHARS and len(m.group(1).split()) <= _QUOTED_MAX_WORDS]
-        for m in _RE_AKA.finditer(text):
-            raw += [_aka_side(text[:m.start()], from_end=True), _aka_side(text[m.end():], from_end=False)]
+        for left, right in self._aka_pairs(text):
+            raw += [left, right]
         uniq: dict[str, str] = {}  # casefolded key -> first-seen spelling, insertion-ordered
         for name in filter(None, (n.strip(" .,;:!?") for n in raw if n)):
             if _valid_entity(name):
                 uniq.setdefault(fold(name), name)
         return list(uniq.values())
 
+    @staticmethod
+    def _aka_pairs(text: str) -> list[tuple[str, str]]:
+        """(name, alias) for every "X aka Y" in *text* whose sides are valid names."""
+        pairs = []
+        for m in _RE_AKA.finditer(text):
+            left, right = _aka_side(text[:m.start()], from_end=True), _aka_side(text[m.end():], from_end=False)
+            left, right = (n.strip(" .,;:!?") if n else "" for n in (left, right))
+            if _valid_entity(left) and _valid_entity(right) and entity_key(left) != entity_key(right):
+                pairs.append((left, right))
+        return pairs
+
     def _link_entities(self, fact_id: int, content: str, declared=()) -> None:
         """Link the fact to its entities: names extracted from the text, names the caller declared (a one-word name
-        such as "Masha" is accepted here), and entities already known that the text mentions in any word form."""
-        ids = {self._resolve_entity(name) for name in self._extract_entities(content)}
+        such as "Masha" is accepted here), and entities already known that the text mentions in any word form.
+        "X aka Y" makes Y an alias of X rather than a second entity (unless Y is already an entity)."""
+        pairs = self._aka_pairs(content)
+        alias_only = {entity_key(right) for _, right in pairs}
+        ids = {self._resolve_entity(name) for name in self._extract_entities(content)
+               if entity_key(name) not in alias_only or self.entity_ids(name)}
+        for left, right in pairs:
+            if not self.entity_ids(right):
+                ids.add(self.add_alias(left, right)["entity_id"])
         for name in declared or ():
             name = name.strip(" .,;:!?") if isinstance(name, str) else ""
             if _valid_entity(name):
@@ -466,11 +613,15 @@ class MemoryStore:
         with self._lock:
             signature = tuple(self._one("SELECT COUNT(*), COALESCE(MAX(entity_id), 0), COALESCE(SUM(LENGTH(aliases)), 0), "
                                         "COALESCE(SUM(entity_type = 'declared'), 0) FROM entities"))
+            signature += tuple(self._one("SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM entity_aliases"))
             cached = self._entry.get("entities")
             if cached is None or cached[0] != signature:
                 known = []
+                names: dict[int, list[str]] = {}
+                for row in self._conn.execute("SELECT entity_id, alias FROM entity_aliases"):
+                    names.setdefault(row["entity_id"], []).append(row["alias"])
                 for row in self._conn.execute("SELECT entity_id, name, aliases, entity_type FROM entities"):
-                    for name in [row["name"], *((row["aliases"] or "").split(","))]:
+                    for name in [row["name"], *((row["aliases"] or "").split(",")), *names.get(row["entity_id"], [])]:
                         key = tuple(stem(w) for w in words(name))
                         if len(key) > 1 or (key and row["entity_type"] == "declared"):
                             known.append((int(row["entity_id"]), key))
@@ -493,10 +644,11 @@ class MemoryStore:
         ids = self.entity_ids(name)
         if ids:
             return ids[0]
-        return int(self._write("INSERT INTO entities (name) VALUES (?)", (name,)).lastrowid)  # type: ignore[arg-type]
+        return int(self._write("INSERT INTO entities (name, name_key) VALUES (?, ?)", (name, entity_key(name))).lastrowid)  # type: ignore[arg-type]
 
     def _drop_orphan_entities(self) -> None:
         self._write("DELETE FROM entities WHERE entity_id NOT IN (SELECT entity_id FROM fact_entities)")
+        self._write("DELETE FROM entity_aliases WHERE entity_id NOT IN (SELECT entity_id FROM entities)")
 
     def _compute_hrr_vector(self, fact_id: int, content: str) -> None:
         """Compute and store the HRR vector for a fact (linked entities as roles). No-op without numpy."""
