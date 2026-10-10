@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.6.0 — 2026-10-11
+
+Synonyms and words of another root through keywords the agent gives when it stores a fact, and four more languages
+measured: Japanese, Korean, Thai, German (README, "Languages").
+
+### Added
+
+- **`keywords`** on `fact_store` add / update: 3–8 words someone might ask with that the fact does not contain
+  (synonyms, other roots, broader terms, translations). Kept in the indexed tags column after a `keywords:` line (no
+  schema change; older versions index them too), searched like the text by FTS5, n-grams and the word scan, never
+  shown in the recalled block, validated like a fact. `update` replaces them and keeps the user's tags. **`enrich`**
+  lists facts without keywords; `stats` counts them. The tool description tells the agent to search again with a
+  synonym or a translation when nothing fits. Measured on 112 questions in 14 languages that share no word with their
+  fact: found 42 → 94, recalled 33 → 88, with keywords from an agent that never saw the questions.
+- **German**: Snowball stems, function words, greetings, negators; a word matches the end of a compound in German text
+  (`Katze` / `Familienkatze`), and German stores use the word scan for that.
+- **Japanese, Korean, Thai**: Japanese particles weigh like Chinese function characters; Thai trigrams are weighted by
+  Thai function words; whole-message fillers (はい, 네, โอเค) and greetings in the three languages recall nothing.
+  Thai chit-chat recalled facts 4 times in 5, Korean and German once; now none.
+
+### Changed
+
+- Only Chinese characters (also in Japanese text) count one by one in the relevance gate; kana, Hangul and Thai
+  letters are sounds, and Thai matched chit-chat through them.
+- Thai claims compare by trigrams (they compared single letters, so unrelated facts looked like conflicts).
+- A negation is a possible conflict when the shorter claim is at least 60 % contained in the other (was a 0.5 word
+  overlap): "eats meat every day" / "does not eat meat" counts, "likes cats" / "does not like cooking" does not.
+
 ## 0.5.0 — 2026-10-11
 
 Seven more languages: Spanish, Hindi, Arabic, French, Bengali, Portuguese, Indonesian (the most spoken after English,

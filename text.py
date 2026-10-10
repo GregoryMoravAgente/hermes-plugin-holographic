@@ -22,7 +22,7 @@ try:  # pure Python, BSD; optional: without it words compare exactly (Arabic and
     import snowballstemmer
     _STEMMERS = {code: snowballstemmer.stemmer(name) for code, name in (
         ("en", "english"), ("ru", "russian"), ("es", "spanish"), ("fr", "french"), ("pt", "portuguese"),
-        ("id", "indonesian"), ("hi", "hindi"), ("ar", "arabic"))}
+        ("id", "indonesian"), ("de", "german"), ("hi", "hindi"), ("ar", "arabic"))}
 except ImportError:  # pragma: no cover - exercised only without the dependency
     _STEMMERS = {}
 
@@ -59,7 +59,7 @@ def word_script(word: str) -> str:
 # query cannot see past them. Words in these scripts are matched against the text of every fact instead.
 _SCAN_SCRIPTS = frozenset({"arabic", "devanagari", "bengali", "indic"})
 _SCRIPT_LANGS = {"cyrillic": ("ru",), "arabic": ("ar",), "devanagari": ("hi",), "bengali": ("bn",)}
-LATIN = ("en", "es", "fr", "pt", "id")
+LATIN = ("en", "es", "fr", "pt", "id", "de")
 
 _FOLD = str.maketrans({
     "œ": "oe", "æ": "ae",  # Latin ligatures ("cœur" = "coeur")
@@ -142,6 +142,13 @@ STOP = {
     mengapa kenapa berapa apakah yaitu yakni oleh karena jika kalau agar supaya tetapi tapi namun hanya saja pun lagi
     para sebuah seorang setiap tiap semua banyak sedikit nya ya oke ok makasih halo hai sip seperti
     sebaiknya punya mau ingin boleh perlu nih dong kok sih deh"""),
+"de": _folded("""
+    der die das den dem des ein eine einer eines einem einen und oder aber nicht kein keine ist sind war waren bin
+    bist sein hat haben habe hast hatte wird werden wurde ich du er sie es wir ihr mich mir dich dir ihn ihm uns euch
+    sich mein meine dein deine seine ihre unser zu im in am an auf aus bei mit nach von vor für über unter um durch
+    gegen ohne bis als wie wo was wer wen wem wann warum welche welcher welches viel viele noch schon nur auch so ja
+    nein doch mal da dort hier dann denn dass weil wenn ob kann können soll sollen muss müssen will wollen darf gibt
+    etwas ok okay danke bitte hallo"""),
 "ar": _folded("""
     في من إلى الى على عن عمن مع هذا هذه ذلك تلك هؤلاء هو هي هم هن هما أنا نحن أنت أنتم كان كانت يكون تكون كانوا ما
     ماذا متى أين كيف لماذا لم لن لا ليس ليست قد كل بعض غير بين عند حتى إذا إن أن أو ثم بل لكن التي الذي الذين يتم تم
@@ -161,7 +168,8 @@ STOP = {
 }
 STOPWORDS = frozenset().union(*STOP.values())
 
-NEGATORS = _folded("""not no never nobody nothing cannot don't doesn't didn't isn't aren't wasn't weren't won't can't
+NEGATORS = _folded("""nicht kein keine keinen keinem keiner nie niemals nichts
+    not no never nobody nothing cannot don't doesn't didn't isn't aren't wasn't weren't won't can't
     couldn't shouldn't haven't hasn't dont doesnt didnt isnt cant wont не нет никогда ни nunca jamás tampoco nadie
     ningún ninguna ninguno ne pas jamais aucun aucune non não nem nenhum nenhuma tidak tak bukan belum jangan لا لم لن
     ليس ليست नहीं न मत না নয় নেই নি""")
@@ -169,8 +177,9 @@ NEGATORS = _folded("""not no never nobody nothing cannot don't doesn't didn't is
 
 # Function words a claim still needs ("with sugar" / "without sugar"), and conjunctions after which a negation belongs
 # to another clause ("likes cats but not dogs").
-CLAIM_WORDS = _folded("with without avec sans con sin com sem dengan tanpa مع بدون साथ बिना সাথে ছাড়া с без")
-CONTRASTIVE = _folded("but however pero sino mais mas porém tapi tetapi namun لكن बल्कि लेकिन किंतु কিন্তু но")
+CLAIM_WORDS = _folded("with without avec sans con sin com sem dengan tanpa mit ohne مع بدون साथ बिना সাথে ছাড়া с без")
+CONTRASTIVE = _folded("but however pero sino mais mas porém tapi tetapi namun aber sondern jedoch لكن बल्कि लेकिन किंतु "
+                      "কিন্তু но")
 
 
 def _greeting_key(text: str) -> str:
@@ -194,7 +203,14 @@ GREETINGS = frozenset(_greeting_key(g) for g in """
     terima kasih banyak|
     مرحبا|أهلا|أهلا وسهلا|السلام عليكم|صباح الخير|مساء الخير|تصبح على خير|كيف حالك|شكرا|شكرا جزيلا|
     नमस्ते|नमस्कार|हैलो|हेलो|सुप्रभात|शुभ प्रभात|शुभ रात्रि|आप कैसे हैं|धन्यवाद|बहुत धन्यवाद|शुक्रिया|
-    নমস্কার|হ্যালো|শুভ সকাল|সুপ্রভাত|শুভ রাত্রি|আসসালামু আলাইকুম|কেমন আছেন|কেমন আছো|ধন্যবাদ|অনেক ধন্যবাদ""".split("|"))
+    নমস্কার|হ্যালো|শুভ সকাল|সুপ্রভাত|শুভ রাত্রি|আসসালামু আলাইকুম|কেমন আছেন|কেমন আছো|ধন্যবাদ|অনেক ধন্যবাদ|
+    guten morgen|guten tag|guten abend|gute nacht|hallo zusammen|servus|moin|danke schön|dankeschön|vielen dank|
+    danke sehr|wie geht's|
+    おはよう|おはようございます|こんにちは|こんばんは|おやすみ|おやすみなさい|ありがとう|ありがとうございます|
+    どうもありがとう|どうも|よろしく|よろしくお願いします|はじめまして|
+    안녕|안녕하세요|안녕하십니까|좋은 아침|좋은 아침이에요|고마워|고마워요|고맙습니다|감사합니다|감사해요|잘 자|잘 자요|
+    สวัสดี|สวัสดีครับ|สวัสดีค่ะ|อรุณสวัสดิ์|อรุณสวัสดิ์ครับ|อรุณสวัสดิ์ค่ะ|ขอบคุณ|ขอบคุณครับ|ขอบคุณค่ะ|ขอบคุณมาก|
+    ขอบคุณมากครับ|ขอบคุณมากค่ะ|ราตรีสวัสดิ์""".split("|"))
 
 
 def is_greeting(text: str) -> bool:
@@ -369,7 +385,8 @@ class Analysis:
     bag: frozenset  # folded words, plus the parts of hyphenated ones
     keys: frozenset  # every key of every word in the bag
     text: str  # folded, lower-cased text, for boundary matches
-    langs: tuple  # languages of the Latin words (all five when undetermined)
+    langs: tuple  # languages of the Latin words (all of LATIN when undetermined)
+    german: bool = False  # determined German: its compounds end in the word they name ("Familienkatze" is a Katze)
 
 
 def _stop(word: str, script: str, votes: dict, sentence: bool) -> bool:
@@ -423,9 +440,10 @@ def analyze(text: str) -> Analysis:
             stop=not ident and not unsegmented and _stop(word, script, votes, len(latin) >= 4), identifier=ident,
             # Indonesian prefixes (me-, di-, ber-) hide a word from a prefix query; text of undetermined language
             # might be Indonesian
-            scan=script in _SCAN_SCRIPTS or (script == "latin" and "id" in word_langs),
+            scan=script in _SCAN_SCRIPTS or (script == "latin" and ("id" in word_langs or "de" in word_langs)),
             fts=script not in _SCAN_SCRIPTS))
-    return Analysis(tuple(words), frozenset(bag), frozenset(keys), _fold_text(lowered), langs)
+    return Analysis(tuple(words), frozenset(bag), frozenset(keys), _fold_text(lowered), langs,
+                    german=determined and "de" in langs and "en" not in langs)
 
 
 def name_keys(name: str) -> tuple[tuple[frozenset, bool], ...]:
@@ -497,7 +515,18 @@ UNSEGMENTED = re.compile(r"[฀-໿က-႟ក-៿]+|[぀-ヿ㐀-䶿一-鿿豈-�
 _SEA = re.compile(r"[฀-໿က-႟ក-៿]")
 # Chinese function characters (particles, pronouns, question words, auxiliaries). A gram made only of them (可以, 什么,
 # 怎么, 我们) carries no topic; a gram with one of them carries half; others carry full weight.
-CJK_FUNCTION = frozenset("的是了吗呢吧啊呀哦嗯么怎什哪谁几多少在有和与及或就都也还要会能可以把被给让对为从到这那你我他她它们个一不没很太该应些吗嘛")
+CJK_FUNCTION = frozenset("的是了吗呢吧啊呀哦嗯么怎什哪谁几多少在有和与及或就都也还要会能可以把被给让对为从到这那你我他她它们个一不没很太该应些吗嘛"
+                         "はがをにのでともへやかねよなだ")  # + Japanese particles and copula
+# Thai function words: a trigram inside them carries no topic, one touching them half (Thai letters, unlike Chinese
+# characters, mean nothing alone, so Thai is weighted by words found in the run, longest first).
+_TH_FUNCTION = sorted(set("""ของ ที่ และ ใน กับ ไม่ ได้ จะ แล้ว ไหม อะไร ยังไง อย่างไร คือ เป็น มี ให้ ครับ ค่ะ คะ นะ เลย ด้วย แบบ
+    ไหน เท่าไหร่ กี่ ว่า ก็ หรือ แต่ จาก ถึง เรา ฉัน ผม คุณ เขา นี้ นั้น หน่อย ควร""".split()), key=len, reverse=True)
+# Whole runs that are chat fillers, as "ok", "yes", "thanks" are in the English list: they recall nothing.
+FILLER_RUNS = frozenset("""はい うん ええ いいえ 了解 了解です りょうかい オーケー ありがとう ありがとうございます お願い お願いします
+    よろしく そう そうです わかった わかりました 네 예 응 아니 아니요 좋아 좋아요 그래 그래요 알겠어 알겠어요 알겠습니다 오케이
+    고마워 고마워요 감사 감사합니다 부탁해 부탁해요 ครับ ค่ะ คะ นะ จ้ะ จ้า โอเค ได้ ได้เลย ใช่ ขอบคุณ ขอบคุณครับ ขอบคุณค่ะ
+    ขอบคุณมาก""".split())
+_HAN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 CJK_NEGATORS = frozenset("不没无别非未")
 _MAX_GRAMS = 32
 # Bengali, Arabic-Indic, Persian and Devanagari digits: the FTS5 index keeps them as written, so a number is also
@@ -506,14 +535,34 @@ _NATIVE_DIGITS = tuple(str.maketrans("0123456789", d) for d in ("০১২৩৪
 _LATIN_IN_CJK = re.compile(r"[A-Za-z][A-Za-z0-9._:/-]*[A-Za-z0-9]|[A-Za-z0-9]*\d[A-Za-z0-9._:/-]*")
 
 
+def _thai_mask(run: str) -> list[bool]:
+    """Which characters of a Thai run belong to a function word (greedy, longest word first)."""
+    mask, i = [False] * len(run), 0
+    while i < len(run):
+        word = next((w for w in _TH_FUNCTION if run.startswith(w, i)), "")
+        for k in range(i, i + len(word)):
+            mask[k] = True
+        i += len(word) or 1
+    return mask
+
+
+def is_sea(run: str) -> bool:
+    """Thai, Lao, Khmer or Myanmar: scripts whose characters are letters, compared by trigrams."""
+    return _SEA.search(run) is not None
+
+
 def run_grams(run: str) -> list[tuple[str, float]]:
-    """(n-gram, weight) of one unsegmented run; a run no longer than n is one gram."""
-    n = 3 if _SEA.match(run) else 2
-    grams = [run] if len(run) <= n else [run[i:i + n] for i in range(len(run) - n + 1)]
+    """(n-gram, weight) of one unsegmented run; a run no longer than n is one gram; a filler run has none."""
+    if run in FILLER_RUNS:
+        return []
+    sea = is_sea(run)
+    n = 3 if sea else 2
+    function = _thai_mask(run) if sea else [c in CJK_FUNCTION for c in run]
+    spans = [(0, len(run))] if len(run) <= n else [(i, i + n) for i in range(len(run) - n + 1)]
     out = []
-    for g in grams:
-        function = sum(c in CJK_FUNCTION for c in g)
-        out.append((g, 0.0 if function == len(g) else 0.5 if function else 1.0))
+    for i, j in spans:
+        hits = sum(function[i:j])
+        out.append((run[i:j], 0.0 if hits == j - i else 0.5 if hits else 1.0))
     return out
 
 
@@ -537,10 +586,12 @@ def query_grams(text: str) -> list[tuple[str, float]]:
 
 
 def content_chars(text: str) -> list[str]:
-    """Distinct characters of the unsegmented runs that carry meaning (no function characters or negators)."""
+    """Distinct Chinese characters (also in Japanese text) that carry meaning: no function characters or negators.
+    Kana, Hangul and Thai are left out: their characters are sounds, not words."""
     chars = []
     for run in UNSEGMENTED.findall((text or "").lower()):
-        chars += [c for c in run if c not in CJK_FUNCTION and c not in CJK_NEGATORS and c.isalnum()]
+        if run not in FILLER_RUNS:
+            chars += [c for c in run if _HAN.match(c) and c not in CJK_FUNCTION and c not in CJK_NEGATORS]
     return list(dict.fromkeys(chars))
 
 
@@ -610,6 +661,14 @@ class Term:
             return ()
         return tuple(k for k in self.keys if len(k) >= 6)
 
+    @cached_property
+    def _head_keys(self) -> tuple:
+        """Latin: keys of four letters or more that may be the last part of a German compound ("katze" in
+        "familienkatze", "laptop" in "arbeitslaptop"). Checked only against facts written in German."""
+        if self.identifier or len(self.tokens) != 1 or word_script(self.word) != "latin":
+            return ()
+        return tuple(k for k in self.keys if len(k) >= 4)
+
     def found_in(self, fact: Analysis) -> bool:
         """Does a fact contain this term: the same word, a shared key (word or stem), the loose beginning, or (for
         identifiers and multi-token words) the same token run with word boundaries, so "pve-01" does not match
@@ -620,7 +679,11 @@ class Term:
             return True
         if self.loose and self.loose in fact.text and any(w.startswith(self.loose) for w in fact.bag):
             return True
-        if self._prefix_keys and any(k in fact.text for k in self._prefix_keys) and                 any(f.startswith(k) for k in self._prefix_keys for f in fact.keys):
+        if self._prefix_keys and any(k in fact.text for k in self._prefix_keys) and \
+                any(f.startswith(k) for k in self._prefix_keys for f in fact.keys):
+            return True
+        if fact.german and self._head_keys and any(k in fact.text for k in self._head_keys) and \
+                any(len(f) >= len(k) + 3 and f.endswith(k) for k in self._head_keys for f in fact.bag):
             return True
         return self.word in fact.text and self._bounded.search(fact.text) is not None
 

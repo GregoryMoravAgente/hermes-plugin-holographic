@@ -14,8 +14,8 @@ if TYPE_CHECKING:
 
 from . import holographic as hrr
 from .text import (CJK_NEGATORS, CLAIM_WORDS, CONTRASTIVE, NEGATORS, UNSEGMENTED, analyze, content_chars,
-                   content_keys, content_stems, gram_coverage, is_greeting, query_grams, query_terms, soft_jaccard,
-                   soft_overlap, words)
+                   content_keys, content_stems, gram_coverage, is_greeting, is_sea, query_grams, query_terms, run_grams,
+                   soft_jaccard, soft_overlap, words)
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +30,8 @@ _RE_UNSEGMENTED = UNSEGMENTED
 # The commonest Indonesian function words: a store with none of them holds no Indonesian, and Latin words of a query
 # of undetermined language need no word scan (Indonesian prefixes are what hides a word from FTS5).
 _INDONESIAN_PROBE = '"yang" OR "dengan" OR "untuk" OR "tidak" OR "adalah" OR "sudah" OR "belum"'
+# ... and of German, whose compounds hide their last word from a prefix query ("Katze" in "Familienkatze").
+_GERMAN_PROBE = '"und" OR "nicht" OR "ist" OR "sind" OR "der" OR "das" OR "eine" OR "mit"'
 
 
 def _shift(sim: float) -> float:
@@ -108,15 +110,17 @@ class FactRetriever:
         return out
 
     def _scan_terms(self, terms) -> list:
-        """The terms matched word by word: Arabic and Indic always; Latin ones (Indonesian, or a query of undetermined
-        language) only when the store holds Indonesian facts, so an English store never pays for a scan."""
+        """The terms matched word by word: Arabic and Indic always; Latin ones (Indonesian, German, or a query of
+        undetermined language) only when the store holds Indonesian or German facts, so an English store never pays
+        for a scan."""
         scan = [t for t in terms if t.scan]
         if any(t.fts_ok for t in scan):
             try:
-                indonesian = bool(self.store.read("SELECT 1 FROM facts_fts WHERE facts_fts MATCH ? LIMIT 1", (_INDONESIAN_PROBE,)))
+                needed = bool(self.store.read("SELECT 1 FROM facts_fts WHERE facts_fts MATCH ? LIMIT 1",
+                                              (f"{_INDONESIAN_PROBE} OR {_GERMAN_PROBE}",)))
             except Exception:  # a damaged index: the scan does not need it
-                indonesian = True
-            if not indonesian:
+                needed = True
+            if not needed:
                 scan = [t for t in scan if not t.fts_ok]
         return scan
 
@@ -159,7 +163,8 @@ class FactRetriever:
         grams = query_grams(query)
         if not grams:
             return []
-        hits = " + ".join(f"(instr(lower(content), ?) > 0) * {weight}" for _, weight in grams)
+        # content and tags: the agent's keywords (kept in tags) are searched like the text
+        hits = " + ".join(f"(instr(lower(content || ' ' || COALESCE(tags, '')), ?) > 0) * {weight}" for _, weight in grams)
         sql = (f"SELECT * FROM (SELECT f.*, ({hits}) AS gram_hits FROM facts f WHERE f.trust_score >= ?"
                + (" AND f.category = ?" if category else "") + ") WHERE gram_hits > 0 ORDER BY gram_hits DESC LIMIT ?")
         rows = self.store.read(sql, [*(g for g, _ in grams), min_trust, *([category] if category else []), limit])
@@ -440,7 +445,8 @@ class FactRetriever:
         total = max(self.store.count_facts(), 1)
         weights, missing = {}, []
         for c in chars[:16]:
-            df = self.store.read("SELECT COUNT(*) FROM facts WHERE instr(lower(content), ?) > 0", (c,))[0][0]
+            df = self.store.read("SELECT COUNT(*) FROM facts WHERE instr(lower(content || ' ' || COALESCE(tags, '')), ?) > 0",
+                                 (c,))[0][0]
             if df:
                 weights[c] = math.log(1.0 + total / df)
             else:
@@ -466,6 +472,10 @@ class FactRetriever:
                 for name in entity_words:
                     if UNSEGMENTED.search(name):
                         w = w.replace(name, " ")
+                if is_sea(w):  # Thai letters mean nothing alone: trigrams, and "ไม่" (not)
+                    negated = negated or ("ไม่" in w and not contrast)
+                    claim += [frozenset({g}) for run in UNSEGMENTED.findall(w) for g, weight in run_grams(run) if weight]
+                    continue
                 for ch in w:
                     if ch in CJK_NEGATORS:
                         negated = negated or not contrast
@@ -482,14 +492,17 @@ class FactRetriever:
     @classmethod
     def _conflicting(cls, a: tuple[frozenset, bool], b: tuple[frozenset, bool]) -> float:
         """Claim overlap when two claims about one subject look like a conflict, else 0: the same statement with
-        the opposite polarity ("likes apples" / "does not like apples"), or a similar but different statement
-        where neither only adds detail to the other ("lives in Paris" / "lives in London"). Lexical candidates for
-        a person to judge; word order (who paid whom) is not modelled."""
+        the opposite polarity ("likes apples" / "does not like apples": at least 60 % of the shorter claim is in the
+        other, so "eats meat every day" / "does not eat meat" counts and "likes cats" / "does not like cooking" does
+        not), or a similar but different statement where neither only adds detail to the other ("lives in Paris" /
+        "lives in London"). Lexical candidates for a person to judge; word order (who paid whom) is not modelled."""
         (claim_a, neg_a), (claim_b, neg_b) = a, b
-        overlap = soft_jaccard(list(claim_a), list(claim_b))
-        if neg_a != neg_b:
-            return overlap if overlap >= 0.5 else 0.0
         a_in_b, b_in_a = soft_overlap(list(claim_a), list(claim_b))
+        if neg_a != neg_b:
+            shorter = min(len(claim_a), len(claim_b))
+            contained = min(a_in_b, b_in_a) / shorter if shorter else 0.0
+            return contained if contained >= 0.6 else 0.0
+        overlap = soft_jaccard(list(claim_a), list(claim_b))
         if a_in_b == len(claim_a) or b_in_a == len(claim_b):  # identical, or one only adds detail
             return 0.0
         return overlap

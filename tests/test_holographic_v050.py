@@ -54,7 +54,7 @@ def test_latin_language_follows_the_function_words():
     assert analyze("Onde está a gata da Ana?").langs == ("pt",)
     assert analyze("Di mana kucing yang hilang itu?").langs == ("id",)
     assert analyze("Where is the cat?").langs == ("en",)
-    assert len(analyze("Proxmox cluster upgrade").langs) == 5  # no function word: every Latin stemmer
+    assert len(analyze("Proxmox cluster upgrade").langs) == 6  # no function word: every Latin stemmer (0.6.0: + de)
 
 
 def test_a_function_word_of_another_language_stays_informative():

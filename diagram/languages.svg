@@ -24,7 +24,7 @@
   <rect width="100%" height="100%" fill="#0f172a"/>
   <rect width="100%" height="100%" fill="url(#grid)"/>
 
-  <text x="30" y="38" class="title">How a word is matched in ten languages</text>
+  <text x="30" y="38" class="title">How a word is matched across languages</text>
   <text x="30" y="56" class="subtitle">Two words match when their keys meet: the folded word, or its stem in the language of the text.</text>
 
   <!-- pipeline arrows -->
@@ -53,9 +53,9 @@
   <text x="349" y="146" class="sub" text-anchor="middle">Arabic → ar,</text>
   <text x="349" y="160" class="sub" text-anchor="middle">Devanagari → hi, Bengali → bn</text>
   <text x="349" y="174" class="sub" text-anchor="middle">Latin by function words:</text>
-  <text x="349" y="188" class="sub" text-anchor="middle">the · el · le · o · yang</text>
-  <text x="349" y="202" class="sub" text-anchor="middle">→ en · es · fr · pt · id;</text>
-  <text x="349" y="216" class="sub" text-anchor="middle">none found: all five</text>
+  <text x="349" y="188" class="sub" text-anchor="middle">the · el · le · o · yang · der</text>
+  <text x="349" y="202" class="sub" text-anchor="middle">→ en es fr pt id de;</text>
+  <text x="349" y="216" class="sub" text-anchor="middle">none found: all six</text>
 
   <!-- 3 function words -->
   <rect x="472" y="90" width="196" height="150" rx="6" fill="#0f172a"/>
@@ -74,7 +74,7 @@
   <rect x="693" y="90" width="196" height="150" rx="6" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.5"/>
   <text x="791" y="112" class="name" text-anchor="middle">4 · Keys</text>
   <text x="791" y="132" class="sub" text-anchor="middle">folded word + stem</text>
-  <text x="791" y="146" class="sub" text-anchor="middle">Snowball: en ru es fr pt id hi</text>
+  <text x="791" y="146" class="sub" text-anchor="middle">Snowball: en ru es fr pt id de hi</text>
   <text x="791" y="160" class="sub" text-anchor="middle">Arabic: light10 + Snowball</text>
   <text x="791" y="174" class="sub" text-anchor="middle">Bengali: suffix stripper</text>
   <text x="791" y="188" class="sub" text-anchor="middle">fold: accents (é = e), Arabic</text>
@@ -124,10 +124,10 @@
   <text x="740" y="385" class="td">মাটি (soil)</text><text x="850" y="385" class="td">মা (mother)</text><text x="960" y="385" class="why">3 letters kept</text>
   <text x="740" y="406" class="td">كتاب (book)</text><text x="850" y="406" class="td">تاب</text><text x="960" y="406" class="why">ك here is no clitic</text>
 
-  <text x="740" y="450" class="note">Not matched either: synonyms and words of</text>
-  <text x="740" y="463" class="note">another root (relocating / move, nada /</text>
-  <text x="740" y="476" class="note">natación). No embeddings, no model calls.</text>
+  <text x="740" y="450" class="note">Synonyms and words of another root match</text>
+  <text x="740" y="463" class="note">only through keywords the agent adds when</text>
+  <text x="740" y="476" class="note">it stores a fact. No model calls here.</text>
 
   <text x="30" y="580" class="note">Every pair above was run against the code; most are unit tests (tests/test_holographic_v050.py, test_holographic_languages.py).</text>
-  <text x="30" y="596" class="note">Japanese, Korean and Thai are matched like Chinese but not measured; other languages compare exact words.</text>
+  <text x="30" y="596" class="note">Japanese, Korean, Thai: n-grams like Chinese; German: stems and compound endings; other languages compare exact words.</text>
 </svg>

@@ -39,7 +39,12 @@ CI runs the suite on Linux, macOS and Windows against hermes-agent `main`, and `
 ## Languages
 
 `text.py` holds everything per language: function words (`STOP`), stemmer choice (`_STEMMERS`, `_DEFAULT_LANG`,
-`_SCRIPT_LANGS`), greetings, negators, claim words, folding (`_FOLD`). To add a language: its function words (they
+`_SCRIPT_LANGS`, `LATIN`), greetings, negators, claim words, folding (`_FOLD`); for the n-gram scripts the function
+characters (`CJK_FUNCTION`, Japanese particles included), Thai function words (`_TH_FUNCTION`) and filler runs
+(`FILLER_RUNS`). Synonyms come from the agent's `keywords` (stored after a `keywords:` line in `tags`, see
+`_split_tags` / `_join_tags` in `__init__.py`); the keyword benchmark generated them with a separate agent that never
+saw the questions, and the example in the `keywords` description must never be a benchmark fact (one batch was
+discarded for that). To add a language: its function words (they
 also decide which Latin language a text is), its stemmer, greetings and negators; then a main set and an unseen set in
 `tests/test_holographic_languages.py` style, measured before the change. Arabic, Indic scripts and Indonesian go
 through the word scan in `retrieval.py` (`_texts`, `_scan_candidates`), not FTS5; keep that in mind for any script
@@ -53,8 +58,10 @@ obtained; keep it that way.
   Not needed at this store's size; revisit if stores grow past ~50k facts.
 - Paraphrase recall (no shared words) needs embeddings; deliberately out of scope (no network, no model).
 - The word scan reads every row on each scan; past ~20k facts a persisted key index (with a reconciliation story for
-  older versions writing the file) would be the next step. Host names in Spanish/French/Portuguese/Indonesian
-  questions are not enforced as identifiers (compound words win there).
+  older versions writing the file) would be the next step. Host names in Spanish/French/Portuguese/Indonesian/German
+  questions are not enforced as identifiers (compound words win there). German compounds in the question are not
+  split (`Erdnussallergie`); keywords cover that today.
+- The nightly dreaming skill could run `enrich` and fill keywords for old facts; not wired yet.
 - Upstream PRs to the bundled copy that were never merged and are worth reviewing here: hermes-agent#133389
   (retrieval contract tests), #123599 (setup offers saved config).
 

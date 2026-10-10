@@ -54,7 +54,7 @@ In `config.yaml` under `plugins.hermes-memory-store`:
 
 | Tool | Description |
 |------|-------------|
-| `fact_store` | add, search, probe, related, reason, contradict, update, remove, list, stats, export, review, entities, alias |
+| `fact_store` | add, search, probe, related, reason, contradict, update, remove, list, stats, export, review, entities, alias, enrich |
 | `fact_feedback` | Rate a fact helpful or unhelpful (moves its trust score) |
 
 - **search**: keyword candidates in any word form (`Маши` finds `Маша`, `deploys` finds `deploy`, `kucingnya` finds
@@ -64,12 +64,14 @@ In `config.yaml` under `plugins.hermes-memory-store`:
   the message names. A fact already injected in this session is not repeated for `prefetch_repeat_turns` turns.
   Facts are framed as data (`#id [trust] text`), one line each.
 - **add** takes `entities` (who the fact is about; needed for one-word names such as a first name, so later facts
-  mentioning it in any form link to it) and `supersedes` (the id of the fact it replaces). Its answer lists
+  mentioning it in any form link to it), `keywords` (see [Synonyms](#synonyms-and-other-roots-keywords)) and
+  `supersedes` (the id of the fact it replaces). Its answer lists
   `similar` facts and `possible_conflicts` (same subject, a different claim); the agent decides. Text that is not a
   fact (JSON, tool or chat-role markup, instruction-like phrasing, invisible characters, long blobs, >1000
   characters) is refused with the reason.
 - **stats** (what is stored and how much of it was ever recalled), **export** (Markdown view), **review**
-  (clean-up candidates: low trust, never recalled for 60 days, near-duplicates).
+  (clean-up candidates: low trust, never recalled for 60 days, near-duplicates), **enrich** (facts without keywords,
+  most recalled first, to give keywords with `update`).
 - **entities** lists names with their aliases and fact counts; **alias** gives an entity a second name (or merges
   two entities). Spelling variants are one entity (`Hermes Agent` = `hermes-agent`), and `X aka Y` makes `Y` an alias.
 - **probe**: every fact linked to a named entity, from the entity index (name or alias, any letter case).
@@ -85,22 +87,22 @@ In `config.yaml` under `plugins.hermes-memory-store`:
 
 ## Languages
 
-![How a word is matched in ten languages: words, language, function words, keys, match, with examples that match and
+![How a word is matched across languages: words, language, function words, keys, match, with examples that match and
 examples that do not](diagram/languages.svg)
 
 A word matches another when they share its plain form or its stem in the language of the text:
 
-- **Stems**: Snowball for English, Russian, Spanish, French, Portuguese, Indonesian and Hindi, with two plural rules it
-  lacks (Portuguese `ação` / `ações`, Spanish `lápiz` / `lápices`); for Arabic, Larkey's light stemmer (the one Lucene
-  ships) next to Snowball's, plus the word without a glued conjunction or preposition before an alef (`لإيفا`, "for
-  Eva"; `ولإيفا`, "and for Eva"); for Bengali, a light suffix stripper (Snowball has none) that leaves at least three
-  letters, so `মাটি` (soil) is not `মা` (mother).
+- **Stems**: Snowball for English, Russian, Spanish, French, Portuguese, Indonesian, German and Hindi, with two plural
+  rules it lacks (Portuguese `ação` / `ações`, Spanish `lápiz` / `lápices`); for Arabic, Larkey's light stemmer (the one
+  Lucene ships) next to Snowball's, plus the word without a glued conjunction or preposition before an alef (`لإيفا`,
+  "for Eva"; `ولإيفا`, "and for Eva"); for Bengali, a light suffix stripper (Snowball has none) that leaves at least
+  three letters, so `মাটি` (soil) is not `মা` (mother).
 - **Which language**: the script decides for Cyrillic, Arabic, Devanagari and Bengali. Latin text is English, Spanish,
-  French, Portuguese or Indonesian by the function words it uses ("the", "el", "le", "o", "yang"); text with none of
-  them is stemmed in all five. A word is dropped as a function word only when the other words show that language, or
-  when it is the only sign of it in a sentence of four words or more: "son" alone, or in "where does my son study",
-  is a search word; in "il boit son café" it is French "his". With no other evidence the English list applies, as it
-  did to all Latin text before 0.5.0.
+  French, Portuguese, Indonesian or German by the function words it uses ("the", "el", "le", "o", "yang", "der"); text
+  with none of them is stemmed in all six. A word is dropped as a function word only when the other words show that
+  language, or when it is the only sign of it in a sentence of four words or more: "son" alone, or in "where does my
+  son study", is a search word; in "il boit son café" it is French "his". With no other evidence the English list
+  applies, as it did to all Latin text before 0.5.0.
 - **Folding**: Latin accents and ligatures (`esta` finds `está`, `coeur` finds `cœur`), Arabic vowel marks and letter
   variants, the Indic nukta, and native digits (`2027` finds `২০২৭`, `HR24` finds `HR২৪`). Folding also merges what
   only an accent tells apart (Spanish `año` / `ano`), as the FTS5 index already did.
@@ -108,22 +110,29 @@ A word matches another when they share its plain form or its stem in the languag
   taken apart in text of that language, reduplication (`anak-anak`) in any; a hyphen between scripts splits
   (`hr-ovh-এর`). A letters-only hyphenated token is an identifier in English text or text of no determined language
   (`hr-ovh`, `carry-on`): a message naming it is about that one, and a fact about `hr-other` is not recalled for it.
-  In Spanish, French, Portuguese and Indonesian text it is a compound word (`week-end`, `sexta-feira`), so a host name
-  in a question in those languages is matched like any word, not enforced.
+  In Spanish, French, Portuguese, Indonesian and German text it is a compound word (`week-end`, `sexta-feira`,
+  `IT-Treffen`), so a host name in a question in those languages is matched like any word, not enforced.
+- **German compounds**: a word matches the end of a compound in German text (`Katze` finds `Familienkatze`, `Laptop`
+  finds `Arbeitslaptop`). A compound in the question is not taken apart (`Erdnussallergie` does not find `allergisch
+  gegen Erdnüsse`).
 - **Names** in Latin script are matched as written (and with an English `'s`): `Jean` is not mentioned by `jeans`.
   Names in other scripts carry their inflections (`Маши` mentions `Маша`, `لإيفا` mentions `إيفا`).
-- **Chinese, Japanese, Korean, Thai** (no spaces between words): character n-grams.
-- **Arabic, Indic scripts and Indonesian** are also matched word by word against the text of the facts (so are Latin
-  words of a question of undetermined language, when the store holds Indonesian facts): the SQLite FTS5 index splits
-  Indic words at their vowel signs and cannot see past Arabic and Indonesian prefixes. The rows are read on every such
-  search; a fact is analysed once and again only when its text changes. Measured at 5,000 facts: 0.03–0.07 s per
-  search and about the same for the relevance gate; the first such search after start analyses every fact, about 1 s
-  at 5,000 facts and 4–6 s at 20,000 facts (later searches 0.2–0.4 s, plus 0.15–0.2 s for the gate). A store without
-  Arabic, Indic or Indonesian facts never scans: an English store answers in about 0.02 s at 5,000 facts, as before.
+- **Chinese, Japanese, Korean, Thai** (no spaces between words): character n-grams, bigrams for Chinese, Japanese and
+  Korean, trigrams for Thai. Grammar weighs less: Chinese function characters (的 是 了), Japanese particles (は が を
+  に の), Thai function words (ของ ที่ และ); a message that is only a filler (はい, 네, โอเค) recalls nothing. Chinese
+  characters (also in Japanese) count one by one as well; kana, Hangul and Thai letters, which are sounds, do not.
+- **Arabic, Indic scripts, Indonesian and German** are also matched word by word against the text of the facts (so are
+  Latin words of a question of undetermined language, when the store holds Indonesian or German facts): the SQLite FTS5
+  index splits Indic words at their vowel signs and cannot see past Arabic and Indonesian prefixes or into German
+  compounds. The rows are read on every such search; a fact is analysed once and again only when its text changes.
+  Measured at 5,000 facts: 0.03–0.07 s per search and about the same for the relevance gate; the first such search
+  after start analyses every fact, about 1 s at 5,000 facts and 4–6 s at 20,000 facts (later searches 0.2–0.4 s, plus
+  0.15–0.2 s for the gate). A store without such facts never scans: an English store answers in about 0.02 s at 5,000
+  facts, as before.
 
 Measured on stores of 20 everyday facts per language (people, school, work, servers, plans). "Found" = the right
 fact among the first five search results; "recalled" = injected before the turn; "quiet" = chit-chat, greetings and
-off-topic questions recall nothing.
+off-topic questions recall nothing. No keywords in these stores.
 
 | | Main set (20 questions): found / recalled | Unseen set (8 questions, 15 unrelated facts added): found / recalled | Quiet (all sets) |
 |---|---|---|---|
@@ -137,21 +146,27 @@ off-topic questions recall nothing.
 | Bengali | 100 % / 100 % | 100 % / 100 % | 10 / 10 |
 | Portuguese | 100 % / 100 % | 100 % / 100 % | 10 / 10 |
 | Indonesian | 100 % / 100 % | 100 % / 100 % | 10 / 10 |
+| Japanese | 95 % / 95 % | 100 % / 100 % | 10 / 10 |
+| Korean | 100 % / 100 % | 100 % / 100 % | 10 / 10 |
+| Thai | 100 % / 95 % | 100 % / 100 % | 10 / 10 |
+| German | 100 % / 100 % | 75 % / 75 % | 10 / 10 |
 
-The right fact is first in 95–100 % of main-set questions and 75–100 % of unseen ones. Recall before the turn is not
-only the right fact: about one other fact of the store comes with it per question (0.8–1.1 on the main sets), and in
-the unseen sets 0–1 of the 15 unrelated facts per language. English, Russian and Chinese also have a second set (10
+The right fact is first in 95–100 % of main-set questions and 62–100 % of unseen ones. Recall before the turn is not
+only the right fact: about one other fact of the store comes with it per question (0.8–1.2 on the main sets), and in
+the unseen sets 0–2 of the 15 unrelated facts per language. English, Russian and Chinese also have a second set (10
 questions): found 90 / 90 / 100 %, recalled 80 / 90 / 90 %.
 
 How the numbers were obtained, honestly:
 
-- **Main sets are tuned on.** English, Russian and Chinese: the fixes in 0.4.2 were made against them. The other seven:
-  the set was first run on 0.4.2, where it found 85–100 % and recalled 50–100 % (Arabic 50 %, French 75 %, Spanish
-  85 %), and chit-chat recalled facts in four languages; 0.5.0 fixes were made against those misses. The fixes are
-  per language and per script (function words, stemmers, folding, how a word is matched), not per question.
-- **Unseen sets were written after the fixes.** English, Russian, Chinese: run once; after it, whole-message greetings
-  were made to recall nothing ("good morning" recalled facts about mornings), and the quiet column includes that fix.
-  The other seven: first run before the changes below, with the same found and recalled numbers as in the table.
+- **Main sets are tuned on.** English, Russian and Chinese: the fixes in 0.4.2 were made against them. Spanish, Hindi,
+  Arabic, French, Bengali, Portuguese, Indonesian: first run on 0.4.2 (found 85–100 %, recalled 50–100 %, Arabic 50 %,
+  French 75 %, Spanish 85 %, chit-chat recalled facts in four languages), fixed in 0.5.0. Japanese, Korean, Thai,
+  German: first run on 0.5.0 (found 95–100 %, recalled 95–100 %, but chit-chat recalled facts in Korean 1/5, German
+  1/5 and Thai 4/5), fixed in 0.6.0. The fixes are per language and per script, not per question.
+- **Unseen sets were written before those fixes were seen to work and run once after them.** English, Russian,
+  Chinese: after the run, whole-message greetings were made to recall nothing ("good morning" recalled facts about
+  mornings), and the quiet column includes that fix. Spanish to Indonesian: first run before the review fixes below,
+  with the same found and recalled numbers. Japanese, Korean, Thai, German: run once; nothing changed after.
 - **An independent review (Codex CLI) of 0.4.2 and 0.5.0** found regressions the sets did not: a lone "son" dropped as
   a Spanish function word, `hr-ovh` no longer enforced, `ação` / `ações` apart, "with" / "without" sugar no longer a
   conflict, `Jean` mentioned by `jeans`, and others. Each is fixed with a test, and every set was run again. One of
@@ -162,16 +177,55 @@ How the numbers were obtained, honestly:
   70 %), and two fixes followed. Its numbers published with 0.4.2 (recalled 90 / 100 / 100 %) were partly luck: facts
   of a named person saved in the same second came back in arbitrary order. They now come back newest first, every
   time, and the numbers above are what that gives.
-- **Not measured**: Japanese, Korean, Thai (n-grams, as Chinese), German and other languages (exact words, no stems,
-  no function-word list).
+- **Not measured**: other languages (exact words, no stems, no function-word list).
 
-What it does not do: find a fact through a synonym or a word of another root ("relocating" for "move", "бэкапы" for
-"резервные копии", Spanish `nada` for `natación`, 十月 for 10月). It can surface a fact that shares a word in another
-sense: "nightly backups" → "night market"; Hindi `बनाना` is both "to cook" and "to make a plan"; Portuguese `dirigir`
-is "to drive" and "to run a company". Stems are search keys, not lemmas: an irregular form can miss (`ponies` /
-`pony`). A negation counts for the whole clause up to a "but" ("likes cats but not dogs" is detail, not a conflict),
-not for a single word. `auto_extract` and the refusal of instruction-like text recognise English and Russian phrasing
-only. The main sets of all ten languages run in CI (`tests/test_holographic_languages.py`).
+### Synonyms and other roots: keywords
+
+Words are matched, not meanings: "relocating" does not find "move", 宠物 (pet) does not find 猫 (cat). The plugin calls
+no model, but the agent that stores a fact is one: `fact_store add` takes `keywords`, 3–8 words someone might ask
+with that the fact does not contain (synonyms, other roots, broader terms, the same in the user's other languages).
+They are kept with the fact's tags, searched like its text, never shown in the recalled block, and old versions index
+them too. This is document expansion, as doc2query does for lexical search: the meaning is added once, when the fact
+is written, and recall stays local and deterministic. `enrich` lists the facts that have none, so the agent or a
+nightly job can add them with `update`.
+
+Measured on a third set per language: 8 questions that share no word with their fact except a name ("Where are we
+relocating?", "What breed is our pet?", "Can my office computer handle AI models?"), written after the keywords. The
+keywords came from a separate agent that saw only the facts and the description of `keywords`, not the questions; a
+first batch was thrown away because the description's example then was the store's own "we move to Chiang Mai".
+
+| | Without keywords: found / recalled | With keywords: found / recalled |
+|---|---|---|
+| English | 38 % / 38 % | 100 % / 100 % |
+| Russian | 25 % / 25 % | 75 % / 62 % |
+| Chinese | 38 % / 12 % | 88 % / 75 % |
+| Spanish | 38 % / 25 % | 100 % / 100 % |
+| French | 38 % / 38 % | 100 % / 100 % |
+| Portuguese | 38 % / 38 % | 75 % / 75 % |
+| Indonesian | 38 % / 25 % | 88 % / 88 % |
+| Arabic | 38 % / 38 % | 75 % / 75 % |
+| Hindi | 38 % / 38 % | 88 % / 75 % |
+| Bengali | 38 % / 38 % | 75 % / 75 % |
+| Japanese | 50 % / 25 % | 88 % / 75 % |
+| Korean | 50 % / 12 % | 88 % / 62 % |
+| Thai | 38 % / 25 % | 75 % / 62 % |
+| German | 25 % / 38 % | 62 % / 75 % |
+| **All 112** | **42 / 33** | **94 / 88** |
+
+Without keywords, what is found comes through the name in three of the eight questions (Eva, Anton). With them, the
+main sets lose nothing (280 / 280 found and recalled), one more extra fact comes per ten questions, and one chit-chat
+line of 70 recalls a fact ("Apa ibu kota Australia?" shares "kota", city, with a keyword "ganti kota"). The misses
+left are words the keywords did not include ("перебираемся" against "переселение", "morar" against "moradia"):
+keywords are as good as the agent that writes them, and facts stored without them (older ones, `auto_extract`,
+`mirror_memory_writes`) are found by their words only until `enrich` gives them some.
+
+What it does not do: find a fact through a synonym or another root that no keyword names ("бэкапы" for "резервные
+копии", Spanish `nada` for `natación`, 十月 for 10月). It can surface a fact that shares a word in another sense:
+"nightly backups" → "night market"; Hindi `बनाना` is both "to cook" and "to make a plan"; Portuguese `dirigir` is "to
+drive" and "to run a company". Stems are search keys, not lemmas: an irregular form can miss (`ponies` / `pony`). A
+negation counts for the whole clause up to a "but" ("likes cats but not dogs" is detail, not a conflict), not for a
+single word. `auto_extract` and the refusal of instruction-like text recognise English and Russian phrasing only. The
+main sets of all fourteen languages run in CI (`tests/test_holographic_languages.py`).
 
 ## Data and privacy
 

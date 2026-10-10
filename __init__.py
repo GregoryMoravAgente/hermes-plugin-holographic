@@ -42,12 +42,14 @@ FACT_STORE_SCHEMA = {
     "description": (
         "Long-term facts (local store). Use with the memory tool: memory = always-on notes, fact_store = recall on "
         "demand.\n"
-        "• search {query} — find facts by words (any word form).\n"
+        "• search {query} — find facts by words (any word form). Nothing fits? Search again with a synonym or a "
+        "translation.\n"
         "• probe {entity} — every fact about a person or thing.\n"
         "• reason {entities} — facts that involve ALL of them.\n"
-        "• add {content, entities?, supersedes?} — one short standalone sentence. The result lists similar facts "
-        "and possible conflicts: if the new fact replaces one, add it with supersedes=<old id>.\n"
+        "• add {content, entities?, keywords?, supersedes?} — one short standalone sentence. The result lists similar "
+        "facts and possible conflicts: if the new fact replaces one, add it with supersedes=<old id>.\n"
         "• update / remove {fact_id} · list · stats · export · review (clean-up candidates) · related · contradict.\n"
+        "• enrich — facts stored without keywords: give each some with update {fact_id, keywords}.\n"
         "• entities — known names and aliases · alias {entity, content=<other name>} — one entity, two names "
         "(merges them if both exist).\n"
         "Recalled facts show their id as #N: pass it to fact_feedback."
@@ -56,7 +58,8 @@ FACT_STORE_SCHEMA = {
         "type": "object",
         "properties": {
             "action": {"type": "string", "enum": ["add", "search", "probe", "related", "reason", "contradict", "update",
-                                                  "remove", "list", "stats", "export", "review", "entities", "alias"]},
+                                                  "remove", "list", "stats", "export", "review", "entities", "alias",
+                                                  "enrich"]},
             "content": {"type": "string", "description": "Fact text for 'add' / 'update': one short standalone sentence."},
             "query": {"type": "string", "description": "Search query (required for 'search')."},
             "entity": {"type": "string", "description": "Entity name for 'probe'/'related'."},
@@ -64,6 +67,13 @@ FACT_STORE_SCHEMA = {
                          "description": "'reason': the entities to join. 'add'/'update': who or what the fact is about; "
                                         "needed for one-word names (e.g. a first name), so later facts link to them."},
             "supersedes": {"type": "integer", "description": "'add': id of the fact this one replaces (removed in the same step)."},
+            "keywords": {"type": "array", "items": {"type": "string"},
+                         "description": "'add'/'update': 3-8 words or short phrases someone might use to ask for this fact "
+                                        "that are NOT in its text: synonyms, words of another root, broader terms, and "
+                                        "the same in the other languages the user writes in (fact 'Mom's birthday is "
+                                        "May 3' -> birth date, anniversary, день рождения, cumpleaños). Used only to "
+                                        "find the fact; never shown as part of it. 'update' replaces the fact's "
+                                        "keywords."},
             "fact_id": {"type": "integer", "description": "Fact ID for 'update'/'remove'."},
             "category": {"type": "string", "enum": ["user_pref", "project", "tool", "general"]},
             "tags": {"type": "string", "description": "Comma-separated tags."},
@@ -168,6 +178,38 @@ _MAX_LIMIT = 100
 # Agent contexts that may write (contract: skip writes for subagent / cron / flush contexts).
 _WRITER_CONTEXTS = frozenset({"", "primary"})
 _WRITE_ACTIONS = frozenset({"add", "update", "remove", "alias"})
+# Keywords (document expansion, as doc2query does for lexical search): words a person might ask with that the fact
+# does not contain, given by the agent when it stores the fact. Kept in the indexed tags column after a marker line,
+# so older versions and FTS5 see them too and no schema changes; never shown in the recalled block.
+_KW_MARK = "keywords: "
+_MAX_KEYWORDS, _MAX_KEYWORD_CHARS = 12, 40
+
+
+def _keywords(value) -> list[str]:
+    """A list of strings or one comma-separated string -> distinct, trimmed keywords (at most 12 of 40 characters)."""
+    items = value if isinstance(value, list) else str(value or "").split(",")
+    out: list[str] = []
+    for item in items:
+        word = " ".join(item.split()).strip(" ,;") if isinstance(item, str) else ""
+        if word and len(word) <= _MAX_KEYWORD_CHARS and word.casefold() not in {o.casefold() for o in out}:
+            out.append(word)
+    return out[:_MAX_KEYWORDS]
+
+
+def _split_tags(stored: str | None) -> tuple[str, list[str]]:
+    """(the user's tags, the keywords) of a stored tags value."""
+    text = stored or ""
+    if text.startswith(_KW_MARK):
+        return "", _keywords(text[len(_KW_MARK):])
+    head, mark, tail = text.rpartition("\n" + _KW_MARK)
+    return (head, _keywords(tail)) if mark else (text, [])
+
+
+def _join_tags(tags: str | None, keywords: list[str]) -> str:
+    base = (tags or "").strip()
+    if not keywords:
+        return base
+    return (base + "\n" if base else "") + _KW_MARK + ", ".join(keywords)
 _SCOPES = frozenset({"profile", "user"})
 _PREFETCH_CANDIDATES, _PREFETCH_FACTS, _ENTITY_FACTS = 15, 5, 2
 _PREFETCH_LINE_CHARS = 300
@@ -643,11 +685,18 @@ class HolographicMemoryProvider(MemoryProvider):
         value = a.get("entities") or []
         return [value] if isinstance(value, str) else [e for e in value if isinstance(e, str)]
 
+    @staticmethod
+    def _keyword_problem(a: dict) -> str:
+        keywords = _keywords(a.get("keywords"))
+        problem = _fact_problem(", ".join(keywords)) if keywords else ""
+        return f"keywords: {problem}" if problem else ""
+
     def _add(self, a: dict) -> str:
-        problem = _fact_problem(a["content"])
+        problem = _fact_problem(a["content"]) or self._keyword_problem(a)
         if problem:
             return tool_error(f"Not stored: {problem}.")
-        category, tags, entities = a.get("category", "general"), a.get("tags", ""), self._entities(a)
+        category, entities = a.get("category", "general"), self._entities(a)
+        tags = _join_tags(_split_tags(a.get("tags", ""))[0], _keywords(a.get("keywords")))
         if a.get("supersedes") is not None:
             old_id = int(a["supersedes"])
             try:
@@ -669,13 +718,28 @@ class HolographicMemoryProvider(MemoryProvider):
         return json.dumps(result)
 
     def _update(self, a: dict) -> str:
-        if a.get("content") is not None:
-            problem = _fact_problem(a["content"])
-            if problem:
-                return tool_error(f"Not updated: {problem}.")
+        problem = (_fact_problem(a["content"]) if a.get("content") is not None else "") or self._keyword_problem(a)
+        if problem:
+            return tool_error(f"Not updated: {problem}.")
+        tags = a.get("tags")
+        if tags is not None or a.get("keywords") is not None:  # the other half of the tags column is kept
+            row = self._store.read("SELECT tags FROM facts WHERE fact_id = ?", (int(a["fact_id"]),))
+            user_tags, keywords = _split_tags(row[0]["tags"] if row else "")
+            tags = _join_tags(_split_tags(tags)[0] if tags is not None else user_tags,
+                              _keywords(a["keywords"]) if a.get("keywords") is not None else keywords)
         return json.dumps({"updated": self._store.update_fact(
             int(a["fact_id"]), content=a.get("content"), trust_delta=float(a["trust_delta"]) if "trust_delta" in a else None,
-            tags=a.get("tags"), category=a.get("category"), entities=self._entities(a))})
+            tags=tags, category=a.get("category"), entities=self._entities(a))})
+
+    def _enrich(self, a: dict) -> str:
+        """Facts without keywords, the most recalled first: what the agent (or a nightly job) should give keywords."""
+        rows = self._store.read(
+            "SELECT fact_id, content FROM facts WHERE COALESCE(tags, '') NOT LIKE ? AND COALESCE(tags, '') NOT LIKE ? "
+            "ORDER BY retrieval_count DESC, fact_id LIMIT ?", (_KW_MARK + "%", "%\n" + _KW_MARK + "%", _limit(a)))
+        facts = [{"fact_id": r["fact_id"], "content": r["content"]} for r in rows]
+        return json.dumps({"facts": facts, "count": len(facts),
+                           "hint": "Give each 3-8 keywords with update {fact_id, keywords}: synonyms, other roots and "
+                                   "translations someone might ask with."} if facts else {"facts": [], "count": 0})
 
     def _feedback(self, a: dict) -> str:
         if a["action"] not in ("helpful", "unhelpful"):
@@ -691,6 +755,8 @@ class HolographicMemoryProvider(MemoryProvider):
             "facts": self._store.count_facts(), "entities": read("SELECT COUNT(*) FROM entities")[0][0],
             "by_category": by_category,
             "recalled_at_least_once": read("SELECT COUNT(*) FROM facts WHERE retrieval_count > 0")[0][0],
+            "without_keywords": read("SELECT COUNT(*) FROM facts WHERE COALESCE(tags, '') NOT LIKE ? AND COALESCE(tags, '') "
+                                     "NOT LIKE ?", (_KW_MARK + "%", "%\n" + _KW_MARK + "%"))[0][0],
             "low_trust": read("SELECT COUNT(*) FROM facts WHERE trust_score < ?", (self._min_trust,))[0][0],
             "structural_recall": "on" if hrr._HAS_NUMPY else "off (numpy missing)",
             "database": str(self._store.db_path),
@@ -730,6 +796,7 @@ class HolographicMemoryProvider(MemoryProvider):
             "review": lambda self, a: _results(self._retriever.review(limit=_limit(a)), key="candidates"),
             "entities": lambda self, a: _results(self._store.list_entities(limit=_limit(a)), key="entities"),
             "alias": lambda self, a: json.dumps(self._store.add_alias(a["entity"], a["content"])),
+            "enrich": lambda self, a: self._enrich(a),
         }),
         "fact_feedback": lambda self, a: self._feedback(a),
     }
