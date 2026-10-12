@@ -161,11 +161,14 @@ A word matches another when they share its plain form or its stem in the languag
 - **German compounds**: a word matches the end of a compound in German text (`Katze` finds `Familienkatze`, `Laptop`
   finds `Arbeitslaptop`). A compound in the question is not taken apart (`Erdnussallergie` does not find `allergisch
   gegen Erdnüsse`).
-- **Words of the same root** (Russian and English, 0.9.0): Snowball removes inflection but keeps derivations apart.
-  A root key strips derivational suffixes off the stem: Russian adjective, verbal-noun, verb and diminutive suffixes
-  (`ночные` / `ночь`, `городской` / `город`, `плавание` / `плавает`), English agent nouns, -ist, -ian, -al, -ic and -y,
-  one step only (`teacher` / `teaches`, `swimmer` / `swims`, `dentist` / `dental`, `photography` / `photograph`).
-  Russian stems of six letters also match on their first five (`покупа` / `покупк`). Only in text whose language is
+- **Words of the same root** (Russian and English): Snowball removes inflection but keeps derivations apart. Russian
+  pairs come from a dictionary (0.10.0): DerivBase.Ru, its direct derivation links as stem pairs, kept when the pair
+  has the shape of a derivation (`ночные` / `ночь`, `городской` / `город`, `учительница` / `учитель`, `дружеский` /
+  `друг`; not `полный` / `пол` or `задача` / `дача`) — 46,756 pairs, Apache-2.0
+  ([licence](LICENSES/DerivBase.Ru-Apache-2.0.txt)), loaded on the first Russian word (about 0.3 s, 12 MB). English:
+  one suffix off the stem — agent nouns, -ist, -ian, -al, -ic and -y (`teacher` / `teaches`, `swimmer` / `swims`,
+  `dentist` / `dental`, `photography` / `photograph`). Russian stems of six letters also match on their first five
+  (`покупа` / `покупк`). Only in text whose language is
   determined (English by its function words; Cyrillic without Ukrainian or Belarusian letters), and only within that
   language. A root counts 0.6 of the word itself and **never recalls a fact on its own**: suffix rules cannot tell a
   derivation from a look-alike (`войной` / `вой`, `полный` / `пол`), so automatic recall needs a word of the message
@@ -269,6 +272,10 @@ How the numbers were obtained, honestly:
   same-script questions 100 % both; synonyms with no shared character 0 % both (keywords cover them). Folding also
   makes a same word in another sense meet across scripts ("圍棋是誰發明的？" recalls the family's Go lessons, written
   `围棋`), as it always did within one script.
+- **Russian dictionary (0.10.0)**: a fresh blind set (12 same-root questions, 4 other forms, 4 synonyms, 12
+  look-alike traps), run once: same-root questions found 75 % (0.8.0) → 83 % (0.9.0 rules) → 92 % (dictionary),
+  recalled 42 → 67 → 67 %; traps quiet 11 of 12 in all three. The choice of the dictionary was made on the earlier,
+  already read sets, before this run.
 - **Not measured**: other languages (exact words, no stems, no function-word list).
 
 ### Synonyms and other roots: keywords
@@ -368,9 +375,11 @@ HERMES_AGENT_REPO=~/.hermes/hermes-agent PYTHONPATH=~/.hermes/hermes-agent pytho
 ```
 
 CI runs the suite on Linux, macOS and Windows against hermes-agent `main`, plus `hermes plugins validate`, the check
-the plugin catalog runs at admission. 0.9.0: 432 tests pass against a hermes-agent 0.21.6 core (3 skipped: optional
-dependencies), 388 without the core (the auto-extraction tests need it). Maintenance notes are in [HANDOFF.md](HANDOFF.md).
+the plugin catalog runs at admission. 0.10.0: 439 tests pass against a hermes-agent 0.21.6 core (3 skipped: optional
+dependencies), 395 without the core (the auto-extraction tests need it). Maintenance notes are in [HANDOFF.md](HANDOFF.md).
 
 Original plugin by dusterbloom (hermes-agent PR #2351); its history is in hermes-agent
 (`git log -- plugins/memory/holographic`). MIT licence; the Traditional → Simplified Chinese table in `cjk_fold.py` is
-derived from OpenCC under Apache-2.0 ([LICENSES/OpenCC-Apache-2.0.txt](LICENSES/OpenCC-Apache-2.0.txt)).
+derived from OpenCC under Apache-2.0 ([LICENSES/OpenCC-Apache-2.0.txt](LICENSES/OpenCC-Apache-2.0.txt)), the Russian
+derivation pairs in `ru_derivation.tsv.gz` from DerivBase.Ru (UDer 1.1) under Apache-2.0
+([LICENSES/DerivBase.Ru-Apache-2.0.txt](LICENSES/DerivBase.Ru-Apache-2.0.txt)).

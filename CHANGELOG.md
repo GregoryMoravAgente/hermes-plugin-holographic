@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.10.0 — 2026-10-13
+
+Russian words of one root come from a dictionary instead of suffix rules.
+
+### Changed
+
+- **Russian same-root words: DerivBase.Ru.** 0.9.0 joined them by stripping suffixes, which cannot tell a derivation
+  from a look-alike (`ночные` / `ночь` and `полный` / `пол` look the same to a rule). They now come from DerivBase.Ru
+  (Vodolazsky, LREC 2020) as harmonised in Universal Derivations 1.1, Apache-2.0
+  (`LICENSES/DerivBase.Ru-Apache-2.0.txt`): its direct parent-child links, as pairs of Snowball stems, kept only when
+  the pair has the shape of a derivation — a suffix extension (a three-letter stem only by `-н`, `-ов`, `-ев`, `-ск`,
+  `-ин`), or a regular consonant alternation (`друг` / `дружеский`, `г/ж к/ч х/ш д/ж т/ч з/ж с/ш ц/ч`, `ст/ск → щ`).
+  The filter also drops the resource's own noise (`пол` / `полк`, `бан` / `банк`, `город` / `гордец`, `дача` /
+  `задача`). 46,756 pairs, `ru_derivation.tsv.gz` (269 KB); `tools/build_ru_derivation.py` rebuilds it from the UDer
+  file. Loaded on the first Russian word: about 0.3 s and 12 MB. A root still counts 0.6 of a word and still never
+  recalls a fact on its own. `_RU_DERIVATION = "rules"` restores 0.9.0's rules, `"both"` joins the two. English keeps
+  its one-step suffix rules.
+
+### Measured
+
+A fresh blind Russian set (24 facts, 20 look-alike distractors; 12 questions asked with another word of the fact's
+root, 4 with another form, 4 with a synonym, 12 look-alike traps), run once: same-root questions found 75 % (0.8.0) →
+83 % (0.9.0 rules) → 92 % (dictionary), recalled 42 → 67 → 67 %; all questions found 80 → 85 → 90 %, first 55 → 60
+→ 55 %; traps quiet 11 of 12 in all three. The dictionary misses `дачный` / `дача` (DerivBase.Ru derives дача from
+дать). Chosen on the earlier, already read sets (dictionary ≥ rules on each), before this run. Every earlier set as in
+0.9.0, except the Russian main set, first 95 → 100 %. 439 tests against a hermes-agent 0.21.6 core.
+
 ## 0.9.0 — 2026-10-13
 
 Words of the same root meet in Russian and English; Traditional and Simplified Chinese meet; small talk recalls less;

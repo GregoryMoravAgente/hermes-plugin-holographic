@@ -15,10 +15,14 @@ of Southeast Asia are compared by character n-grams instead (see UNSEGMENTED).""
 
 from __future__ import annotations
 
+import gzip
 import re
+import sys
+import threading
 import unicodedata
 from dataclasses import dataclass
 from functools import cached_property, lru_cache
+from pathlib import Path
 
 from .cjk_fold import SIMPLIFIED, TRADITIONAL
 
@@ -436,8 +440,45 @@ def word_roots(word: str, stem_: str, lang: str) -> frozenset:
     return frozenset()
 
 
+# Russian words of one root come from a dictionary, not from suffix rules: DerivBase.Ru (UDer 1.1, Apache-2.0), its
+# direct parent-child links as pairs of Snowball stems, kept when their shape is a derivation (tools/
+# build_ru_derivation.py). Suffix rules cannot tell "ночные" / "ночь" from "полный" / "пол"; the dictionary can, and it
+# also has what rules cannot reach ("друг" / "дружеский"). "rules" keeps 0.9.0's first rules, "both" joins the two.
+_RU_DERIVATION = "dict"
+_RU_PAIRS: dict | None = None
+_RU_PAIRS_LOCK = threading.Lock()
+
+
+def _ru_related(stem_: str) -> frozenset:
+    """Stems linked to *stem_* by a derivation in the dictionary (loaded on first use, about 47,000 pairs)."""
+    global _RU_PAIRS
+    if _RU_PAIRS is None:
+        with _RU_PAIRS_LOCK:
+            if _RU_PAIRS is None:
+                pairs: dict[str, tuple] = {}
+                try:
+                    with gzip.open(Path(__file__).with_name("ru_derivation.tsv.gz"), "rt", encoding="utf-8") as fh:
+                        for line in fh:
+                            a, tab, b = line.rstrip("\n").partition("\t")
+                            if tab and not line.startswith("#"):
+                                a, b = sys.intern(a), sys.intern(b)  # each stem kept once
+                                pairs[a] = pairs.get(a, ()) + (b,)
+                                pairs[b] = pairs.get(b, ()) + (a,)
+                except OSError:  # a copy without the data file: no dictionary roots
+                    pairs = {}
+                _RU_PAIRS = pairs
+    return frozenset(_RU_PAIRS.get(stem_, ()))
+
+
 @lru_cache(maxsize=65536)
 def _ru_roots(word: str, stem_: str) -> frozenset:
+    if _RU_DERIVATION == "dict":
+        return _ru_related(stem_)
+    rules = _ru_rule_roots(word, stem_)
+    return rules | _ru_related(stem_) if _RU_DERIVATION == "both" else rules
+
+
+def _ru_rule_roots(word: str, stem_: str) -> frozenset:
     out = set()
 
     def keep(s: str) -> str:

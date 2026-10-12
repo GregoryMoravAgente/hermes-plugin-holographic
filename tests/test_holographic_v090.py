@@ -51,13 +51,31 @@ def no_roots(monkeypatch):
 
 # -- the rules ----------------------------------------------------------------------------------------------------
 
-@pytest.mark.parametrize("word, root", [
-    ("ночные", "ноч"), ("городской", "город"), ("банковский", "банк"), ("школьный", "школ"), ("плавание", "плав"),
-    ("плавает", "плав"), ("лечение", "леч"), ("соседка", "сосед"), ("дочка", "доч"), ("учительница", "учител"),
-    ("стоматологический", "стоматолог"),
+@pytest.mark.parametrize("word, related", [
+    ("ночные", "ноч"), ("ночь", "ночн"), ("городской", "город"), ("школьный", "школ"), ("плавание", "плава"),
+    ("учительница", "учител"), ("соседка", "сосед"), ("зимний", "зим"), ("ипотечный", "ипотек"),
+    ("дружеский", "друг"),  # an alternation suffix rules cannot reach
 ])
-def test_russian_roots(word, root):
-    assert root in text._ru_roots(word, text.stem(word, "ru"))
+def test_russian_roots_come_from_the_dictionary(word, related):
+    assert related in text._ru_roots(word, text.stem(word, "ru"))
+
+
+@pytest.mark.parametrize("word, not_related", [
+    ("полный", "пол"), ("войной", "вой"), ("речка", "реч"), ("летает", "лет"), ("банк", "бан"), ("гордый", "город"),
+    ("задача", "дач"),
+])
+def test_dictionary_keeps_look_alikes_apart(word, not_related):
+    # look-alikes (and DerivBase.Ru's own noise: пол → полк, бан → банк) are filtered by the shape of the pair
+    assert not_related not in text._ru_roots(word, text.stem(word, "ru"))
+
+
+def test_suffix_rules_remain_as_an_option(monkeypatch):
+    monkeypatch.setattr(text, "_RU_DERIVATION", "rules")
+    text._ru_roots.cache_clear()
+    try:
+        assert "ноч" in text._ru_roots("ночные", text.stem("ночные", "ru"))
+    finally:
+        text._ru_roots.cache_clear()
 
 
 @pytest.mark.parametrize("word, root", [
