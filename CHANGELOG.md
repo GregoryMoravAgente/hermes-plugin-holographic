@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.7.0 — 2026-10-12
+
+### Added
+
+- **`scope: chat`** — a separate database per chat (`holographic-chats/<platform>-<chat id>.db` next to `db_path`),
+  for one bot serving many unrelated groups: the provider recalls facts into every turn on its own, and without
+  isolation one group would hear what was said in another. **`scope: thread`** — per forum topic / thread
+  (`…-t<thread id>.db`), the chat's own database outside threads. A file per chat, not a `chat_id` column: facts meet
+  in the FTS index, the n-gram scan, entities, HRR banks and the write checks, and one missed filter would leak between
+  chats. The core already passes `chat_id` / `thread_id` to memory providers; no core change. Without a chat (CLI,
+  cron, subagents) nothing is recalled or written, as in `scope: user`. Existing facts stay in the profile database;
+  tools that read `memory_store.db` directly (e.g. hermes-dreaming) do not see per-chat databases. Per-turn
+  auto-extraction (`auto_extract`) files facts into the active store — the chat's, never the profile one.
+  ([#1](https://github.com/itpartypattaya/hermes-plugin-holographic/issues/1))
+
 ## 0.6.2 — 2026-10-12
 
 ### Added

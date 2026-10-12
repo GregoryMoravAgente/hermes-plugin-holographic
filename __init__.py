@@ -3,7 +3,7 @@ resolution, trust scoring, and HRR-based compositional retrieval. Original plugi
 Config in $HERMES_HOME/config.yaml under plugins.hermes-memory-store: db_path ($HERMES_HOME/memory_store.db),
 auto_extract (false), default_trust (0.5), min_trust_threshold (0.3), temporal_decay_half_life (0),
 hrr_dim (1024), hrr_weight (0.3), mirror_memory_writes (false), prefetch_min_coverage (0.3),
-prefetch_repeat_turns (6), recall_indicator (true), scope (profile | user)."""
+prefetch_repeat_turns (6), recall_indicator (true), scope (profile | user | chat | thread)."""
 
 from __future__ import annotations
 
@@ -210,7 +210,10 @@ def _join_tags(tags: str | None, keywords: list[str]) -> str:
     if not keywords:
         return base
     return (base + "\n" if base else "") + _KW_MARK + ", ".join(keywords)
-_SCOPES = frozenset({"profile", "user"})
+_SCOPES = frozenset({"profile", "user", "chat", "thread"})
+# A separate database per chat (or per forum topic / thread): facts meet in the FTS index, n-gram scan, entities, HRR
+# banks and the write checks, so a chat_id column would need a filter in each of them; a file isolates by construction.
+_CHAT_SCOPES = frozenset({"chat", "thread"})
 _PREFETCH_CANDIDATES, _PREFETCH_FACTS, _ENTITY_FACTS = 15, 5, 2
 _PREFETCH_LINE_CHARS = 300
 _COUNT_FLUSH_AT = 25  # buffered recall counts are written in one go at this many, and at session boundaries
@@ -273,7 +276,7 @@ class HolographicMemoryProvider(MemoryProvider):
         self._last_recall = 0
         scope = str(self._config.get("scope", "profile")).strip().lower()
         self._scope = scope if scope in _SCOPES else "profile"
-        self._scope_key = ""  # "" = the profile store; otherwise the user whose store is active
+        self._scope_key = ""  # "" = the profile store; otherwise the user / chat whose store is active
         self._stores: OrderedDict[str, tuple] = OrderedDict()  # scope key -> (MemoryStore, FactRetriever), LRU
         self._home, self._platform = "", ""
         self._init_key: str | None = None  # the user Hermes named at start (user scope)
@@ -349,9 +352,9 @@ class HolographicMemoryProvider(MemoryProvider):
         except (ValueError, OSError):
             pass
         found = [str(path.resolve())] if path.is_absolute() or path.exists() else []
-        users = path.parent / "holographic-users"
-        if self._scope == "user" and users.is_dir():
-            found += sorted(str(p.resolve()) for p in users.glob("*.db"))
+        scoped = path.parent / self._scoped_dir()
+        if self._scope != "profile" and scoped.is_dir():
+            found += sorted(str(p.resolve()) for p in scoped.glob("*.db"))
         return found
 
     @_serialized
@@ -368,6 +371,8 @@ class HolographicMemoryProvider(MemoryProvider):
         if self._scope == "user":
             self._init_key = self._user_key(kwargs.get("user_id"))
             self._activate(self._init_key)
+        elif self._scope in _CHAT_SCOPES:  # the gateway builds one agent per chat (and thread): fixed for the session
+            self._activate(self._chat_key(kwargs.get("chat_id"), kwargs.get("thread_id")))
         else:
             self._activate("")
 
@@ -382,11 +387,23 @@ class HolographicMemoryProvider(MemoryProvider):
         user = str(user_id or "").strip()
         return self._safe_part(f"{self._platform or 'unknown'}-{user}") if user else None
 
+    def _chat_key(self, chat_id, thread_id=None) -> str | None:
+        """Per-chat store key "<platform>-<chat id>" (thread scope: "...-t<thread id>" when the turn is in a thread),
+        or None without a chat (CLI, cron, subagents): nothing is recalled or written then, as in user scope."""
+        chat = str(chat_id or "").strip()
+        if not chat:
+            return None
+        thread = str(thread_id or "").strip() if self._scope == "thread" else ""
+        return self._safe_part(f"{self._platform or 'unknown'}-{chat}" + (f"-t{thread}" if thread else ""))
+
+    def _scoped_dir(self) -> str:
+        return "holographic-chats" if self._scope in _CHAT_SCOPES else "holographic-users"
+
     def _scoped_db_path(self, key: str) -> str:
         base = self._db_path(self._home)
         if not key:
             return base
-        return str(Path(base).expanduser().parent / "holographic-users" / f"{key}.db")
+        return str(Path(base).expanduser().parent / self._scoped_dir() / f"{key}.db")
 
     def _open(self, key: str) -> tuple | None:
         """(store, retriever) of *key*, opened on first use and kept in a small LRU; None if it cannot be opened."""
@@ -415,7 +432,7 @@ class HolographicMemoryProvider(MemoryProvider):
         return self._stores[key]
 
     def _activate(self, key: str | None) -> None:
-        """Make the store of *key* ("" = profile store, None = no identity in user scope) the active one."""
+        """Make the store of *key* ("" = profile store, None = no identity in user / chat scope) the active one."""
         opened = self._open(key) if key is not None else None
         self._scope_key = key
         self._store, self._retriever = opened if opened else (None, None)
@@ -439,8 +456,10 @@ class HolographicMemoryProvider(MemoryProvider):
     def system_prompt_block(self) -> str:
         if self._init_error:
             return f"# Holographic Memory\nUnavailable this session: {self._init_error}"
-        if self._scope == "user" and self._scope_key is None:
-            return "# Holographic Memory\nPer-user memory: off in this context (no user identity)."
+        if self._scope_key is None:
+            what = ("Per-user memory: off in this context (no user identity)." if self._scope == "user"
+                    else "Per-chat memory: off in this context (no chat).")
+            return "# Holographic Memory\n" + what
         if not self._store:
             return ""
         try:
@@ -459,6 +478,9 @@ class HolographicMemoryProvider(MemoryProvider):
             lines.append("- numpy is not installed: keyword recall only (no structural 'related').")
         if self._scope == "user":
             lines.append("- Facts are kept per user: what one person tells you is not recalled for another.")
+        elif self._scope in _CHAT_SCOPES:
+            lines.append("- Facts are kept per chat: what is said here is not recalled in another chat, and the other way "
+                         "round.")
         return "# Holographic Memory\n" + "\n".join(lines)
 
     # -- recall before the turn ----------------------------------------------------------------------------------
@@ -526,8 +548,9 @@ class HolographicMemoryProvider(MemoryProvider):
         if tool_name not in self._TOOL_HANDLERS:
             return tool_error(f"Unknown tool: {tool_name}")
         if self._store is None:
-            reason = self._init_error or ("no user identity in this context (per-user memory)"
-                                          if self._scope == "user" else "not initialised")
+            reason = self._init_error or ("no user identity in this context (per-user memory)" if self._scope == "user"
+                                          else "no chat in this context (per-chat memory)" if self._scope in _CHAT_SCOPES
+                                          else "not initialised")
             return tool_error(f"Holographic memory is unavailable: {reason}")
         if not self._writable and (tool_name == "fact_feedback" or args.get("action") in _WRITE_ACTIONS):
             return tool_error("The fact store is read-only in this context (subagent, cron or flush); "
@@ -555,8 +578,8 @@ class HolographicMemoryProvider(MemoryProvider):
         anonymous turn in a shared conversation, is skipped rather than stored in somebody's memory."""
         if not self._extracting() or not user_content:
             return
-        if self._scope != "user":
-            target = self._open("")
+        if self._scope != "user":  # profile: the shared store; chat / thread: this chat's store, never the shared one
+            target = self._open(self._scope_key) if self._scope_key is not None else None
         else:
             author = turn_author or {}
             if author.get("is_bot"):

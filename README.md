@@ -49,7 +49,7 @@ In `config.yaml` under `plugins.hermes-memory-store`:
 | `prefetch_min_coverage` | `0.3` | Share of a message's informative words (rarer words weigh more) a fact must match to be recalled before the turn |
 | `prefetch_repeat_turns` | `6` | A fact recalled before a turn is not injected again for this many turns of the session |
 | `recall_indicator` | `true` | Report recalled facts to the core's recall indicator ("🧠 Holographic — recalled 2 memories"). On Telegram and other messaging platforms that line arrives as a separate message before the reply; `false` turns it off, recall itself is unchanged |
-| `scope` | `profile` | `user`: a separate database per user (`holographic-users/<platform>-<user id>.db` next to `db_path`); in a shared chat the store follows the author of each turn, and with no user identity nothing is recalled or written |
+| `scope` | `profile` | `user`: a separate database per user (`holographic-users/<platform>-<user id>.db` next to `db_path`); in a shared chat the store follows the author of each turn, and with no user identity nothing is recalled or written. `chat`: a separate database per chat (`holographic-chats/<platform>-<chat id>.db`) — for one bot serving many unrelated groups; `thread`: per forum topic / thread (`…-t<thread id>.db`), the chat's own database outside threads. Without a chat (CLI, cron, subagents) nothing is recalled or written |
 
 ## Tools
 
@@ -253,8 +253,9 @@ match `hrr_dim` are re-encoded. Only a writable agent does this; subagents, cron
 What is tested: this release, then 0.1.1, then this release on one database in CI (adds, edits, removals, aliases, a
 keyless duplicate entity written by 0.1.1), plus the reconciliation cases above. What a downgrade does not keep:
 aliases made after 0.4.0 are visible to 0.1.1 only through the legacy `entities.aliases` column; and with
-`scope: user`, an older version knows nothing of per-user files, so it reads and writes the shared `db_path` again.
-The per-user files stay untouched (no leak), but new facts would land in the shared store.
+`scope: user`, `chat` or `thread`, an older version knows nothing of per-user or per-chat files (0.6.x and older do not
+know `chat` / `thread` at all and fall back to `profile`), so it reads and writes the shared `db_path` again. Those
+files stay untouched (no leak), but new facts would land in the shared store.
 
 ## Development
 
