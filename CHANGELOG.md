@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.2 — 2026-10-12
+
+### Added
+
+- **`recall_indicator`** (default `true`). The core turns `recall_status` into a status line
+  ("🧠 Holographic — recalled 1 memory"); on Telegram and other messaging platforms it arrives as a separate message
+  before every reply that used memory, in English, in family and group chats alike — the bundled v0.1.1 never reported
+  it, so installs moving to this plugin see it for the first time. `recall_indicator: false` under
+  `plugins.hermes-memory-store` turns the line off; what is recalled does not change.
+
 ## 0.6.1 — 2026-10-11
 
 ### Fixed

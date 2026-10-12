@@ -3,7 +3,7 @@ resolution, trust scoring, and HRR-based compositional retrieval. Original plugi
 Config in $HERMES_HOME/config.yaml under plugins.hermes-memory-store: db_path ($HERMES_HOME/memory_store.db),
 auto_extract (false), default_trust (0.5), min_trust_threshold (0.3), temporal_decay_half_life (0),
 hrr_dim (1024), hrr_weight (0.3), mirror_memory_writes (false), prefetch_min_coverage (0.3),
-prefetch_repeat_turns (6), scope (profile | user)."""
+prefetch_repeat_turns (6), recall_indicator (true), scope (profile | user)."""
 
 from __future__ import annotations
 
@@ -259,6 +259,9 @@ class HolographicMemoryProvider(MemoryProvider):
         self._min_trust = float(self._config.get("min_trust_threshold", 0.3))
         self._min_coverage = float(self._config.get("prefetch_min_coverage", 0.3))
         self._repeat_turns = int(self._config.get("prefetch_repeat_turns", 6))
+        # The core turns recall_status into a status line ("🧠 Holographic — recalled 2 memories"); on a messaging
+        # platform that is a separate message before every reply that used memory, so it can be switched off.
+        self._recall_indicator = is_truthy_value(self._config.get("recall_indicator", True))
         self._writable = True
         self._init_error = ""
         self._session_id = ""
@@ -321,6 +324,9 @@ class HolographicMemoryProvider(MemoryProvider):
              "default": current("mirror_memory_writes", "false"), "choices": ["true", "false"]},
             {"key": "prefetch_min_coverage", "description": "How much of a message a fact must match to be recalled "
              "automatically before a turn (0-1; higher = fewer, closer facts)", "default": current("prefetch_min_coverage", "0.3")},
+            {"key": "recall_indicator", "description": "Show the core's status line when facts were recalled before a turn "
+             "(on messaging platforms it arrives as a separate message)",
+             "default": current("recall_indicator", "true"), "choices": ["true", "false"]},
         ]
 
     def _db_path(self, hermes_home: str) -> str:
@@ -508,7 +514,7 @@ class HolographicMemoryProvider(MemoryProvider):
     @_serialized
     def recall_status(self):
         """What the last prefetch injected, for the core's recall indicator."""
-        if RecallStatus is None or not self._last_recall:
+        if RecallStatus is None or not self._last_recall or not self._recall_indicator:
             return None
         return RecallStatus(provider_label="Holographic", count=self._last_recall)
 

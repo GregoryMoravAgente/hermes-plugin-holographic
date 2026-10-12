@@ -98,6 +98,25 @@ def test_enrich_lists_facts_without_keywords(provider):
     assert _call(provider, action="stats")["without_keywords"] == 1
 
 
+# -- recall indicator ------------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("setting,shown", [(None, True), (False, False), ("false", False), ("true", True)])
+def test_recall_indicator_can_be_switched_off(tmp_path, monkeypatch, setting, shown):
+    """On a messaging platform the core sends the indicator as its own message; recall itself stays on."""
+    import hermes_plugin_holographic as plugin
+    if plugin.RecallStatus is None:  # an older core: stand in for its dataclass
+        monkeypatch.setattr(plugin, "RecallStatus", lambda provider_label, count: (provider_label, count))
+    config = {"db_path": str(tmp_path / "memory_store.db"), "hrr_dim": DIM}
+    if setting is not None:
+        config["recall_indicator"] = setting
+    p = HolographicMemoryProvider(config=config)
+    p.initialize(session_id="s")
+    _call(p, action="add", content="The family plans to move to Chiang Mai in spring 2027")
+    assert "Chiang Mai" in p.prefetch("when do we move to Chiang Mai?")  # recalled either way
+    assert (p.recall_status() is not None) is shown
+    p.shutdown()
+
+
 # -- German, Japanese, Korean, Thai ----------------------------------------------------------------------------------
 
 def test_german_compounds_end_in_the_word_they_name(provider):
