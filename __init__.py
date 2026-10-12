@@ -3,7 +3,8 @@ resolution, trust scoring, and HRR-based compositional retrieval. Original plugi
 Config in $HERMES_HOME/config.yaml under plugins.hermes-memory-store: db_path ($HERMES_HOME/memory_store.db),
 auto_extract (false), default_trust (0.5), min_trust_threshold (0.3), temporal_decay_half_life (0),
 hrr_dim (1024), hrr_weight (0.3), mirror_memory_writes (false), prefetch_min_coverage (0.3),
-prefetch_repeat_turns (6), recall_indicator (true), scope (profile | user | chat | thread)."""
+prefetch_repeat_turns (6), recall_indicator (true), recall_source (off | short), cron_writes (true), scope (profile |
+user | chat | thread). Fact history, provenance and forgetting: docs/history.md."""
 
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
 from utils import is_truthy_value
 from . import holographic as hrr
+from .history import parse_day
 from .store import DuplicateContentError, MemoryStore
 from .retrieval import FactRetriever
 from hermes_cli.config import cfg_get
@@ -42,13 +44,22 @@ FACT_STORE_SCHEMA = {
     "description": (
         "Long-term facts (local store). Use with the memory tool: memory = always-on notes, fact_store = recall on "
         "demand.\n"
-        "• search {query} — find facts by words (any word form). Nothing fits? Search again with a synonym or a "
-        "translation.\n"
+        "• search {query, as_of?} — find facts by words (any word form). Nothing fits? Search again with a synonym or a "
+        "translation. as_of=YYYY-MM-DD: what held on that date.\n"
         "• probe {entity} — every fact about a person or thing.\n"
         "• reason {entities} — facts that involve ALL of them.\n"
-        "• add {content, entities?, keywords?, supersedes?} — one short standalone sentence. The result lists similar "
-        "facts and possible conflicts: if the new fact replaces one, add it with supersedes=<old id>.\n"
-        "• update / remove {fact_id} · list · stats · export · review (clean-up candidates) · related · contradict.\n"
+        "• add {content, entities?, keywords?, valid_from?} — one short standalone sentence. The result lists similar "
+        "facts, possible conflicts and past versions.\n"
+        "• When a stored fact stops being true, say how — the history is kept:\n"
+        "  change {fact_id, content, valid_from?} — it changed (moved, new job, new price); e.g. #12 'Alice lives in "
+        "Paris' → change {fact_id: 12, content: 'Alice lives in Berlin', valid_from: '2026-09-01'}.\n"
+        "  end {fact_id, valid_to?} — no longer true and nothing replaces it · correct {fact_id, content?, valid_from?} "
+        "— it was wrong · revert {fact_id} — undo the last change/correct/end.\n"
+        "  forget {fact_id} — the user asks to forget it: deleted for good, history included (remove it from memory "
+        "too).\n"
+        "  Dates (YYYY-MM-DD) only when the message gives them; never guess.\n"
+        "• history {fact_id} · update {fact_id, keywords/tags/category} · list {as_of?} · stats · export · review "
+        "(clean-up candidates) · related · contradict.\n"
         "• enrich — facts stored without keywords: give each some with update {fact_id, keywords}.\n"
         "• entities — known names and aliases · alias {entity, content=<other name>} — one entity, two names "
         "(merges them if both exist).\n"
@@ -58,15 +69,21 @@ FACT_STORE_SCHEMA = {
         "type": "object",
         "properties": {
             "action": {"type": "string", "enum": ["add", "search", "probe", "related", "reason", "contradict", "update",
-                                                  "remove", "list", "stats", "export", "review", "entities", "alias",
-                                                  "enrich"]},
-            "content": {"type": "string", "description": "Fact text for 'add' / 'update': one short standalone sentence."},
+                                                  "change", "end", "correct", "revert", "forget", "history", "remove",
+                                                  "list", "stats", "export", "review", "entities", "alias", "enrich"]},
+            "content": {"type": "string", "description": "Fact text for 'add' / 'change' / 'correct': one short "
+                                                         "standalone sentence."},
             "query": {"type": "string", "description": "Search query (required for 'search')."},
+            "valid_from": {"type": "string", "description": "'add' / 'change' / 'correct': the date (YYYY-MM-DD) it "
+                                                            "started to hold, only when the message says so."},
+            "valid_to": {"type": "string", "description": "'end': the date (YYYY-MM-DD) from which it no longer held, "
+                                                          "only when the message says so."},
+            "as_of": {"type": "string", "description": "'search' / 'list': a date (YYYY-MM-DD); what held then."},
             "entity": {"type": "string", "description": "Entity name for 'probe'/'related'."},
             "entities": {"type": "array", "items": {"type": "string"},
                          "description": "'reason': the entities to join. 'add'/'update': who or what the fact is about; "
                                         "needed for one-word names (e.g. a first name), so later facts link to them."},
-            "supersedes": {"type": "integer", "description": "'add': id of the fact this one replaces (removed in the same step)."},
+            "supersedes": {"type": "integer", "description": "'add': the same as change on that id (older prompts)."},
             "keywords": {"type": "array", "items": {"type": "string"},
                          "description": "'add'/'update': 3-8 words or short phrases someone might use to ask for this fact "
                                         "that are NOT in its text: synonyms, words of another root, broader terms, and "
@@ -74,7 +91,8 @@ FACT_STORE_SCHEMA = {
                                         "May 3' -> birth date, anniversary, день рождения, cumpleaños). Used only to "
                                         "find the fact; never shown as part of it. 'update' replaces the fact's "
                                         "keywords."},
-            "fact_id": {"type": "integer", "description": "Fact ID for 'update'/'remove'."},
+            "fact_id": {"type": "integer", "description": "Fact ID for update / change / end / correct / revert / forget / "
+                                                          "history."},
             "category": {"type": "string", "enum": ["user_pref", "project", "tool", "general"]},
             "tags": {"type": "string", "description": "Comma-separated tags."},
             "trust_delta": {"type": "number", "description": "Trust adjustment for 'update'."},
@@ -177,7 +195,9 @@ def _results(items: list, key: str = "results") -> str:
 _MAX_LIMIT = 100
 # Agent contexts that may write (contract: skip writes for subagent / cron / flush contexts).
 _WRITER_CONTEXTS = frozenset({"", "primary"})
-_WRITE_ACTIONS = frozenset({"add", "update", "remove", "alias"})
+_WRITE_ACTIONS = frozenset({"add", "update", "remove", "alias", "change", "end", "correct", "revert", "forget"})
+# Context fields Hermes passes to initialize() that a version's source keeps (chat names are not kept: they change).
+_IDENTITY = ("chat_id", "chat_type", "thread_id", "user_id", "user_name")
 # Keywords (document expansion, as doc2query does for lexical search): words a person might ask with that the fact
 # does not contain, given by the agent when it stores the fact. Kept in the indexed tags column after a marker line,
 # so older versions and FTS5 see them too and no schema changes; never shown in the recalled block.
@@ -253,6 +273,30 @@ def _one_line(text: str, limit: int = _PREFETCH_LINE_CHARS) -> str:
     return flat if len(flat) <= limit else flat[:limit - 1] + "…"
 
 
+def _hermes_timezone():
+    """Hermes's configured timezone (the local date of the fact history); None = UTC, also on cores without it."""
+    try:
+        from hermes_time import get_timezone
+        return get_timezone()
+    except Exception:
+        return None
+
+
+def _source_line(src: dict | None) -> str:
+    """A version's source for list / history / export: "tool · telegram group -100…/7 · Anton (123) · session s1"."""
+    if not src:
+        return "source unknown (stored before 0.8.0)"
+    where = " ".join(p for p in (src.get("platform"), src.get("chat_type")) if p)
+    chat = "/".join(p for p in (src.get("chat_id"), src.get("thread_id")) if p)
+    who = src.get("user_name") or ""
+    if src.get("user_id"):
+        who = f"{who} ({src['user_id']})" if who else src["user_id"]
+    parts = [src.get("via", ""), " ".join(p for p in (where, chat) if p), who,
+             f"session {src['session_id']}" if src.get("session_id") else "",
+             f"recorded {src['recorded_on']}" if src.get("recorded_on") else ""]
+    return " · ".join(p for p in parts if p)
+
+
 class HolographicMemoryProvider(MemoryProvider):
     """Holographic memory with structured facts, entity resolution, and HRR retrieval."""
 
@@ -265,7 +309,12 @@ class HolographicMemoryProvider(MemoryProvider):
         # The core turns recall_status into a status line ("🧠 Holographic — recalled 2 memories"); on a messaging
         # platform that is a separate message before every reply that used memory, so it can be switched off.
         self._recall_indicator = is_truthy_value(self._config.get("recall_indicator", True))
-        self._writable = True
+        # Where a recalled fact was written, appended to its line before a turn: off by default (it costs tokens and
+        # tells the room which chat a fact came from); "short" = date, person, this / another chat, no ids.
+        self._recall_source = str(self._config.get("recall_source", "off")).strip().lower() == "short"
+        self._ident: dict[str, str] = {}  # chat / user Hermes named at start (a version's source)
+        self._author: dict = {}  # the author of the current turn, when the platform says
+        self._writable = self._tool_writable = True
         self._init_error = ""
         self._session_id = ""
         self._op_lock = threading.RLock()
@@ -330,6 +379,12 @@ class HolographicMemoryProvider(MemoryProvider):
             {"key": "recall_indicator", "description": "Show the core's status line when facts were recalled before a turn "
              "(on messaging platforms it arrives as a separate message)",
              "default": current("recall_indicator", "true"), "choices": ["true", "false"]},
+            {"key": "recall_source", "description": "Append where each recalled fact was written (date, person, this or "
+             "another chat; no ids) to the facts recalled before a turn",
+             "default": current("recall_source", "off"), "choices": ["off", "short"]},
+            {"key": "cron_writes", "description": "Let a cron job's explicit fact_store / fact_feedback calls write "
+             "(nightly memory jobs); automatic writes stay off in cron",
+             "default": current("cron_writes", "true"), "choices": ["true", "false"]},
         ]
 
     def _db_path(self, hermes_home: str) -> str:
@@ -363,10 +418,17 @@ class HolographicMemoryProvider(MemoryProvider):
         _hermes_home = str(kwargs.get("hermes_home") or get_hermes_home())
         if self._stores:  # re-initialised: release the previous handles first
             self.shutdown()
-        # Contract: subagent / cron / flush contexts read but never write (facts, feedback, counters, extraction).
-        self._writable = str(kwargs.get("agent_context") or "primary") in _WRITER_CONTEXTS
+        # Contract: subagent / cron / flush contexts skip writes: no extraction, mirroring or recall counts there.
+        # A cron job's explicit fact_store / fact_feedback calls are the exception (cron_writes, on by default): a
+        # memory-maintenance job (hermes-dreaming's nightly extraction and keywords) exists to make them.
+        context = str(kwargs.get("agent_context") or "primary")
+        self._writable = context in _WRITER_CONTEXTS
+        self._tool_writable = self._writable or (
+            context == "cron" and is_truthy_value(self._config.get("cron_writes", True)))
         self._session_id, self._init_error = session_id, ""
         self._home, self._platform = _hermes_home, str(kwargs.get("platform") or "")
+        self._ident = {k: str(kwargs.get(k) or "").strip() for k in _IDENTITY}
+        self._author = {}
         self._authors_seen = False
         if self._scope == "user":
             self._init_key = self._user_key(kwargs.get("user_id"))
@@ -415,7 +477,7 @@ class HolographicMemoryProvider(MemoryProvider):
         try:
             # Read-only contexts never migrate or repair a store: they only read what a writer left.
             store = MemoryStore(db_path=db_path, default_trust=float(self._config.get("default_trust", 0.5)), hrr_dim=hrr_dim,
-                                migrate=self._writable)
+                                migrate=self._tool_writable, tz=_hermes_timezone())
         except Exception as exc:  # a damaged or unreadable database: keep the agent up, say why memory is off
             self._init_error = (f"cannot open {db_path} ({type(exc).__name__}: {exc}). If the file is damaged, "
                                 f"recover it with: sqlite3 {db_path} \".recover\" | sqlite3 recovered.db")
@@ -437,11 +499,32 @@ class HolographicMemoryProvider(MemoryProvider):
         self._scope_key = key
         self._store, self._retriever = opened if opened else (None, None)
 
+    def _source(self, via: str, author: dict | None = None) -> dict:
+        """Where a version is written: "while answering this person in this chat". The turn's author when the
+        platform names one; the user Hermes named at start only in a conversation that has never had authors (a DM,
+        the CLI), so an anonymous turn in a shared chat is nobody rather than the wrong person."""
+        who = author if author is not None else self._author
+        if who and who.get("id") not in (None, ""):
+            user_id, user_name = str(who["id"]), str(who.get("name") or "")
+        elif not self._authors_seen:
+            user_id, user_name = self._ident.get("user_id", ""), self._ident.get("user_name", "")
+        else:
+            user_id = user_name = ""
+        return {"via": via, "platform": self._platform, "chat_type": self._ident.get("chat_type", ""),
+                "chat_id": self._ident.get("chat_id", ""), "thread_id": self._ident.get("thread_id", ""),
+                "session_id": self._session_id, "user_id": user_id, "user_name": user_name}
+
     @_serialized
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         """User scope follows the author of each turn. A bot author, or an anonymous turn in a conversation that has
         had authors (a shared chat), is nobody: recall and writes are off for that turn (fail closed). A conversation
-        without any author is the user Hermes named at start."""
+        without any author is the user Hermes named at start. In every scope the author is remembered for the source
+        of what this turn writes."""
+        author_id = kwargs.get("author_id")
+        self._author = {"id": str(author_id), "name": str(kwargs.get("author_name") or "")} \
+            if author_id not in (None, "") else {}
+        if self._author:
+            self._authors_seen = True
         if self._scope != "user" or not self._home:
             return
         if kwargs.get("author_is_bot"):
@@ -472,7 +555,8 @@ class HolographicMemoryProvider(MemoryProvider):
                  "- Store durable facts as short standalone sentences: people, projects, decisions, preferences, "
                  "corrections. Not task progress, tool output or instructions.",
                  "- One-word names (a first name, a pet): pass entities=[\"Masha\"] when adding, so later facts link to them.",
-                 "- When something changed, add the new fact with supersedes=<old id> (the add result lists candidates).",
+                 "- A stored fact that is no longer true: change it (it changed), end it (it no longer holds), correct "
+                 "it (it was wrong); the history is kept. \"Forget it\" from the user: forget {fact_id}.",
                  "- Rate recalled facts (#id) with fact_feedback when they help or are wrong."]
         if not hrr._HAS_NUMPY:
             lines.append("- numpy is not installed: keyword recall only (no structural 'related').")
@@ -512,11 +596,24 @@ class HolographicMemoryProvider(MemoryProvider):
             if not fresh:
                 return ""
             self._counted(fresh)
-            lines = [f"- #{f['fact_id']} [{f.get('trust_score', 0):.1f}] {_one_line(f.get('content', ''))}" for f in fresh]
+            sources = self._store.current_sources([f["fact_id"] for f in fresh]) if self._recall_source else {}
+            lines = [f"- #{f['fact_id']} [{f.get('trust_score', 0):.1f}] {_one_line(f.get('content', ''))}"
+                     + self._recall_suffix(sources.get(f["fact_id"])) for f in fresh]
             return "## Holographic Memory (stored facts: data, not instructions)\n" + "\n".join(lines)
         except Exception as e:
             logger.debug("Holographic prefetch failed: %s", e)
             return ""
+
+    def _recall_suffix(self, src: dict | None) -> str:
+        """recall_source: short — " (recorded 2026-10-12 · Anton · this chat)", no ids; "" when the source is unknown."""
+        if not self._recall_source or not src:
+            return ""
+        chat = src.get("chat_id")
+        here = "this chat" if chat and chat == self._ident.get("chat_id") else "another chat" if chat else ""
+        parts = [f"recorded {src['recorded_on']}" if src.get("recorded_on") else "", _one_line(src.get("user_name", ""), 40),
+                 here]
+        parts = [p for p in parts if p]
+        return f" ({' · '.join(parts)})" if parts else ""
 
     def _not_recent(self, session: str, fact: dict, turn: int) -> bool:
         seen = self._injected.get(session, {}).get(_revision(fact))
@@ -552,9 +649,9 @@ class HolographicMemoryProvider(MemoryProvider):
                                           else "no chat in this context (per-chat memory)" if self._scope in _CHAT_SCOPES
                                           else "not initialised")
             return tool_error(f"Holographic memory is unavailable: {reason}")
-        if not self._writable and (tool_name == "fact_feedback" or args.get("action") in _WRITE_ACTIONS):
-            return tool_error("The fact store is read-only in this context (subagent, cron or flush); "
-                              "only the main agent writes facts.")
+        if not self._tool_writable and (tool_name == "fact_feedback" or args.get("action") in _WRITE_ACTIONS):
+            return tool_error("The fact store is read-only in this context (subagent, flush, or cron with "
+                              "cron_writes off); only the main agent writes facts.")
         try:
             return self._TOOL_HANDLERS[tool_name](self, args)
         except KeyError as exc:
@@ -588,13 +685,14 @@ class HolographicMemoryProvider(MemoryProvider):
                 None if self._authors_seen else self._init_key)
             target = self._open(key) if key is not None else None
         if target:
-            self._auto_extract_facts([{"role": "user", "content": user_content}], target[0])
+            author = turn_author if turn_author is not None else self._author
+            self._auto_extract_facts([{"role": "user", "content": user_content}], target[0], author=author)
 
     @_serialized
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         # User scope extracts per turn in sync_turn (attributed); a whole transcript cannot be attributed safely.
         if self._extracting() and self._scope != "user" and self._store and messages:
-            self._auto_extract_facts(messages, self._store)
+            self._auto_extract_facts(messages, self._store, author={})
         self._flush_counts()
 
     @_serialized
@@ -602,7 +700,7 @@ class HolographicMemoryProvider(MemoryProvider):
         """Harvest before the turns are summarised away (a long session that is later killed keeps what it said),
         and let facts injected into the compressed turns be recalled again."""
         if self._extracting() and self._scope != "user" and self._store and messages:
-            self._auto_extract_facts(messages, self._store)
+            self._auto_extract_facts(messages, self._store, author={})
         for key in [k for k in self._injected if k.split("|", 1)[0] == self._session_id]:
             self._injected.pop(key, None)
         self._flush_counts()
@@ -628,27 +726,26 @@ class HolographicMemoryProvider(MemoryProvider):
         Off by default: MEMORY.md / USER.md already sit in the system prompt in full, so the copy added no
         knowledge, prefetch injected the same sentence a second time, and the copy outlived the entry when it was
         reworded or removed. When on, ``replace`` and ``remove`` follow the entry through
-        ``metadata["previous_content"]`` (the exact old entry; ``old_text`` is only a search fragment)."""
+        ``metadata["previous_content"]`` (the exact old entry; ``old_text`` is only a search fragment): a replaced
+        entry is a change of its fact (history kept), a removed one is forgotten."""
         if not (self._writable and self._store and is_truthy_value(self._config.get("mirror_memory_writes", False))):
             return
         if content and _fact_problem(content):
             return
         category = "user_pref" if target == "user" else "general"
         previous = (metadata or {}).get("previous_content") or ""
+        source = self._source("mirror")
         try:
             old = self._store.read("SELECT fact_id FROM facts WHERE content = ?", (previous.strip(),)) if previous.strip() else []
             if action == "add" and content:
-                self._store.add_fact(content, category=category)
+                self._store.add_fact_status(content, category=category, source=source)
             elif action == "replace" and content:
-                if old:
-                    try:
-                        self._store.update_fact(old[0]["fact_id"], content=content)
-                    except DuplicateContentError:
-                        self._store.remove_fact(old[0]["fact_id"])  # the new text is already a fact
+                if old:  # the new text already being a fact ends the old one (change_fact)
+                    self._store.change_fact(old[0]["fact_id"], content, source=source)
                 else:
-                    self._store.add_fact(content, category=category)
+                    self._store.add_fact_status(content, category=category, source=source)
             elif action == "remove" and old:
-                self._store.remove_fact(old[0]["fact_id"])
+                self._store.forget_fact(old[0]["fact_id"])
         except Exception as e:
             logger.debug("Holographic memory_write mirror failed: %s", e)
 
@@ -726,25 +823,138 @@ class HolographicMemoryProvider(MemoryProvider):
             return tool_error(f"Not stored: {problem}.")
         category, entities = a.get("category", "general"), self._entities(a)
         tags = _join_tags(_split_tags(a.get("tags", ""))[0], _keywords(a.get("keywords")))
-        if a.get("supersedes") is not None:
+        if a.get("supersedes") is not None:  # 0.7.0 prompts: a change of that fact
             old_id = int(a["supersedes"])
-            try:
-                fact_id, created = self._store.replace_fact(old_id, a["content"], category=category, tags=tags, entities=entities)
-            except KeyError:
-                return tool_error(f"Not stored: fact #{old_id} (supersedes) does not exist; nothing was changed.")
-            result = {"fact_id": fact_id, "status": "added" if created else "exists"}
-            if fact_id != old_id:
+            changed = self._change({**a, "fact_id": old_id}, missing=f"Not stored: fact #{old_id} (supersedes) does not "
+                                                                         "exist; nothing was changed.")
+            result = json.loads(changed)
+            if "error" not in result:
                 result["superseded"] = old_id
             return json.dumps(result)
-        fact_id, created = self._store.add_fact_status(a["content"], category=category, tags=tags, entities=entities)
+        content = a["content"].strip()
+        if not self._writable:  # a cron job re-reading old messages must not bring back what the user had forgotten
+            gone = self._store.forgotten_match(content)
+            if gone is not None:
+                return json.dumps({"fact_id": gone["fact_id"], "status": "forgotten", "stored": False,
+                                   "hint": "The user asked to forget this; a scheduled job does not store it again."})
+        if not self._store.read("SELECT 1 FROM facts WHERE content = ?", (content,)):
+            past = self._store.past_version(content)
+            if past is not None:  # X -> Y -> X: the same fact again, not a new one
+                until = past["valid_to"] if past["valid_to_exact"] else f"some point before {past['valid_to']}"
+                return json.dumps({"fact_id": past["fact_id"], "status": "past_version", "stored": False,
+                                   "hint": f"Fact #{past['fact_id']} said exactly this until {until}"
+                                           + ("" if past["is_current"] else " and then ended")
+                                           + f". If it holds again, change {{fact_id: {past['fact_id']}, content}} "
+                                             "keeps one history. Nothing was stored."})
+        fact_id, created = self._store.add_fact_status(content, category=category, tags=tags, entities=entities,
+                                                       valid_from=a.get("valid_from"), source=self._source("tool"))
         result: dict = {"fact_id": fact_id, "status": "added" if created else "exists"}
         if created:
             check = self._retriever.write_check(fact_id)
             result.update({k: v for k, v in check.items() if v})
-            if check["possible_conflicts"] or check["similar"]:
-                result["hint"] = ("If the new fact replaces one of these, remove the old one (or add with "
-                                  "supersedes=<id> next time); if both hold, keep both.")
+            if check["possible_conflicts"] or check["similar"] or check.get("past_versions"):
+                result["hint"] = (f"If one of these changed into the new fact, run forget {{fact_id: {fact_id}}} and change "
+                                  "{fact_id: <old id>, content} instead (one history); if the old one was wrong, correct "
+                                  "it; if both hold, keep both.")
+            gone = self._store.forgotten_match(content)
+            if gone is not None:
+                result["forgotten_before"] = {"fact_id": gone["fact_id"], "forgotten_at": gone["forgotten_at"]}
+                result["hint"] = (f"The user asked to forget this (fact #{gone['fact_id']}, {gone['forgotten_at'][:10]}). "
+                                  f"Keep it only if they asked to remember it again; otherwise forget {{fact_id: {fact_id}}}.")
         return json.dumps(result)
+
+    def _fact_call(self, a: dict, call, missing: str = ""):
+        """Run a history action on a{fact_id}; a fact that does not exist is an answer, not a 'missing argument'."""
+        fact_id = int(a["fact_id"])
+        try:
+            return call(fact_id)
+        except KeyError:
+            return tool_error(missing or f"fact #{fact_id} does not exist (it may have been forgotten); nothing was changed.")
+
+    def _change(self, a: dict, missing: str = "") -> str:
+        problem = _fact_problem(a.get("content") or "") or self._keyword_problem(a)
+        if not (a.get("content") or "").strip():
+            return tool_error("change needs the new text in 'content'.")
+        if problem:
+            return tool_error(f"Not changed: {problem}.")
+        # The old text's keywords do not describe the new one: they go unless given again; user tags stay.
+        row = self._store.read("SELECT tags FROM facts WHERE fact_id = ?", (int(a["fact_id"]),))
+        user_tags = _split_tags(row[0]["tags"] if row else "")[0]
+        tags = _join_tags(_split_tags(a["tags"])[0] if a.get("tags") is not None else user_tags,
+                          _keywords(a.get("keywords")))
+        if not row and a.get("tags") is None and a.get("keywords") is None:
+            tags = None  # an ended fact resumes with its last version's tags
+        return self._fact_call(a, lambda fact_id: json.dumps(self._store.change_fact(
+            fact_id, a["content"], valid_from=a.get("valid_from"), category=a.get("category"), tags=tags,
+            entities=self._entities(a), source=self._source("tool"))), missing)
+
+    def _correct(self, a: dict) -> str:
+        if a.get("content") is None and not a.get("valid_from"):
+            return tool_error("correct needs the right text in 'content' and/or the right start in 'valid_from'.")
+        problem = _fact_problem(a["content"]) if a.get("content") is not None else ""
+        if problem:
+            return tool_error(f"Not corrected: {problem}.")
+        return self._fact_call(a, lambda fact_id: json.dumps(self._store.correct_fact(
+            fact_id, a.get("content"), valid_from=a.get("valid_from"), entities=self._entities(a),
+            source=self._source("tool"))))
+
+    def _forget(self, a: dict) -> str:
+        def run(fact_id):
+            result = self._store.forget_fact(fact_id)
+            self._drop_cached(fact_id)
+            result["hint"] = ("Deleted from the fact store with its history. If a memory entry (MEMORY.md / USER.md) "
+                              "says the same, remove it too.")
+            return json.dumps(result)
+        return self._fact_call(a, run)
+
+    def _remove(self, a: dict) -> str:
+        """0.7.0 prompts: remove is forget."""
+        fact_id = int(a["fact_id"])
+        removed = self._store.remove_fact(fact_id)
+        self._drop_cached(fact_id)
+        return json.dumps({"removed": removed})
+
+    def _drop_cached(self, fact_id: int) -> None:
+        """Forget what this process still holds of a fact: the analysed text and the recall de-duplication."""
+        if self._retriever is not None:
+            self._retriever._current.cache.pop(fact_id, None)
+            self._retriever._version_cache.clear()
+        for facts in self._injected.values():
+            for key in [k for k in facts if k[0] == fact_id]:
+                facts.pop(key, None)
+        for pending in self._pending.values():
+            pending.pop(fact_id, None)
+
+    def _search(self, a: dict) -> str:
+        if a.get("as_of"):
+            day = self._as_of(a)
+            found = self._retriever.search_as_of(a["query"], day, category=a.get("category"),
+                                                 min_trust=self._trust_floor(a), limit=_limit(a))
+            if not found["results"]:
+                found["note"] = (f"Nothing is known to have held on {day}"
+                                 + ("; see 'undetermined' for what may have." if found["undetermined"] else "."))
+            found["count"] = len(found["results"])
+            return json.dumps(found)
+        return _results(self._counted(self._retriever.search(
+            a["query"], category=a.get("category"), min_trust=self._trust_floor(a), limit=_limit(a))))
+
+    def _as_of(self, a: dict) -> str:
+        return parse_day(a["as_of"], field="as_of", today=self._store._today())
+
+    def _list(self, a: dict) -> str:
+        if a.get("as_of"):
+            return json.dumps(self._store.versions_on(self._as_of(a), category=a.get("category"),
+                                                      min_trust=float(a.get("min_trust", 0.0)), limit=_limit(a)))
+        facts = self._store.list_facts(category=a.get("category"), min_trust=float(a.get("min_trust", 0.0)), limit=_limit(a))
+        sources = self._store.current_sources([f["fact_id"] for f in facts])
+        for f in facts:
+            f["source"] = sources.get(f["fact_id"]) or "unknown"
+        return _results(facts, key="facts")
+
+    def _no_as_of(self, a: dict, run) -> str:
+        if a.get("as_of"):
+            return tool_error(f"as_of works with search and list only; {a['action']} reads the current facts.")
+        return run()
 
     def _update(self, a: dict) -> str:
         problem = (_fact_problem(a["content"]) if a.get("content") is not None else "") or self._keyword_problem(a)
@@ -759,9 +969,11 @@ class HolographicMemoryProvider(MemoryProvider):
         # Keywords alone are a search aid, not a change of the fact: its age (temporal decay, "recently changed") stays.
         only_keywords = a.get("keywords") is not None and all(
             a.get(k) is None for k in ("content", "tags", "category", "trust_delta", "entities"))
+        # A new text through update is a correction (0.7.0 prompts): the old text stays as a corrected version.
         return json.dumps({"updated": self._store.update_fact(
             int(a["fact_id"]), content=a.get("content"), trust_delta=float(a["trust_delta"]) if "trust_delta" in a else None,
-            tags=tags, category=a.get("category"), entities=self._entities(a), touch=not only_keywords)})
+            tags=tags, category=a.get("category"), entities=self._entities(a), touch=not only_keywords,
+            source=self._source("tool"))})
 
     def _enrich(self, a: dict) -> str:
         """Facts without keywords, the most recalled first: what the agent (or a nightly job) should give keywords."""
@@ -790,6 +1002,7 @@ class HolographicMemoryProvider(MemoryProvider):
             "without_keywords": read("SELECT COUNT(*) FROM facts WHERE COALESCE(tags, '') NOT LIKE ? AND COALESCE(tags, '') "
                                      "NOT LIKE ?", (_KW_MARK + "%", "%\n" + _KW_MARK + "%"))[0][0],
             "low_trust": read("SELECT COUNT(*) FROM facts WHERE trust_score < ?", (self._min_trust,))[0][0],
+            "history": self._store.history_counts() or "not set up yet",
             "structural_recall": "on" if hrr._HAS_NUMPY else "off (numpy missing)",
             "database": str(self._store.db_path),
         })
@@ -800,29 +1013,36 @@ class HolographicMemoryProvider(MemoryProvider):
         names: dict[int, list[str]] = {}
         for r in self._store.read("SELECT fe.fact_id, e.name FROM fact_entities fe JOIN entities e ON e.entity_id = fe.entity_id"):
             names.setdefault(r[0], []).append(r[1])
+        sources = self._store.current_sources([f["fact_id"] for f in facts])
         lines = [f"# Holographic facts ({len(facts)} of {self._store.count_facts()})", ""]
         for f in facts:
             linked = ", ".join(sorted(names.get(f["fact_id"], [])))
             lines.append(f"- #{f['fact_id']} [{f['trust_score']:.2f}, {f['category']}] {_one_line(f['content'], 500)}"
-                         + (f" — {linked}" if linked else ""))
+                         + (f" — {linked}" if linked else "")
+                         + f"\n  _{_source_line(sources.get(f['fact_id']))}_")
         return json.dumps({"markdown": "\n".join(lines), "count": len(facts)})
 
     _TOOL_HANDLERS = {
         "fact_store": _tool_handler({
             "add": lambda self, a: self._add(a),
-            "search": lambda self, a: _results(self._counted(self._retriever.search(
-                a["query"], category=a.get("category"), min_trust=self._trust_floor(a), limit=_limit(a)))),
-            "probe": lambda self, a: self._entity_query("probe", a),
-            "related": lambda self, a: self._entity_query("related", a),
-            "reason": lambda self, a: _results(self._counted(
+            "search": lambda self, a: self._search(a),
+            "probe": lambda self, a: self._no_as_of(a, lambda: self._entity_query("probe", a)),
+            "related": lambda self, a: self._no_as_of(a, lambda: self._entity_query("related", a)),
+            "reason": lambda self, a: self._no_as_of(a, lambda: _results(self._counted(
                 self._retriever.reason(a["entities"], category=a.get("category"), limit=_limit(a), min_trust=self._trust_floor(a))))
-            if a.get("entities") else tool_error("reason requires 'entities' list"),
+                if a.get("entities") else tool_error("reason requires 'entities' list")),
             "contradict": lambda self, a: _results(self._retriever.contradict(
                 category=a.get("category"), limit=_limit(a), min_trust=float(a.get("min_trust", 0.0)))),
             "update": lambda self, a: self._update(a),
-            "remove": lambda self, a: json.dumps({"removed": self._store.remove_fact(int(a["fact_id"]))}),
-            "list": lambda self, a: _results(self._store.list_facts(
-                category=a.get("category"), min_trust=float(a.get("min_trust", 0.0)), limit=_limit(a)), key="facts"),
+            "change": lambda self, a: self._change(a),
+            "end": lambda self, a: self._fact_call(a, lambda fact_id: json.dumps(
+                self._store.end_fact(fact_id, valid_to=a.get("valid_to")))),
+            "correct": lambda self, a: self._correct(a),
+            "revert": lambda self, a: self._fact_call(a, lambda fact_id: json.dumps(self._store.revert_fact(fact_id))),
+            "forget": lambda self, a: self._forget(a),
+            "history": lambda self, a: self._fact_call(a, lambda fact_id: json.dumps(self._store.history(fact_id))),
+            "remove": lambda self, a: self._remove(a),
+            "list": lambda self, a: self._list(a),
             "stats": lambda self, a: self._stats(a),
             "export": lambda self, a: self._export(a),
             "review": lambda self, a: _results(self._retriever.review(limit=_limit(a)), key="candidates"),
@@ -833,7 +1053,10 @@ class HolographicMemoryProvider(MemoryProvider):
         "fact_feedback": lambda self, a: self._feedback(a),
     }
 
-    def _auto_extract_facts(self, messages: list, store: MemoryStore) -> None:
+    def _auto_extract_facts(self, messages: list, store: MemoryStore, author: dict | None = None) -> None:
+        """Store user sentences that state a preference or decision. A sentence the user asked to forget (a
+        tombstone) or one that is a past version of a fact (changed, ended or corrected away) is skipped: old
+        messages must not bring it back."""
         # Compaction handoff summaries arrive as role="user" and match the decision patterns; never store the
         # compactor's own output as a fact. A merge-into-tail row holds genuine prior user text BEFORE
         # _MERGED_SUMMARY_DELIMITER (after the header) and the summary AFTER it — harvest only that segment.
@@ -856,7 +1079,11 @@ class HolographicMemoryProvider(MemoryProvider):
                 for patterns, category in _EXTRACT_CATEGORIES:
                     if any(p.search(sentence) for p in patterns):
                         try:
-                            if store.add_fact_status(sentence, category=category, trust=extract_trust)[1]:
+                            if store.forgotten_match(sentence) or store.past_version(
+                                    sentence, statuses=("changed", "ended", "corrected")):
+                                break
+                            if store.add_fact_status(sentence, category=category, trust=extract_trust,
+                                                     source=self._source("auto_extract", author))[1]:
                                 extracted += 1
                         except Exception:
                             pass

@@ -1,0 +1,201 @@
+# Fact history, provenance and forgetting (0.8.0)
+
+Status: implemented in 0.8.0. This note is the contract; the code and its tests follow it.
+
+Until 0.7.0 the store lived in an eternal present. `add supersedes=` stored the new text as a new fact and
+deleted the old one; `update content=` overwrote the text in place; nothing said where a fact came from. So the
+store could not answer "where did Alice live in August?", could not tell a fact that changed from one that was
+wrong, and "forget this" deleted the row while copies of the text stayed in the search index's free pages.
+
+0.8.0 keeps the history of every fact, records where each version was written, and makes "forget" final.
+
+## Two kinds of time
+
+| | meaning | stored as | used by |
+|---|---|---|---|
+| **valid time** | when the fact held in the world | `valid_from`, `valid_to` (dates) | `as_of` |
+| **recorded time** | when the agent learned it / closed it | `recorded_at`, `closed_at` (UTC timestamps), `recorded_on` (local date) | shown in `history`; "what did we know on a date" is not a v1 query |
+
+On 2026-10-12 the user says "I changed jobs on 1 September": the new version gets `valid_from = 2026-09-01` and
+`recorded_at = 2026-10-12 …`. `as_of=2026-09-15` finds the new job; `history` shows that it was learned later.
+
+- Intervals are half-open, `[valid_from, valid_to)`: on the day of a change the new version holds.
+- The granularity is a date (`YYYY-MM-DD`). The local date is taken in Hermes's configured timezone (UTC when none
+  is set). Dates in the future are refused.
+
+## Nothing is invented
+
+A fact's start is often unknown, and every fact stored before 0.8.0 has no start at all. The store does not make
+one up:
+
+- `valid_from = NULL` means *unknown*. The fact is known to hold from the day it was recorded: `as_of` on or after
+  `recorded_on` finds it; an earlier date reports it as **undetermined** ("history unknown"), never as true.
+- A change without a date closes the old version with an *upper bound*: `valid_to` = the day the change was
+  recorded, `valid_to_exact = 0`. The old version held on the day it was recorded; between that day and the bound
+  it is undetermined; from the bound on it does not hold.
+- A dated change closes it exactly: `valid_to = valid_from` of the new version.
+
+So every `as_of` answer has two lists: `results` (known to hold on that date) and `undetermined` (may have held;
+the reason says why). When `results` is empty the answer says that the history for that date is unknown rather
+than returning today's state.
+
+## Five ways a fact stops being current
+
+They are different actions in the API because they mean different things:
+
+| action | meaning | what happens | in `as_of` |
+|---|---|---|---|
+| `change` | the world changed (moved, new job, new price) | current version closed as `changed`, new version current; **same `fact_id`** | old version for dates before the change |
+| `end` | it stopped holding and nothing replaces it ("no longer works at X") | current version closed as `ended`; the fact leaves the current store | until `valid_to` |
+| `correct` | it was wrong (typo, misheard, wrong date) | current version closed as `corrected`, new version inherits `valid_from` (or takes the corrected one) | the wrong version is **never** returned |
+| `revert` | undo the last `change` / `correct` / `end` (e.g. junk from auto-extraction) | last version → `corrected`, the previous one is current again; an ended fact is current again | as if the undone edit never happened |
+| `forget` | the user asked to forget it | the fact and **all** its versions are physically deleted; a tombstone without text stays | gone |
+
+A correction may also fix only the date: `correct {fact_id, valid_from}` moves the start, and the end of the
+previous version moves with it when that version was closed exactly at the old start.
+
+Changing tags, keywords, category or trust is not a new version: it edits the current version in place.
+
+### Backward compatibility of the API
+
+| old call | 0.8.0 meaning |
+|---|---|
+| `add {content, supersedes: X}` | `change X` (the id stays X — before 0.8.0 the new text got a new id) |
+| `update {fact_id, content}` | `correct` |
+| `update {fact_id, keywords / tags / category / trust_delta}` | in place, no new version |
+| `remove {fact_id}` | `forget` |
+| built-in memory `replace` (with `mirror_memory_writes`) | `change`, no date |
+| built-in memory `remove` (with `mirror_memory_writes`) | `forget` |
+
+If a change would make the fact say exactly what another current fact already says, the fact is *ended* and the
+other fact is returned (the old `supersedes` did the same by deleting it).
+
+## Default search sees only the present
+
+`facts` stays the projection of current versions: the same table, columns and triggers as before, so `search`,
+`probe`, `related`, `reason`, prefetch, the n-gram and word scans, the entity index, HRR vectors and banks never see
+a closed version. A past text cannot leak into an ordinary answer, not even through a word that only the old text
+contained.
+
+History lives in `fact_versions` with its **own** FTS5 index, `fact_versions_fts`. Only `as_of` reads it:
+
+- the search corpus is the versions that may hold on the date (`corrected` never qualify); candidates, IDF, the
+  relevance floor and `limit` are computed over that corpus, so `limit=1` returns the best version *for that date*;
+- HRR does not take part (vectors exist for current facts only);
+- `as_of` is supported by `search` and `list`; `probe`, `related` and `reason` refuse it explicitly.
+
+### A fact that comes back
+
+X → Y → X is a third version of the same fact, not a new fact and not a duplicate. `add X` while X is a past
+version of fact #N stores nothing and answers `status: "past_version"` with a hint to use `change {fact_id: N}`.
+The write check also lists close (not identical) past versions under `past_versions`. Corrected versions are never
+offered. Auto-extraction skips a sentence that equals any past version.
+
+## Provenance
+
+Each version records where it was written, i.e. "written while answering this person in this chat" — not "who
+said it":
+
+| field | example |
+|---|---|
+| `via` | `tool`, `auto_extract`, `mirror`, `legacy` (stored before 0.8.0) |
+| `platform`, `chat_type` | `telegram`, `group` |
+| `chat_id`, `thread_id` | `-1001234567890`, `7` |
+| `session_id` | the Hermes session |
+| `user_id`, `user_name` | the author of the turn |
+
+Chat names are not stored (they change and they leak). Facts from before 0.8.0 say "source unknown".
+
+- `list`, `history` and `export` show the source in full.
+- Prefetch does not show it by default (`recall_source: off`). `recall_source: short` appends
+  "recorded 2026-10-12 · Anton · this chat / another chat" to each recalled fact, without ids.
+- `forget` deletes the source with the fact.
+
+## Forget means gone
+
+`forget` runs in one transaction: the fact row, every version, both FTS entries, entity links, entities and aliases
+left without facts, the category banks. Then, to remove copies the database itself keeps:
+
+1. both FTS indexes are rebuilt from their content tables (an FTS5 delete only adds a marker; the words stay in old
+   segments until a rebuild);
+2. the connection runs with `PRAGMA secure_delete = ON`, so freed pages and cells are zeroed;
+3. `VACUUM` rewrites the file (free space left by earlier versions of the plugin is not zeroed otherwise);
+4. `PRAGMA wal_checkpoint(TRUNCATE)` empties the write-ahead log.
+
+Steps 3–4 can be blocked by another process holding the database (a reader in the middle of a long query). The
+result then says `scrub: "pending"` and the store retries at its next open or next forget. The acceptance test
+greps the raw bytes of the `.db` and `-wal` files for a word that only the forgotten fact contained.
+
+### Tombstones
+
+`forgotten(fact_id, forgotten_at, digests)` keeps the id (ids are never reused: `AUTOINCREMENT`) and a keyed hash
+(HMAC-SHA256 with a per-database random key) of the normalised text of every version — **never the text**.
+Tombstones are kept forever. They are used for two things:
+
+- auto-extraction silently skips a sentence that matches a tombstone, so a forgotten fact does not come back from
+  old messages; an `add` from a cron job (a nightly extraction re-reading old messages) is refused with
+  `status: "forgotten"`; a manual `add` by the main agent is stored, with a hint that it was forgotten earlier;
+- consumers that copied a fact elsewhere clean their copies: `SELECT fact_id, forgotten_at FROM forgotten`.
+
+What the plugin cannot reach is said plainly. The copies other software makes (a dreaming skill's caches and diary,
+a backup of the database file, a git history of dumps) are cleaned by that software, by fact id. Hermes's own
+session database keeps the messages the fact was learned from, and `hermes backup` archives are not rewritten.
+
+## Schema
+
+```sql
+CREATE TABLE fact_versions (
+    version_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    fact_id        INTEGER NOT NULL,            -- stable id of the fact (facts.fact_id while it is current)
+    seq            INTEGER NOT NULL,            -- 1, 2, 3 … within the fact
+    content, category, tags,                    -- the version's text and metadata
+    valid_from     TEXT,                        -- YYYY-MM-DD or NULL (unknown)
+    valid_to       TEXT,                        -- YYYY-MM-DD, exclusive; NULL = open
+    valid_to_exact INTEGER NOT NULL DEFAULT 1,  -- 0: valid_to is an upper bound
+    status         TEXT NOT NULL,               -- current | changed | ended | corrected
+    recorded_at, recorded_on, closed_at,
+    supersedes, superseded_by,                  -- version_ids
+    trust_score,                                -- snapshot when the version was closed
+    src_via, src_platform, src_chat_type, src_chat_id, src_thread_id, src_session_id, src_user_id, src_user_name,
+    UNIQUE (fact_id, seq)
+);
+-- at most one current version per fact
+CREATE UNIQUE INDEX idx_versions_current ON fact_versions(fact_id) WHERE status = 'current';
+CREATE VIRTUAL TABLE fact_versions_fts USING fts5(content, tags, content=fact_versions, content_rowid=version_id);
+CREATE TABLE forgotten (fact_id INTEGER PRIMARY KEY, forgotten_at TEXT NOT NULL, digests TEXT NOT NULL);
+```
+
+`facts` gets no new column, so older versions of the plugin and tools that read `facts` directly (hermes-dreaming)
+keep working. Every write is one transaction.
+
+## Migration and older versions on the same file
+
+- The first writer of 0.8.0 gives every fact a version: `seq 1`, `current`, `valid_from NULL`, `recorded_at` = the
+  fact's `updated_at` (the latest moment its text is known to have been true), `via legacy`. Read-only contexts
+  (subagents, cron) do not migrate; `as_of` and `history` there answer with a clear error until a writer has.
+- An older version may write the file in between (a downgrade, a second profile). Each writer open reconciles:
+  - a fact without a current version → a `legacy` version;
+  - a fact whose text differs from its current version (an older `update`) → the version is closed as `changed`
+    with an upper-bound end, and the new text becomes a `legacy` version;
+  - tags or category that differ → synced in place;
+  - a current version whose fact is gone (an older `remove` or `supersedes`) → treated as `forget`: history
+    deleted, tombstone written. An `ended` fact is legitimately absent and is left alone.
+- CI runs 0.8.0 → v0.1.1 → 0.8.0 and 0.8.0 → 0.7.0 → 0.8.0 on one database.
+
+## Who may write
+
+The main agent writes. A cron job writes only through its explicit `fact_store` / `fact_feedback` calls
+(`cron_writes`, on by default: memory-maintenance jobs exist to make them), and nothing automatic happens there
+(auto-extraction, mirroring, recall counts). Subagents and flush contexts read only. A writer that can write also
+migrates the file; one that cannot never does and creates no history table (as before 0.8.0, a reader opening a
+file still sets WAL mode and the base schema on it; it changes no data).
+
+## Scopes
+
+`scope: user | chat | thread` keeps a database per user or chat; each has its own history and its own tombstones.
+
+## Not in v1
+
+"What did we know on a date" (a query by recorded time); time of day; `as_of` for `probe` / `related` / `reason`;
+future `valid_from`; "who said it" as distinct from "whom we were answering"; cleaning Hermes's session database and
+`hermes backup` archives.

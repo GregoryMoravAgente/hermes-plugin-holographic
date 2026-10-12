@@ -213,7 +213,9 @@ def test_non_primary_contexts_read_but_never_write(tmp_path, context):
     writer = _provider(tmp_path)
     fact = _call(writer, action="add", content="Alice Smith lives in Paris")["fact_id"]
     writer.shutdown()
-    reader = _provider(tmp_path, agent_context=context, config={"mirror_memory_writes": True, "auto_extract": True})
+    # cron: with cron_writes off (0.8.0 lets a cron job's explicit tool calls write by default)
+    reader = _provider(tmp_path, agent_context=context, config={"mirror_memory_writes": True, "auto_extract": True,
+                                                                "cron_writes": False})
     assert "error" in _call(reader, action="add", content="Bob Brown lives in Rome")
     assert "error" in _call(reader, action="remove", fact_id=fact)
     assert "error" in json.loads(reader.handle_tool_call("fact_feedback", {"action": "helpful", "fact_id": fact}))

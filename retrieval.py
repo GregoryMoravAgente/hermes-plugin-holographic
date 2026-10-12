@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from .store import MemoryStore
 
 from . import holographic as hrr
+from .history import CLOSED, version_state
 from .text import (CJK_NEGATORS, CLAIM_WORDS, CONTRASTIVE, NEGATORS, UNSEGMENTED, analyze, content_chars,
                    content_keys, content_stems, gram_coverage, is_greeting, is_sea, query_grams, query_terms, run_grams,
                    soft_jaccard, soft_overlap, words)
@@ -32,6 +33,26 @@ _RE_UNSEGMENTED = UNSEGMENTED
 _INDONESIAN_PROBE = '"yang" OR "dengan" OR "untuk" OR "tidak" OR "adalah" OR "sudah" OR "belum"'
 # ... and of German, whose compounds hide their last word from a prefix query ("Katze" in "Familienkatze").
 _GERMAN_PROBE = '"und" OR "nicht" OR "ist" OR "sind" OR "der" OR "das" OR "eine" OR "mit"'
+
+
+class _Corpus:
+    """What a search runs over: the current facts, or (``as_of``) the versions that may have held on a date. *source*
+    is a table or a subquery with the columns of ``facts``, *key* its row id, *fts* the FTS5 index over it."""
+
+    __slots__ = ("source", "params", "fts", "key", "cache")
+
+    def __init__(self, source: str, params: tuple, fts: str, key: str, cache: dict):
+        self.source, self.params, self.fts, self.key, self.cache = source, params, fts, key, cache
+
+
+# Versions that may have held on a date (as_of): corrected ones never did. Trust: the fact's while the version is
+# current, else the snapshot taken when it was closed.
+_AS_OF_SOURCE = (
+    "(SELECT v.version_id, v.fact_id, v.seq, v.content, v.category, v.tags, v.status, v.valid_from, v.valid_to, "
+    "v.valid_to_exact, v.recorded_on, v.recorded_at AS created_at, COALESCE(v.closed_at, v.recorded_at) AS updated_at, "
+    "COALESCE(c.trust_score, v.trust_score, ?) AS trust_score, 0 AS retrieval_count, NULL AS hrr_vector "
+    "FROM fact_versions v LEFT JOIN facts c ON c.fact_id = v.fact_id AND v.status = 'current' "
+    "WHERE v.status != 'corrected' AND (v.valid_from IS NULL OR v.valid_from <= ?) AND (v.valid_to IS NULL OR v.valid_to > ?))")
 
 
 def _shift(sim: float) -> float:
@@ -55,7 +76,13 @@ class FactRetriever:
         if hrr_weight > 0 and not hrr._HAS_NUMPY:  # redistribute weights without numpy
             fts_weight, jaccard_weight, hrr_weight = 0.6, 0.4, 0.0
         self.fts_weight, self.jaccard_weight, self.hrr_weight = fts_weight, jaccard_weight, hrr_weight
-        self._analyses: dict[int, tuple[str, object]] = {}  # fact_id -> (text, Analysis), for word-level scans
+        # row id -> (text, Analysis), for word-level scans: one cache for the current facts, one for versions
+        self._current = _Corpus("facts", (), "facts_fts", "fact_id", {})
+        self._version_cache: dict[int, tuple[str, object]] = {}
+
+    def _as_of(self, day: str) -> _Corpus:
+        return _Corpus(_AS_OF_SOURCE, (self.store.default_trust, day, day), "fact_versions_fts", "version_id",
+                       self._version_cache)
 
     def _atom(self, word: str):
         return hrr.encode_atom(word, self.hrr_dim)
@@ -68,18 +95,68 @@ class FactRetriever:
             logger.warning("holographic: skipping an unreadable HRR vector (%s)", exc)
             return None
 
-    def search(self, query: str, category: str | None = None, min_trust: float = 0.3, limit: int = 10) -> list[dict]:
+    def search(self, query: str, category: str | None = None, min_trust: float = 0.3, limit: int = 10,
+               corpus: _Corpus | None = None) -> list[dict]:
         """FTS5 candidates (limit*3) → Jaccard + HRR rerank → trust weighting → optional temporal decay
-        0.5^(age_days / half_life). Returns fact dicts with 'score', sorted desc."""
+        0.5^(age_days / half_life). Returns fact dicts with 'score', sorted desc. *corpus*: the current facts by
+        default; search_as_of passes the versions of a date."""
+        corpus = corpus or self._current
+        key = corpus.key
         terms = query_terms(query or "")
-        candidates = {f["fact_id"]: f for f in self._fts_candidates(query, category, min_trust, limit * 3)
+        candidates = {f[key]: f for f in self._fts_candidates(query, category, min_trust, limit * 3, corpus)
                       if self._contains_a_term(terms, f)}
-        for fact in self._ngram_candidates(query, category, min_trust, limit * 3):
-            if fact["fact_id"] not in candidates or candidates[fact["fact_id"]].get("fts_rank", 0) < fact["fts_rank"]:
-                candidates[fact["fact_id"]] = fact
-        for fact in self._scan_candidates(terms, category, min_trust, limit * 3):
-            candidates.setdefault(fact["fact_id"], fact)  # fills in what FTS cannot see; FTS ranks what it found
+        for fact in self._ngram_candidates(query, category, min_trust, limit * 3, corpus):
+            if fact[key] not in candidates or candidates[fact[key]].get("fts_rank", 0) < fact["fts_rank"]:
+                candidates[fact[key]] = fact
+        for fact in self._scan_candidates(terms, category, min_trust, limit * 3, corpus):
+            candidates.setdefault(fact[key], fact)  # fills in what FTS cannot see; FTS ranks what it found
+        if corpus is not self._current:
+            self._corpus_rank(query, terms, list(candidates.values()), category, min_trust, corpus)
         return self._rerank(query, list(candidates.values()), limit)
+
+    def _corpus_rank(self, query: str, terms, candidates: list[dict], category, min_trust, corpus: _Corpus) -> None:
+        """FTS5's BM25 counts every row of its index; the versions index holds corrected versions and every other
+        date too, so for as_of its rank would weigh words by versions that are not in the corpus. Here the weights
+        come from the corpus itself: the IDF-weighted share of the query's terms a version contains, or (an
+        unsegmented script) the share of the query's n-grams, whichever is higher."""
+        if not candidates:
+            return
+        texts = self._texts(category, min_trust, corpus)
+        df = {t: sum(1 for _, _, a in texts if t.found_in(a)) for t in terms}
+        weight = {t: math.log(1.0 + len(texts) / df[t]) for t in terms if df[t]}
+        # A word no version of the date contains still says what the query is about (as in `relevant`): it counts
+        # against coverage, weighted like the commonest present word.
+        total = sum(weight.values()) + sum(1 for t in terms if not df[t]) * (min(weight.values()) if weight else 0.0)
+        grams = query_grams(query)
+        for fact in candidates:
+            text = f'{fact.get("content", "")} {fact.get("tags") or ""}'
+            analysis = analyze(text)
+            share = sum(w for t, w in weight.items() if t.found_in(analysis)) / total if total else 0.0
+            fact["fts_rank"] = max(share, gram_coverage(grams, text.lower()) if grams else 0.0)
+
+    def search_as_of(self, query: str, day: str, category: str | None = None, min_trust: float = 0.3,
+                     limit: int = 10) -> dict:
+        """What held on *day*: the search runs over the versions that may have held then (candidates, IDF, the
+        floor and the limit are all computed over them, so limit=1 is the best version for that date). Versions
+        known to hold go to 'results', those whose start or end is not known to the day to 'undetermined'."""
+        self.store._require_history()
+        held, maybe = [], {}
+        # A wide pool: FTS5 picks candidates by its global rank, which knows nothing of the date; the corpus rank
+        # (_corpus_rank) then orders them by the versions of that date only.
+        for v in self.search(query, category=category, min_trust=min_trust, limit=max(limit * 10, 100),
+                             corpus=self._as_of(day)):
+            state, why = version_state(v, day)
+            entry = {"fact_id": v["fact_id"], "version": v["seq"], "content": v["content"], "category": v["category"],
+                     "valid_from": v["valid_from"] or "unknown",
+                     "valid_to": v["valid_to"] if not v["valid_to"] or v["valid_to_exact"] else f"before {v['valid_to']}",
+                     "status": v["status"], "score": round(v["score"], 4)}
+            if state == "holds" and all(h["fact_id"] != v["fact_id"] for h in held):
+                held.append(entry)
+            elif state == "undetermined":
+                maybe.setdefault(v["fact_id"], {**entry, "reason": why})
+        known = {h["fact_id"] for h in held}
+        undetermined = [e for fact_id, e in maybe.items() if fact_id not in known]
+        return {"as_of": day, "results": held[:limit], "undetermined": undetermined[:limit]}
 
     @staticmethod
     def _contains_a_term(terms, fact: dict) -> bool:
@@ -90,33 +167,41 @@ class FactRetriever:
         analysis = analyze(f'{fact.get("content", "")} {fact.get("tags") or ""}')
         return any(t.found_in(analysis) for t in terms)
 
-    def _texts(self, category: str | None = None, min_trust: float | None = None) -> list[tuple[int, float, object]]:
-        """(fact_id, trust, Analysis) of every fact passing the filters. The rows are read on every call (the table is
-        the truth; another process may have written); a fact is analysed again only when its text changed, so the
-        first scan after start analyses every fact and later ones only what changed."""
-        where = [c for c, on in (("trust_score >= ?", min_trust is not None), ("category = ?", category)) if on]
+    def _texts(self, category: str | None = None, min_trust: float | None = None,
+               corpus: _Corpus | None = None) -> list[tuple[int, float, object]]:
+        """(row id, trust, Analysis) of every fact (or version) passing the filters. The rows are read on every call
+        (the table is the truth; another process may have written); a row is analysed again only when its text
+        changed, so the first scan after start analyses every fact and later ones only what changed."""
+        corpus = corpus or self._current
+        where = [c for c, on in (("f.trust_score >= ?", min_trust is not None), ("f.category = ?", category)) if on]
         params = [p for p, on in ((min_trust, min_trust is not None), (category, category)) if on]
-        rows = self.store.read("SELECT fact_id, content, tags, trust_score FROM facts"
-                               + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY fact_id", params)
-        cache, out = self._analyses, []
+        rows = self.store.read(f"SELECT f.{corpus.key} AS rid, f.content, f.tags, f.trust_score FROM {corpus.source} f"
+                               + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY rid",
+                               [*corpus.params, *params])
+        cache, out = corpus.cache, []
         for row in rows:
             text = f'{row["content"]} {row["tags"] or ""}'
-            hit = cache.get(row["fact_id"])
+            hit = cache.get(row["rid"])
             if hit is None or hit[0] != text:
-                hit = cache[row["fact_id"]] = (text, analyze(text))
-            out.append((row["fact_id"], row["trust_score"], hit[1]))
-        if not where and len(cache) > len(out) + 1024:  # deleted facts: only an unfiltered read sees every fact
-            self._analyses = {fact_id: cache[fact_id] for fact_id, _, _ in out}
+                hit = cache[row["rid"]] = (text, analyze(text))
+            out.append((row["rid"], row["trust_score"], hit[1]))
+        if corpus is self._current and not where and len(cache) > len(out) + 1024:  # deleted facts: only an
+            kept = {fact_id: cache[fact_id] for fact_id, _, _ in out}  # unfiltered read of the facts sees every one
+            cache.clear()
+            cache.update(kept)
+        elif corpus is not self._current and len(cache) > 20_000:
+            cache.clear()
         return out
 
-    def _scan_terms(self, terms) -> list:
+    def _scan_terms(self, terms, corpus: _Corpus | None = None) -> list:
         """The terms matched word by word: Arabic and Indic always; Latin ones (Indonesian, German, or a query of
         undetermined language) only when the store holds Indonesian or German facts, so an English store never pays
         for a scan."""
+        fts = (corpus or self._current).fts
         scan = [t for t in terms if t.scan]
         if any(t.fts_ok for t in scan):
             try:
-                needed = bool(self.store.read("SELECT 1 FROM facts_fts WHERE facts_fts MATCH ? LIMIT 1",
+                needed = bool(self.store.read(f"SELECT 1 FROM {fts} WHERE {fts} MATCH ? LIMIT 1",
                                               (f"{_INDONESIAN_PROBE} OR {_GERMAN_PROBE}",)))
             except Exception:  # a damaged index: the scan does not need it
                 needed = True
@@ -124,50 +209,57 @@ class FactRetriever:
                 scan = [t for t in scan if not t.fts_ok]
         return scan
 
-    def _rows(self, ids: list[int], category: str | None = None, min_trust: float | None = None) -> list[dict]:
+    def _rows(self, ids: list[int], category: str | None = None, min_trust: float | None = None,
+              corpus: _Corpus | None = None) -> list[dict]:
         """Full rows of *ids*, the filters applied again: the fact may have changed since its text was read."""
         if not ids:
             return []
-        sql = (f"SELECT * FROM facts WHERE fact_id IN ({','.join('?' * len(ids))})"
-               + (" AND trust_score >= ?" if min_trust is not None else "") + (" AND category = ?" if category else ""))
-        params = [*ids, *([min_trust] if min_trust is not None else []), *([category] if category else [])]
+        corpus = corpus or self._current
+        sql = (f"SELECT * FROM {corpus.source} f WHERE f.{corpus.key} IN ({','.join('?' * len(ids))})"
+               + (" AND f.trust_score >= ?" if min_trust is not None else "") + (" AND f.category = ?" if category else ""))
+        params = [*corpus.params, *ids, *([min_trust] if min_trust is not None else []), *([category] if category else [])]
         return [dict(r) for r in self.store.read(sql, params)]
 
-    def _scan_candidates(self, terms, category: str | None, min_trust: float, limit: int) -> list[dict]:
+    def _scan_candidates(self, terms, category: str | None, min_trust: float, limit: int,
+                         corpus: _Corpus | None = None) -> list[dict]:
         """Facts containing the query's scan terms (Arabic, Indic, Indonesian: words whose other forms the FTS5
         index cannot find), matched word by word against the text of every fact and ranked by the IDF-weighted share
         of those terms they contain ('fts_rank'). A scan, like the n-gram path: milliseconds at the size this store
         is meant for."""
-        scan = self._scan_terms(terms)
+        corpus = corpus or self._current
+        scan = self._scan_terms(terms, corpus)
         if not scan:
             return []
-        texts = self._texts(category, min_trust)
-        found = [(fact_id, trust, [t for t in scan if t.found_in(a)]) for fact_id, trust, a in texts]
+        texts = self._texts(category, min_trust, corpus)
+        found = [(rid, trust, [t for t in scan if t.found_in(a)]) for rid, trust, a in texts]
         df = {t: sum(t in hit for _, _, hit in found) for t in scan}
         weight = {t: math.log(1.0 + len(texts) / df[t]) for t in scan if df[t]}
         total = sum(weight.values()) or 1.0
         # ties: the more trusted fact, then the newer one
-        ranked = sorted(((sum(weight[t] for t in hit) / total, trust, fact_id) for fact_id, trust, hit in found if hit),
+        ranked = sorted(((sum(weight[t] for t in hit) / total, trust, rid) for rid, trust, hit in found if hit),
                         reverse=True)[:limit]
-        rank = {fact_id: score for score, _, fact_id in ranked}
-        rows = [f for f in self._rows([fact_id for _, _, fact_id in ranked], category, min_trust)
+        rank = {rid: score for score, _, rid in ranked}
+        rows = [f for f in self._rows([rid for _, _, rid in ranked], category, min_trust, corpus)
                 if self._contains_a_term(scan, f)]
         for fact in rows:
-            fact["fts_rank"] = rank[fact["fact_id"]]
+            fact["fts_rank"] = rank[fact[corpus.key]]
         return rows
 
-    def _ngram_candidates(self, query: str, category: str | None, min_trust: float, limit: int) -> list[dict]:
+    def _ngram_candidates(self, query: str, category: str | None, min_trust: float, limit: int,
+                          corpus: _Corpus | None = None) -> list[dict]:
         """Facts sharing character n-grams with the query's unsegmented runs, ranked by the share of n-grams they
         contain ('fts_rank'). A substring scan: no extra index, so nothing to migrate or keep in sync; at the size
         this store is meant for (hundreds to thousands of facts) it takes milliseconds."""
+        corpus = corpus or self._current
         grams = query_grams(query)
         if not grams:
             return []
         # content and tags: the agent's keywords (kept in tags) are searched like the text
         hits = " + ".join(f"(instr(lower(content || ' ' || COALESCE(tags, '')), ?) > 0) * {weight}" for _, weight in grams)
-        sql = (f"SELECT * FROM (SELECT f.*, ({hits}) AS gram_hits FROM facts f WHERE f.trust_score >= ?"
+        sql = (f"SELECT * FROM (SELECT f.*, ({hits}) AS gram_hits FROM {corpus.source} f WHERE f.trust_score >= ?"
                + (" AND f.category = ?" if category else "") + ") WHERE gram_hits > 0 ORDER BY gram_hits DESC LIMIT ?")
-        rows = self.store.read(sql, [*(g for g, _ in grams), min_trust, *([category] if category else []), limit])
+        rows = self.store.read(sql, [*(g for g, _ in grams), *corpus.params, min_trust,
+                                     *([category] if category else []), limit])
         total = sum(weight for _, weight in grams)
         results = []
         for row in rows:
@@ -330,17 +422,21 @@ class FactRetriever:
         return self.store.read(f"SELECT {_FACT_COLUMNS}, hrr_vector FROM facts {where}",
                                [min_trust] + ([category] if category else []))
 
-    def _fts_candidates(self, query: str, category: str | None, min_trust: float, limit: int) -> list[dict]:
+    def _fts_candidates(self, query: str, category: str | None, min_trust: float, limit: int,
+                        corpus: _Corpus | None = None) -> list[dict]:
         """FTS5 candidates for a natural-language query; [] when nothing in it is searchable."""
         expression = self._sanitize_fts_query(query)
-        return self._fts_query(expression, category, min_trust, limit) if expression else []
+        return self._fts_query(expression, category, min_trust, limit, corpus) if expression else []
 
-    def _fts_query(self, expression: str, category: str | None, min_trust: float, limit: int) -> list[dict]:
+    def _fts_query(self, expression: str, category: str | None, min_trust: float, limit: int,
+                   corpus: _Corpus | None = None) -> list[dict]:
         """Raw FTS5 MATCH candidates with rank normalized to [0, 1] as 'fts_rank'."""
+        corpus = corpus or self._current
+        fts = corpus.fts
         category_clause = "AND f.category = ? " if category else ""
-        params = [expression] + ([category] if category else []) + [min_trust, limit]
-        sql = ("SELECT f.*, facts_fts.rank as fts_rank_raw FROM facts_fts JOIN facts f ON f.fact_id = facts_fts.rowid "
-               f"WHERE facts_fts MATCH ? {category_clause}AND f.trust_score >= ? ORDER BY facts_fts.rank LIMIT ?")
+        params = [*corpus.params, expression] + ([category] if category else []) + [min_trust, limit]
+        sql = (f"SELECT f.*, {fts}.rank as fts_rank_raw FROM {fts} JOIN {corpus.source} f ON f.{corpus.key} = {fts}.rowid "
+               f"WHERE {fts} MATCH ? {category_clause}AND f.trust_score >= ? ORDER BY {fts}.rank LIMIT ?")
         try:
             results = [dict(row) for row in self.store.read(sql, params)]
         except Exception as exc:  # a damaged index (expressions are built to be valid)
@@ -520,7 +616,8 @@ class FactRetriever:
                 ",".join("?" * len(own_entities)) or "NULL"), [*own_entities, fact_id])}
         candidate_ids |= {f["fact_id"] for f in self.search(content, min_trust=0.0, limit=10)} - {fact_id}
         if not candidate_ids:
-            return {"similar": [], "possible_conflicts": []}
+            return {"similar": [], "possible_conflicts": [],
+                    "past_versions": self._past_versions(fact_id, content, content_keys(content), limit)}
         entity_names = {r["entity_id"]: r["name"] for r in self.store.read(
             "SELECT entity_id, name FROM entities WHERE entity_id IN (SELECT entity_id FROM fact_entities WHERE fact_id IN ({}))".format(
                 ",".join("?" * (len(candidate_ids) + 1))), [fact_id, *sorted(candidate_ids)])}
@@ -545,7 +642,33 @@ class FactRetriever:
             elif overlap >= 0.7 and own_claim[1] == other_claim[1]:
                 similar.append(entry)
         by_overlap = lambda xs: sorted(xs, key=lambda e: e["word_overlap"], reverse=True)[:limit]  # noqa: E731
-        return {"similar": by_overlap(similar), "possible_conflicts": by_overlap(conflicts)}
+        return {"similar": by_overlap(similar), "possible_conflicts": by_overlap(conflicts),
+                "past_versions": self._past_versions(fact_id, content, own_keys, limit)}
+
+    def _past_versions(self, fact_id: int, content: str, own_keys, limit: int) -> list[dict]:
+        """Closed versions (changed / ended, never corrected) of other facts that say nearly the same: "a fact that
+        came back" is a new version of that fact (change), not a fact of its own."""
+        expression = self._sanitize_fts_query(content)
+        if not expression or not self.store.history_ready():
+            return []
+        marks = ",".join("?" * len(CLOSED))
+        try:
+            rows = self.store.read(
+                "SELECT v.fact_id, v.seq, v.content, v.status, v.valid_to, v.valid_to_exact FROM fact_versions_fts "
+                "JOIN fact_versions v ON v.version_id = fact_versions_fts.rowid WHERE fact_versions_fts MATCH ? "
+                f"AND v.status IN ({marks}) AND v.fact_id != ? ORDER BY fact_versions_fts.rank LIMIT 20",
+                (expression, *CLOSED, fact_id))
+        except Exception as exc:  # a damaged index: the hint is advisory
+            logger.warning("holographic: history search failed (%s)", exc)
+            return []
+        out: dict[int, dict] = {}
+        for r in rows:
+            overlap = soft_jaccard(own_keys, content_keys(r["content"]))
+            if overlap >= 0.7 and r["fact_id"] not in out:
+                until = r["valid_to"] if r["valid_to_exact"] else f"before {r['valid_to']}"
+                out[r["fact_id"]] = {"fact_id": r["fact_id"], "content": r["content"], "status": r["status"],
+                                     "until": until, "word_overlap": round(overlap, 2)}
+        return sorted(out.values(), key=lambda e: e["word_overlap"], reverse=True)[:limit]
 
     def review(self, limit: int = 20, stale_days: int = 60) -> list[dict]:
         """Clean-up candidates with a reason each: low trust; never recalled and older than *stale_days*; a

@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.8.0 — 2026-10-12
+
+The store keeps the history of every fact, records where each version came from, and makes "forget" final.
+Contract: [docs/history.md](docs/history.md).
+
+### Added
+
+- **History.** `fact_versions` keeps every version of a fact with its valid time (`valid_from` / `valid_to`, dates,
+  half-open) and recorded time; `facts` stays the current projection, so ordinary search, prefetch, entities and HRR
+  never see a past version. New actions say how a fact stopped being current: `change` (it changed; same fact id),
+  `end` (no longer holds, nothing replaces it), `correct` (it was wrong; never returned as the past), `revert` (undo
+  the last change, correction or end), `forget`; `history {fact_id}` lists the versions.
+- **`as_of=YYYY-MM-DD`** on `search` and `list`: what held on that date, ranked over the versions of that date only
+  (so `limit=1` is the best version for the date). Answers separate `results` from `undetermined`: a fact without a
+  known start is known to hold only from the day it was recorded, and an undated change gives the old version an
+  upper-bound end; the store does not invent history. `probe`, `related` and `reason` refuse `as_of`.
+- **Source of each version:** via (`tool` / `auto_extract` / `mirror`; `legacy` for facts from before 0.8.0),
+  platform, chat type, chat / thread / session id, author of the turn. Shown by `list`, `history`, `export`; in the
+  facts recalled before a turn only with **`recall_source: short`** (default `off`). Chat names are not stored.
+- **A fact that comes back** (X → Y → X): `add X` answers `past_version` with the fact id instead of storing a
+  duplicate; the write check lists near `past_versions`; auto-extraction skips sentences that are past versions.
+- **Tombstones** (`forgotten`): the id and keyed hashes of a forgotten fact's texts, never the text. Auto-extraction
+  does not store a forgotten sentence again, nor does an `add` from a cron job (`status: "forgotten"`); a manual
+  `add` by the main agent is stored with a hint; other tools read the ids to clean their copies.
+- `stats` reports past versions, corrected versions, ended facts and tombstones.
+
+### Changed
+
+- **`forget` deletes for good**, and `remove` is now `forget`: the fact, every version, links, orphaned entities and
+  aliases, banks; both FTS indexes are rebuilt (an FTS5 delete leaves the words in old segments), the connection runs
+  with `secure_delete`, the file is rewritten with `VACUUM` and the WAL truncated. If another process blocks the
+  rewrite, the result says `scrub: "pending"` and the next open or forget finishes it.
+- **`add supersedes=X` is `change X`: the id stays `X`** (before, the new text got a new id and the old fact was
+  deleted). The answer still carries `superseded`. If the new text is already another fact, `X` ends and that fact is
+  returned.
+- `update content=` is a correction: the old text is kept as a `corrected` version. Tags, keywords, category and trust
+  still change in place.
+- A `change` drops the old text's keywords (they described the old text) unless new ones are given, and starts the
+  trust over, as `supersedes` did.
+- Built-in memory mirroring (`mirror_memory_writes`): `replace` is a `change`, `remove` is a `forget`.
+
+### Fixed
+
+- **A cron job could not write facts.** Since 0.2.0 the plugin refused every write in non-primary contexts, cron
+  included, while the copy bundled in Hermes core never did: memory-maintenance jobs that store facts by calling
+  `fact_store` (hermes-dreaming's nightly extraction, its keyword pass) stopped working after the move to this plugin.
+  New **`cron_writes`** (default `true`): a cron job's explicit `fact_store` / `fact_feedback` calls write;
+  auto-extraction, mirroring and recall counts stay off in cron, and subagents and flush contexts stay read-only.
+
+### Compatibility
+
+- `facts` gets no new column. A file an older release wrote to is reconciled on the next writer open (new facts get
+  a legacy version; a text changed by an older `update` closes the old version with an upper-bound end; a fact an
+  older `remove` deleted is forgotten). Read-only contexts do not migrate; `as_of` / `history` there say so. CI runs
+  0.8.0 → v0.1.1 → 0.8.0 and 0.8.0 → v0.7.0 → 0.8.0 on one database.
+
 ## 0.7.0 — 2026-10-12
 
 ### Added

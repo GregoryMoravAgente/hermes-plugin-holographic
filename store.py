@@ -10,6 +10,7 @@ import unicodedata
 from pathlib import Path
 
 from . import holographic as hrr
+from .history import HISTORY_SCHEMA, HistoryMixin, parse_day
 from .text import UNSEGMENTED, analyze, name_keys
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,7 @@ CREATE TABLE IF NOT EXISTS memory_banks (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """
+# 0.8.0 history tables (history.py) are created by a writer in _migrate(): a read-only context creates nothing.
 
 SCHEMA_VERSION = 2  # 1 = 0.1.x-0.3.x layout, 2 = + meta, entities.name_key, entity_aliases
 _HELPFUL_DELTA, _UNHELPFUL_DELTA = 0.05, -0.10
@@ -209,7 +211,7 @@ def _restrict_permissions(db_path: Path) -> None:
             pass
 
 
-class MemoryStore:
+class MemoryStore(HistoryMixin):
     """SQLite-backed fact store with entity resolution and trust scoring.
 
     Process-wide shared connection registry: SQLite allows one writer at a time and several providers
@@ -222,13 +224,14 @@ class MemoryStore:
     _shared_guard = threading.Lock()
 
     def __init__(self, db_path: "str | Path | None" = None, default_trust: float = 0.5, hrr_dim: int = 1024, *,
-                 migrate: bool = True) -> None:
+                 migrate: bool = True, tz=None) -> None:
         if db_path is None:
             from hermes_constants import get_hermes_home
             db_path = str(get_hermes_home() / "memory_store.db")
         self.db_path = Path(db_path).expanduser()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.default_trust, self.hrr_dim, self._hrr_available = _clamp_trust(default_trust), hrr_dim, hrr._HAS_NUMPY
+        self.tz = tz  # local dates of the history (recorded_on, "today"); None = UTC
         try:  # resolve() so symlinked/relative paths to the same file share ONE connection
             self._key = str(self.db_path.resolve())
         except OSError:
@@ -241,6 +244,7 @@ class MemoryStore:
                 conn = sqlite3.connect(self._key, check_same_thread=False, timeout=10.0, isolation_level=None)
                 conn.row_factory = sqlite3.Row
                 conn.create_function("hfold", 1, fold, deterministic=True)
+                conn.execute("PRAGMA secure_delete = ON")  # freed pages and cells are zeroed: forgotten text leaves no copy
                 entry = MemoryStore._shared[self._key] = {"conn": conn, "lock": threading.RLock(), "refs": 0, "ready": False,
                                                           "migrated": False, "generation": 0}
             entry["refs"] += 1
@@ -253,8 +257,10 @@ class MemoryStore:
                 if migrate and not entry["migrated"]:
                     self._migrate()
                     entry["migrated"] = True
+                    self.scrub()  # a forget whose file rewrite was blocked last time
                 elif migrate:
                     self._check_vectors()
+                    self.scrub()  # a forget whose file rewrite another process blocked: retried by every writer open
             except BaseException:
                 self.close()  # drop our reference; a broken connection must not stay registered
                 raise
@@ -282,7 +288,9 @@ class MemoryStore:
           are merged (links and aliases moved to the oldest one);
         - aliases it may have stored in the legacy ``entities.aliases`` column are copied into ``entity_aliases``;
         - HRR vectors are re-encoded when ``hrr_dim`` differs from the dimension they were written with (recorded in
-          ``meta``; before 0.4.0, inferred from the stored blobs), so a changed setting no longer breaks queries."""
+          ``meta``; before 0.4.0, inferred from the stored blobs), so a changed setting no longer breaks queries.
+        0.8.0 adds the history tables (executescript commits, so before the transaction) and versions every fact."""
+        self._conn.executescript(HISTORY_SCHEMA)
         with self._tx():
             if "name_key" not in {r[1] for r in self._conn.execute("PRAGMA table_info(entities)")}:
                 self._conn.execute("ALTER TABLE entities ADD COLUMN name_key TEXT")
@@ -299,6 +307,7 @@ class MemoryStore:
             self._reconcile_entity_keys()
             self._conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_key ON entities(name_key) WHERE name_key IS NOT NULL")
             self._sync_hrr_dim()
+            self._migrate_history()
             self._bump()
             self._conn.execute("INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
                                "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(SCHEMA_VERSION),))
@@ -429,12 +438,15 @@ class MemoryStore:
         return self.add_fact_status(content, category=category, tags=tags)[0]
 
     def add_fact_status(self, content: str, category: str = "general", tags: str = "", *,
-                        trust: float | None = None, entities=()) -> tuple[int, bool]:
+                        trust: float | None = None, entities=(), valid_from=None,
+                        source: dict | None = None) -> tuple[int, bool]:
         """(fact_id, created). Links extracted, declared (*entities*) and already known entities and stores the HRR
-        vector in the same transaction. *trust* overrides the default trust of a new fact."""
+        vector and the first version (*valid_from*: the date it started to hold, None = unknown; *source*: where it
+        was written) in the same transaction. *trust* overrides the default trust of a new fact."""
         content = (content or "").strip()
         if not content:
             raise ValueError("content must not be empty")
+        start = parse_day(valid_from, field="valid_from", today=self._today())
         with self._tx():
             try:
                 fact_id: int = self._write(
@@ -445,36 +457,56 @@ class MemoryStore:
             self._link_entities(fact_id, content, entities)
             self._compute_hrr_vector(fact_id, content)
             self._invalidate_bank(category)
+            if self.history_ready():
+                self._insert_version(fact_id, content, category, tags, valid_from=start, source=source)
             return fact_id, True
 
     def replace_fact(self, old_id: int, content: str, category: str = "general", tags: str = "", *,
-                     entities=()) -> tuple[int, bool]:
-        """Supersede fact *old_id* with *content* in one transaction: the new fact is stored (or found, if that text
-        already exists) and the old one removed. Returns (fact_id, created). KeyError if *old_id* does not exist.
-        The new fact starts at the default trust: a correction has not earned the old fact's feedback."""
+                     entities=(), valid_from=None, source: dict | None = None) -> tuple[int, bool]:
+        """0.7.0 `supersedes`, now a `change` of *old_id* (history.change_fact): the id stays. Returns (fact_id,
+        changed); another fact that already says *content* is returned as (its id, False) and *old_id* ends.
+        KeyError if *old_id* does not exist."""
         with self._tx():
             old = self._one("SELECT fact_id, content FROM facts WHERE fact_id = ?", (old_id,))
             if old is None:
                 raise KeyError(f"fact_id {old_id} not found")
             if old["content"] == (content or "").strip():
                 return int(old_id), False
-            fact_id, created = self.add_fact_status(content, category=category, tags=tags, entities=entities)
-            self.remove_fact(old_id)
-            return fact_id, created
+            result = self.change_fact(old_id, content, valid_from=valid_from, category=category, tags=tags,
+                                      entities=entities, source=source)
+            return int(result["fact_id"]), result["status"] == "changed"
 
     def update_fact(self, fact_id: int, content: str | None = None, trust_delta: float | None = None,
-                    tags: str | None = None, category: str | None = None, *, entities=(), touch: bool = True) -> bool:
+                    tags: str | None = None, category: str | None = None, *, entities=(), touch: bool = True,
+                    source: dict | None = None) -> bool:
         """Partially update a fact (trust clamped to [0, 1]). Returns True if the row existed. Raises ValueError for
         empty content and DuplicateContentError when another fact already has the new content. touch=False keeps
-        updated_at (temporal decay and "recently changed" read it): for search aids that do not change the fact."""
+        updated_at (temporal decay and "recently changed" read it): for search aids that do not change the fact.
+
+        A new text is a correction (as history.correct_fact): the old text stays as a `corrected` version. Tags and
+        category change the current version in place."""
         if content is not None:
             content = content.strip()
             if not content:
                 raise ValueError("content must not be empty")
         with self._tx():
-            row = self._one("SELECT fact_id, trust_score, category FROM facts WHERE fact_id = ?", (fact_id,))
+            row = self._one("SELECT fact_id, trust_score, category, content, tags FROM facts WHERE fact_id = ?", (fact_id,))
             if row is None:
                 return False
+            history = self.history_ready()
+            if history:
+                self._reconcile_history()
+            if content is not None and history and content != row["content"]:
+                other = self._one("SELECT fact_id FROM facts WHERE content = ? AND fact_id != ?", (content, fact_id))
+                if other is not None:
+                    raise DuplicateContentError(int(other["fact_id"]))
+                cur = self._current_version(fact_id)
+                self._replace_current(fact_id, "corrected", content, category or row["category"],
+                                      row["tags"] if tags is None else tags, valid_from=cur["valid_from"], source=source,
+                                      trust=row["trust_score"])
+            elif history and (tags is not None or category is not None):
+                self._write("UPDATE fact_versions SET tags = COALESCE(?, tags), category = COALESCE(?, category) "
+                            "WHERE fact_id = ? AND status = 'current'", (tags, category, fact_id))
             changes = {col: val for col, val in {
                 "content": content, "tags": tags, "category": category,
                 "trust_score": _clamp_trust(row["trust_score"] + trust_delta) if trust_delta is not None else None,
@@ -505,16 +537,69 @@ class MemoryStore:
             return True
 
     def remove_fact(self, fact_id: int) -> bool:
-        """Delete a fact, its entity links and entities left without facts. Returns True if the row existed."""
-        with self._tx():
-            row = self._one("SELECT fact_id, category FROM facts WHERE fact_id = ?", (fact_id,))
-            if row is None:
-                return False
-            self._write("DELETE FROM fact_entities WHERE fact_id = ?", (fact_id,))
-            self._write("DELETE FROM facts WHERE fact_id = ?", (fact_id,))
-            self._drop_orphan_entities()
-            self._invalidate_bank(row["category"])
-            return True
+        """0.7.0 `remove`, now `forget` (history.forget_fact): the fact, its history, links and entities left without
+        facts are deleted for good and a tombstone is kept. Returns True if the fact existed (current or ended)."""
+        if not self.history_ready():  # a store no writer of 0.8.0 has migrated: the plain delete
+            with self._tx():
+                row = self._one("SELECT fact_id, category FROM facts WHERE fact_id = ?", (fact_id,))
+                if row is None:
+                    return False
+                self._delete_fact_row(fact_id, row["category"])
+                return True
+        try:
+            return not self.forget_fact(fact_id).get("already")
+        except KeyError:
+            return False
+
+    # -- rows of the current projection (inside a transaction) ---------------------------------------------------
+
+    def _delete_fact_row(self, fact_id: int, category: str | None) -> None:
+        self._write("DELETE FROM fact_entities WHERE fact_id = ?", (fact_id,))
+        self._write("DELETE FROM facts WHERE fact_id = ?", (fact_id,))
+        self._drop_orphan_entities()
+        self._invalidate_bank(category)
+
+    def _rewrite_fact(self, fact_id: int, content: str, category, tags, *, entities=(), old_category=None,
+                      reset_trust: bool = False, trust: float | None = None) -> None:
+        """The current text of a fact changed (change / correct / revert): the row, its entity links (declared ones
+        survive), vector and banks follow. reset_trust: a changed fact starts over (default trust, no counts)."""
+        sets = ["content = ?", "category = ?", "tags = ?", "updated_at = CURRENT_TIMESTAMP"]
+        params: list = [content, category or "general", tags or ""]
+        if reset_trust:
+            sets += ["trust_score = ?", "helpful_count = 0", "retrieval_count = 0"]
+            params.append(self.default_trust)
+        elif trust is not None:
+            sets.append("trust_score = ?")
+            params.append(_clamp_trust(trust))
+        try:
+            self._write(f"UPDATE facts SET {', '.join(sets)} WHERE fact_id = ?", [*params, fact_id])
+        except sqlite3.IntegrityError:
+            other = self._one("SELECT fact_id FROM facts WHERE content = ?", (content,))
+            raise DuplicateContentError(int(other["fact_id"]) if other else -1) from None
+        kept = [r[0] for r in self._conn.execute(
+            "SELECT e.name FROM fact_entities fe JOIN entities e ON e.entity_id = fe.entity_id "
+            "WHERE fe.fact_id = ? AND e.entity_type = 'declared'", (fact_id,))]
+        self._write("DELETE FROM fact_entities WHERE fact_id = ?", (fact_id,))
+        self._link_entities(fact_id, content, [*kept, *(entities or ())])
+        self._compute_hrr_vector(fact_id, content)
+        self._drop_orphan_entities()
+        self._invalidate_bank(old_category)
+        if category != old_category:
+            self._invalidate_bank(category)
+
+    def _insert_fact_row(self, fact_id: int, version, *, trust: float, entities=()) -> None:
+        """Put an ended fact back into the current projection under its own id (resume / revert of an end)."""
+        first = self._one("SELECT MIN(recorded_at) FROM fact_versions WHERE fact_id = ?", (fact_id,))[0]
+        try:
+            self._write("INSERT INTO facts (fact_id, content, category, tags, trust_score, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)", (fact_id, version["content"], version["category"], version["tags"],
+                                                      _clamp_trust(trust), first or self._now()))
+        except sqlite3.IntegrityError:
+            other = self._one("SELECT fact_id FROM facts WHERE content = ?", (version["content"],))
+            raise DuplicateContentError(int(other["fact_id"]) if other else -1) from None
+        self._link_entities(fact_id, version["content"], entities)
+        self._compute_hrr_vector(fact_id, version["content"])
+        self._invalidate_bank(version["category"])
 
     def list_facts(self, category: str | None = None, min_trust: float = 0.0, limit: int = 50) -> list[dict]:
         """Browse facts ordered by trust_score descending, optionally filtered by category / min trust."""

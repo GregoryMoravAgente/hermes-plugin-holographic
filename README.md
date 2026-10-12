@@ -48,6 +48,8 @@ In `config.yaml` under `plugins.hermes-memory-store`:
 | `hrr_weight` | `0.3` | Weight of the HRR term in search ranking |
 | `prefetch_min_coverage` | `0.3` | Share of a message's informative words (rarer words weigh more) a fact must match to be recalled before the turn |
 | `prefetch_repeat_turns` | `6` | A fact recalled before a turn is not injected again for this many turns of the session |
+| `recall_source` | `off` | `short`: each fact recalled before a turn also says where it was written (`recorded 2026-10-12 · Anton · this chat`; no ids). Off by default: it costs tokens and tells the room which chat a fact came from. `list`, `history` and `export` always show the source in full |
+| `cron_writes` | `true` | A cron job's explicit `fact_store` / `fact_feedback` calls may write (nightly memory jobs such as hermes-dreaming's extraction and keywords exist to make them). Automatic writes (auto-extraction, mirroring, recall counts) stay off in cron, subagents and flush contexts; `false` makes cron read-only too |
 | `recall_indicator` | `true` | Report recalled facts to the core's recall indicator ("🧠 Holographic — recalled 2 memories"). On Telegram and other messaging platforms that line arrives as a separate message before the reply; `false` turns it off, recall itself is unchanged |
 | `scope` | `profile` | `user`: a separate database per user (`holographic-users/<platform>-<user id>.db` next to `db_path`); in a shared chat the store follows the author of each turn, and with no user identity nothing is recalled or written. `chat`: a separate database per chat (`holographic-chats/<platform>-<chat id>.db`) — for one bot serving many unrelated groups; `thread`: per forum topic / thread (`…-t<thread id>.db`), the chat's own database outside threads. Without a chat (CLI, cron, subagents) nothing is recalled or written |
 
@@ -55,7 +57,7 @@ In `config.yaml` under `plugins.hermes-memory-store`:
 
 | Tool | Description |
 |------|-------------|
-| `fact_store` | add, search, probe, related, reason, contradict, update, remove, list, stats, export, review, entities, alias, enrich |
+| `fact_store` | add, search, probe, related, reason, contradict, change, end, correct, revert, forget, history, update, remove, list, stats, export, review, entities, alias, enrich |
 | `fact_feedback` | Rate a fact helpful or unhelpful (moves its trust score) |
 
 - **search**: keyword candidates in any word form (`Маши` finds `Маша`, `deploys` finds `deploy`, `kucingnya` finds
@@ -66,8 +68,8 @@ In `config.yaml` under `plugins.hermes-memory-store`:
   Facts are framed as data (`#id [trust] text`), one line each.
 - **add** takes `entities` (who the fact is about; needed for one-word names such as a first name, so later facts
   mentioning it in any form link to it), `keywords` (see [Synonyms](#synonyms-and-other-roots-keywords)) and
-  `supersedes` (the id of the fact it replaces). Its answer lists
-  `similar` facts and `possible_conflicts` (same subject, a different claim); the agent decides. Text that is not a
+  `valid_from` (the date it started to hold, when the message says). Its answer lists `similar` facts,
+  `possible_conflicts` (same subject, a different claim) and `past_versions`; the agent decides. Text that is not a
   fact (JSON, tool or chat-role markup, instruction-like phrasing, invisible characters, long blobs, >1000
   characters) is refused with the reason.
 - **stats** (what is stored and how much of it was ever recalled), **export** (Markdown view), **review**
@@ -85,6 +87,49 @@ In `config.yaml` under `plugins.hermes-memory-store`:
 - Every recall action honours `min_trust` (default `min_trust_threshold`).
 - **contradict**: candidate conflicts, i.e. pairs about the same subject that make a similar but not identical
   claim ("lives in Paris" / "lives in London"). It suggests; it never edits.
+
+### History, sources and forgetting (0.8.0)
+
+A fact that stops being current is not overwritten. The agent says what happened, and the store keeps the history:
+
+| action | when | effect |
+|---|---|---|
+| `change {fact_id, content, valid_from?}` | it changed (moved, new job, new price) | the old text becomes a past version of the **same** fact id |
+| `end {fact_id, valid_to?}` | it no longer holds and nothing replaces it | the fact leaves the current store; its history stays |
+| `correct {fact_id, content?, valid_from?}` | it was wrong | the wrong version is never shown as the past |
+| `revert {fact_id}` | undo the last change, correction or end | the previous version is current again |
+| `forget {fact_id}` | the user asks to forget it | deleted for good, every version included; only a tombstone without text stays |
+
+- **Ordinary recall sees only the present.** Past versions live in their own table and index; `search` and `list`
+  read them only with `as_of=YYYY-MM-DD` ("what held on that date"). The answer separates `results` (known to hold
+  then) from `undetermined` (may have held: a start or an end that is not known to the day). The store invents no
+  dates: a fact without `valid_from` is known to hold from the day it was recorded, and so is every fact stored
+  before 0.8.0.
+- **`history {fact_id}`** lists the versions with their dates, status and source.
+- **Source.** Each version records where it was written: via (`tool`, `auto_extract`, `mirror`), platform, chat
+  type, chat and thread id, session, and the author of the turn. Chat names are not stored.
+- **Forget means gone.** The fact, its versions, links and orphaned entities are deleted, both search indexes are
+  rebuilt, the file is rewritten (`VACUUM`, with `secure_delete` on) and the write-ahead log emptied, so no copy of the
+  text stays in free pages. A tombstone (the id and keyed hashes, never the text) stops auto-extraction from bringing
+  the fact back from old messages and tells other tools which ids to clean from their own copies.
+- Older prompts keep working: `add supersedes=X` is `change X` (the id now stays `X`), `update content=` is `correct`,
+  `remove` is `forget`.
+
+The full contract, including what the plugin cannot clean (Hermes's own session database, `hermes backup`
+archives): [docs/history.md](docs/history.md).
+
+### Nightly dreaming: hermes-dreaming
+
+The store keeps what the agent was told; it does not decide what deserves to become a permanent memory.
+[hermes-dreaming](https://github.com/itpartypattaya/hermes-dreaming) (in the Hermes plugin catalog as
+`hermes-dreaming`) does that at night, deterministically and without its own model calls: an optional extraction job
+stores candidate facts here through `fact_store`, and the nightly pass reads this store read-only, corroborates each
+fact with what people actually said in their chats, proposes the few worth writing to `MEMORY.md` / `USER.md`, asks
+whether old entries still hold, and gives facts without keywords their keywords. With 0.8.0 the two work as one: a
+human's "no longer true", "that was wrong" or "forget it" to a dream question becomes `end`, `correct` or `forget`
+here, and after a `forget` the dream removes its own copies of the fact (cache, diary lines, its cron logs) by the
+tombstone's id. Use hermes-dreaming 2.4.0 or later with this release: cron jobs may write facts only from 0.8.0 on
+(`cron_writes`).
 
 ## Languages
 
@@ -234,10 +279,14 @@ main sets of all fourteen languages run in CI (`tests/test_holographic_languages
 
 - Facts live in one SQLite file (`db_path`), in the Hermes home of the profile, readable by its owner only (POSIX
   `0600`). Nothing is sent anywhere. A `db_path` outside the Hermes home is listed for `hermes backup`.
-- Subagents, cron jobs and flush contexts read the store but never write to it (facts, feedback, counters,
-  extraction).
+- Subagents and flush contexts read the store but never write to it (facts, feedback, counters, extraction). A cron
+  job writes only through its explicit tool calls (`cron_writes`, on by default); nothing automatic.
 - With `auto_extract` on, user messages matching the preference/decision patterns are stored at session end.
 - `retrieval_count` counts how often a fact was handed to the model; nothing else is tracked.
+- Each version keeps its source: platform, chat type, chat / thread / session id and the author of the turn (id and
+  display name). Chat names are not kept. `forget` deletes the source with the fact.
+- `forget` deletes a fact for good (see [History](#history-sources-and-forgetting-080)); copies outside this database
+  (Hermes's session transcripts, backups, other tools' caches) are not the plugin's to rewrite.
 - Dependencies: `numpy` (HRR algebra) and `snowballstemmer` (word forms; pure Python). Without numpy the provider
   works with keyword search only and says so in its prompt block; without snowballstemmer words compare exactly.
 
@@ -249,6 +298,12 @@ versions (including the copy bundled in Hermes core) keep reading and writing th
 file an older one wrote to, it reconciles: missing keys are filled in, entities with the same key are merged (links,
 aliases and names kept), aliases of entities the older version deleted are dropped, and vectors whose size does not
 match `hrr_dim` are re-encoded. Only a writable agent does this; subagents, cron and flush contexts never migrate.
+
+0.8.0 adds `fact_versions` (with its own FTS index) and `forgotten`; `facts` keeps its columns, so older versions
+and tools that read `facts` directly keep working, and see only current facts. A file an older version wrote to is
+reconciled on open: a fact without a version gets one (start unknown, source unknown), a text changed by an older
+`update` becomes a new version with the old one closed, and a fact an older `remove` deleted is forgotten (its history
+deleted, a tombstone written). See [docs/history.md](docs/history.md#migration-and-older-versions-on-the-same-file).
 
 What is tested: this release, then 0.1.1, then this release on one database in CI (adds, edits, removals, aliases, a
 keyless duplicate entity written by 0.1.1), plus the reconciliation cases above. What a downgrade does not keep:
