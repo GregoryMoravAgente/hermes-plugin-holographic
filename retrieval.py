@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from .store import MemoryStore
 
 from . import holographic as hrr
+from . import text as _text
 from .history import CLOSED, version_state
 from .text import (CJK_NEGATORS, CLAIM_WORDS, CONTRASTIVE, NEGATORS, UNSEGMENTED, analyze, content_chars,
                    content_keys, content_stems, gram_coverage, is_greeting, is_sea, query_grams, query_terms, run_grams,
@@ -96,22 +97,36 @@ class FactRetriever:
             return None
 
     def search(self, query: str, category: str | None = None, min_trust: float = 0.3, limit: int = 10,
-               corpus: _Corpus | None = None) -> list[dict]:
+               corpus: _Corpus | None = None, roots: bool = True) -> list[dict]:
         """FTS5 candidates (limit*3) → Jaccard + HRR rerank → trust weighting → optional temporal decay
         0.5^(age_days / half_life). Returns fact dicts with 'score', sorted desc. *corpus*: the current facts by
-        default; search_as_of passes the versions of a date."""
+        default; search_as_of passes the versions of a date. *roots*=False matches words exactly, as 0.8.0 did (the
+        candidates of write_check: a word of the same root must not crowd a conflict out)."""
         corpus = corpus or self._current
         key = corpus.key
         terms = query_terms(query or "")
         candidates = {f[key]: f for f in self._fts_candidates(query, category, min_trust, limit * 3, corpus)
-                      if self._contains_a_term(terms, f)}
+                      if self._contains_a_term(terms, f, exact=not roots)}
+        extra = " OR ".join(e for e in (t.fts_extra() for t in terms if t.fts_ok) if e) if roots else ""
+        if extra:  # words of the same root: only what the words' own forms missed, ranked below them
+            for fact in self._fts_query(extra, category, min_trust, limit * 3, corpus):
+                if fact[key] not in candidates and self._contains_a_term(terms, fact):
+                    fact["fts_rank"] *= _text._DERIV_WEIGHT
+                    candidates[fact[key]] = fact
         for fact in self._ngram_candidates(query, category, min_trust, limit * 3, corpus):
             if fact[key] not in candidates or candidates[fact[key]].get("fts_rank", 0) < fact["fts_rank"]:
                 candidates[fact[key]] = fact
-        for fact in self._scan_candidates(terms, category, min_trust, limit * 3, corpus):
+        for fact in self._scan_candidates(terms, category, min_trust, limit * 3, corpus, exact=not roots):
             candidates.setdefault(fact[key], fact)  # fills in what FTS cannot see; FTS ranks what it found
+        # BM25 does not see roots: a fact holding "Марина" and "по ночам" ranks with every other fact about Marina for
+        # "ночная подработка Марины", and "The walker" matches the prefix "walk"* as fully as a fact with "walk". When
+        # any candidate meets any term only through a root (its own or the fact's), all of them are ranked by the
+        # weighted share of the query they hold, which counts the root at _DERIV_WEIGHT (as as_of always is).
         if corpus is not self._current:
             self._corpus_rank(query, terms, list(candidates.values()), category, min_trust, corpus)
+        elif roots and any(0.0 < t.match(analyze(f'{f.get("content", "")} {f.get("tags") or ""}')) < 1.0
+                           for f in candidates.values() for t in terms):
+            self._coverage_rank(query, terms, list(candidates.values()))
         return self._rerank(query, list(candidates.values()), limit)
 
     def _corpus_rank(self, query: str, terms, candidates: list[dict], category, min_trust, corpus: _Corpus) -> None:
@@ -131,7 +146,22 @@ class FactRetriever:
         for fact in candidates:
             text = f'{fact.get("content", "")} {fact.get("tags") or ""}'
             analysis = analyze(text)
-            share = sum(w for t, w in weight.items() if t.found_in(analysis)) / total if total else 0.0
+            share = sum(w * t.match(analysis) for t, w in weight.items()) / total if total else 0.0
+            fact["fts_rank"] = max(share, gram_coverage(grams, text.lower()) if grams else 0.0)
+
+    def _coverage_rank(self, query: str, terms, candidates: list[dict]) -> None:
+        """The same weighted share for the current facts, cheaply: document frequencies from the FTS index (one COUNT
+        per term, as the recall gate takes them), the share computed on the candidates only, not on every fact."""
+        total_facts = max(self.store.count_facts(), 1)
+        df = {t: self._doc_freq(t) for t in terms}
+        weight = {t: math.log(1.0 + total_facts / df[t]) for t in terms if df[t]}
+        if not weight:
+            return
+        total = sum(weight.values()) + sum(1 for t in terms if not df[t]) * min(weight.values())
+        grams = query_grams(query)
+        for fact in candidates:
+            text = f'{fact.get("content", "")} {fact.get("tags") or ""}'
+            share = sum(w * t.match(analyze(text)) for t, w in weight.items()) / total
             fact["fts_rank"] = max(share, gram_coverage(grams, text.lower()) if grams else 0.0)
 
     def search_as_of(self, query: str, day: str, category: str | None = None, min_trust: float = 0.3,
@@ -159,13 +189,14 @@ class FactRetriever:
         return {"as_of": day, "results": held[:limit], "undetermined": undetermined[:limit]}
 
     @staticmethod
-    def _contains_a_term(terms, fact: dict) -> bool:
-        """A stem prefix ("walk"*) also matches other words ("walker"): keep a candidate only when it really contains
-        a query term (same word, same stem, or the same identifier with word boundaries)."""
+    def _contains_a_term(terms, fact: dict, exact: bool = False) -> bool:
+        """A stem prefix ("contra"*) also matches other words: keep a candidate only when it really contains a query
+        term (same word, same stem, the same identifier with word boundaries, or, unless *exact*, a word of the same
+        root)."""
         if not terms:
             return True
         analysis = analyze(f'{fact.get("content", "")} {fact.get("tags") or ""}')
-        return any(t.found_in(analysis) for t in terms)
+        return any(t._exact(analysis) if exact else t.found_in(analysis) for t in terms)
 
     def _texts(self, category: str | None = None, min_trust: float | None = None,
                corpus: _Corpus | None = None) -> list[tuple[int, float, object]]:
@@ -221,7 +252,7 @@ class FactRetriever:
         return [dict(r) for r in self.store.read(sql, params)]
 
     def _scan_candidates(self, terms, category: str | None, min_trust: float, limit: int,
-                         corpus: _Corpus | None = None) -> list[dict]:
+                         corpus: _Corpus | None = None, exact: bool = False) -> list[dict]:
         """Facts containing the query's scan terms (Arabic, Indic, Indonesian: words whose other forms the FTS5
         index cannot find), matched word by word against the text of every fact and ranked by the IDF-weighted share
         of those terms they contain ('fts_rank'). A scan, like the n-gram path: milliseconds at the size this store
@@ -231,16 +262,17 @@ class FactRetriever:
         if not scan:
             return []
         texts = self._texts(category, min_trust, corpus)
-        found = [(rid, trust, [t for t in scan if t.found_in(a)]) for rid, trust, a in texts]
+        strength = (lambda t, a: float(t._exact(a))) if exact else (lambda t, a: t.match(a))
+        found = [(rid, trust, {t: s for t in scan if (s := strength(t, a))}) for rid, trust, a in texts]
         df = {t: sum(t in hit for _, _, hit in found) for t in scan}
         weight = {t: math.log(1.0 + len(texts) / df[t]) for t in scan if df[t]}
         total = sum(weight.values()) or 1.0
         # ties: the more trusted fact, then the newer one
-        ranked = sorted(((sum(weight[t] for t in hit) / total, trust, rid) for rid, trust, hit in found if hit),
-                        reverse=True)[:limit]
+        ranked = sorted(((sum(weight[t] * s for t, s in hit.items()) / total, trust, rid) for rid, trust, hit in found
+                         if hit), reverse=True)[:limit]
         rank = {rid: score for score, _, rid in ranked}
         rows = [f for f in self._rows([rid for _, _, rid in ranked], category, min_trust, corpus)
-                if self._contains_a_term(scan, f)]
+                if self._contains_a_term(scan, f, exact=exact)]
         for fact in rows:
             fact["fts_rank"] = rank[fact[corpus.key]]
         return rows
@@ -254,19 +286,17 @@ class FactRetriever:
         grams = query_grams(query)
         if not grams:
             return []
-        # content and tags: the agent's keywords (kept in tags) are searched like the text
-        hits = " + ".join(f"(instr(lower(content || ' ' || COALESCE(tags, '')), ?) > 0) * {weight}" for _, weight in grams)
-        sql = (f"SELECT * FROM (SELECT f.*, ({hits}) AS gram_hits FROM {corpus.source} f WHERE f.trust_score >= ?"
-               + (" AND f.category = ?" if category else "") + ") WHERE gram_hits > 0 ORDER BY gram_hits DESC LIMIT ?")
-        rows = self.store.read(sql, [*(g for g, _ in grams), *corpus.params, min_trust,
-                                     *([category] if category else []), limit])
+        # Matched against each fact's folded text (content and tags: the agent's keywords are searched like the text),
+        # so Traditional and Simplified characters meet; the analysis is cached per fact, as for the word scan.
         total = sum(weight for _, weight in grams)
-        results = []
-        for row in rows:
-            fact = dict(row)
-            fact["fts_rank"] = fact.pop("gram_hits") / total
-            results.append(fact)
-        return results
+        texts = self._texts(category, min_trust, corpus)
+        ranked = sorted(((sum(w for g, w in grams if g in a.text) / total, trust, rid) for rid, trust, a in texts),
+                        reverse=True)
+        rank = {rid: score for score, _, rid in ranked[:limit] if score > 0}
+        rows = self._rows(list(rank), category, min_trust, corpus)
+        for fact in rows:
+            fact["fts_rank"] = rank[fact[corpus.key]]
+        return sorted(rows, key=lambda f: f["fts_rank"], reverse=True)
 
     def _rerank(self, query: str, candidates: list[dict], limit: int) -> list[dict]:
         query_tokens = content_stems(query)
@@ -472,8 +502,13 @@ class FactRetriever:
     # -- prefetch relevance --------------------------------------------------------------------------------------
 
     def _doc_freq(self, term) -> int:
+        """Facts that may hold the term: its own forms, and the words of its root when it has any (the population the
+        coverage counts it in: "ночные" is weighed by every fact with a night word, not only by the one that says
+        "ночные")."""
+        extra = term.fts_extra()
+        expression = term.fts(_FTS_OPERATORS) if not extra else f"({term.fts(_FTS_OPERATORS)} OR {extra})"
         try:
-            return int(self.store.read("SELECT COUNT(*) FROM facts_fts WHERE facts_fts MATCH ?", (term.fts(_FTS_OPERATORS),))[0][0])
+            return int(self.store.read("SELECT COUNT(*) FROM facts_fts WHERE facts_fts MATCH ?", (expression,))[0][0])
         except Exception:
             return 0
 
@@ -495,7 +530,7 @@ class FactRetriever:
             char_weights = self._char_weights(content_chars(query))
             char_total = sum(char_weights.values())
             for f in candidates:
-                text = f'{f.get("content", "")} {f.get("tags") or ""}'.lower()
+                text = analyze(f'{f.get("content", "")} {f.get("tags") or ""}').text  # lower-cased and folded
                 char_cov = sum(w for c, w in char_weights.items() if c in text) / char_total if char_total else 0.0
                 if gram_coverage(grams, text) >= min_coverage or char_cov >= max(0.5, min_coverage):
                     gram_kept.append(f)
@@ -527,9 +562,12 @@ class FactRetriever:
             analysis = analyze(f'{fact.get("content", "")} {fact.get("tags") or ""}')
             if identifiers and not any(t.found_in(analysis) for t in identifiers):
                 continue  # a message naming pve-01 or v0.21.6 is about that, not about pve-010
-            matched = [t for t in weights if t.found_in(analysis)]
-            if any(t.identifier for t in matched) or sum(weights[t] for t in matched) / total >= min_coverage \
-                    or fact in gram_kept:
+            strength = {t: t.match(analysis) for t in weights}  # 1.0 the word itself, _DERIV_WEIGHT its root
+            # A root alone never recalls: suffix rules cannot tell a derivation from a look-alike ("войной" / "вой",
+            # "полный" / "пол"), so a fact needs a word of the message itself, and its roots only add to that.
+            exact = any(s == 1.0 for s in strength.values())
+            if any(t.identifier and s for t, s in strength.items()) or fact in gram_kept \
+                    or (exact and sum(weights[t] * s for t, s in strength.items()) / total >= min_coverage):
                 kept.append(fact)
         return kept
 
@@ -538,11 +576,11 @@ class FactRetriever:
         one that is present (it still says what the message is about)."""
         if not chars:
             return {}
-        total = max(self.store.count_facts(), 1)
+        texts = [a.text for _, _, a in self._texts()]  # folded: 醫 counts where 医 is written
+        total = max(len(texts), 1)
         weights, missing = {}, []
         for c in chars[:16]:
-            df = self.store.read("SELECT COUNT(*) FROM facts WHERE instr(lower(content || ' ' || COALESCE(tags, '')), ?) > 0",
-                                 (c,))[0][0]
+            df = sum(1 for t in texts if c in t)
             if df:
                 weights[c] = math.log(1.0 + total / df)
             else:
@@ -614,7 +652,7 @@ class FactRetriever:
         candidate_ids = {r[0] for r in self.store.read(
             "SELECT DISTINCT fact_id FROM fact_entities WHERE entity_id IN ({}) AND fact_id != ? ORDER BY fact_id DESC LIMIT 50".format(
                 ",".join("?" * len(own_entities)) or "NULL"), [*own_entities, fact_id])}
-        candidate_ids |= {f["fact_id"] for f in self.search(content, min_trust=0.0, limit=10)} - {fact_id}
+        candidate_ids |= {f["fact_id"] for f in self.search(content, min_trust=0.0, limit=10, roots=False)} - {fact_id}
         if not candidate_ids:
             return {"similar": [], "possible_conflicts": [],
                     "past_versions": self._past_versions(fact_id, content, content_keys(content), limit)}
@@ -644,6 +682,18 @@ class FactRetriever:
         by_overlap = lambda xs: sorted(xs, key=lambda e: e["word_overlap"], reverse=True)[:limit]  # noqa: E731
         return {"similar": by_overlap(similar), "possible_conflicts": by_overlap(conflicts),
                 "past_versions": self._past_versions(fact_id, content, own_keys, limit)}
+
+    def near_duplicate(self, content: str) -> int | None:
+        """A current fact that says nearly what *content* says — write_check's "similar" (word overlap of 0.7 or
+        more, the same polarity), checked before anything is stored — or None. A possible conflict is not a duplicate:
+        "the budget is 500" / "the budget is 600" is a change."""
+        own_keys, own_claim = content_keys(content), self._claim(content, set())
+        for other in self.search(content, min_trust=0.0, limit=10, roots=False):
+            other_claim = self._claim(other["content"], set())
+            if soft_jaccard(own_keys, content_keys(other["content"])) >= 0.7 and own_claim[1] == other_claim[1] \
+                    and self._conflicting(own_claim, other_claim) < 0.3:
+                return other["fact_id"]
+        return None
 
     def _past_versions(self, fact_id: int, content: str, own_keys, limit: int) -> list[dict]:
         """Closed versions (changed / ended, never corrected) of other facts that say nearly the same: "a fact that

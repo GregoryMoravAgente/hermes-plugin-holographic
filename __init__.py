@@ -122,13 +122,33 @@ _EXTRACT_CATEGORIES = (
       re.compile(r'\bmy\s+(?:favorite|favourite|preferred|default)\s+\w+\s+is\s+\S', re.IGNORECASE),
       re.compile(r'\bI\s+(?:always|never|usually)\s+\S', re.IGNORECASE),
       re.compile(r'(?:^|\s)я\s+(?:предпочитаю|люблю|использую|пользуюсь|хочу|обычно|всегда|никогда|не\s+ем|не\s+пью)\s+\S', re.IGNORECASE),
-      re.compile(r'(?:^|\s)мо[йяеи]\s+любим\w+\s+\S', re.IGNORECASE)], "user_pref"),
+      re.compile(r'(?:^|\s)мо[йяеи]\s+любим\w+\s+\S', re.IGNORECASE),
+      # Chinese, Traditional and Simplified (after itpartypattaya/hermes-plugin-holographic#2 by au61987ai-code). The
+      # sentence must open with the preference — "I" or no subject — so "你喜歡什麼" (what do YOU like) and "他喜歡吃辣"
+      # (HE likes spicy food) are not the user's; "不用" (no need) and "我覺得 / 以我來看" (passing opinions) are left out.
+      re.compile(r'^(?:我|本人)?(?:也|還是|还是|一直|通常|比較|比较|較|较|更)?'
+                 r'(?:偏好|習慣|习惯|喜歡|喜欢|愛用|爱用|傾向|倾向|會先?選用|会先?选用)[^。；！？?\n]{2,40}'),
+      re.compile(r'^(?:我|本人)(?:一律|向來|向来|總是|总是|從不|从不|不習慣|不习惯|不接受|不再)[^。；！？?\n]{2,40}')],
+     "user_pref"),
     ([re.compile(r'\bwe\s+(?:decided|agreed|chose)\s+\S', re.IGNORECASE),
       re.compile(r'\bthe\s+project\s+(?:uses|needs|requires)\s+\S', re.IGNORECASE),
       re.compile(r'(?:^|\s)мы\s+(?:решили|договорились|выбрали)\s+\S', re.IGNORECASE),
-      re.compile(r'(?:^|\s)в\s+проекте\s+(?:используем|используется|нужен|нужна|нужно)\s+\S', re.IGNORECASE)], "project"),
+      re.compile(r'(?:^|\s)в\s+проекте\s+(?:используем|используется|нужен|нужна|нужно)\s+\S', re.IGNORECASE),
+      # Chinese: an explicit deciding subject ("你必須先備份" is an order to the assistant, not a decision), or the
+      # project / its rules as the subject, as "the project uses …" is in English.
+      re.compile(r'^(?:我們|我们|大家|團隊|团队|雙方|双方)(?:已經|已经|最後|最后|一致)?'
+                 r'(?:決定|决定|決議|决议|達成共識|达成共识|商定|約定好|约定好)[^。；！？?\n]{2,60}'),
+      re.compile(r'^(?:這個|这个|本|我們的|我们的)?(?:專案|项目|項目)(?:裡|里|中)?'
+                 r'(?:使用|採用|采用|需要|必須用|必须用|一律用|統一用|统一用)[^。；！？?\n]{2,40}'),
+      re.compile(r'^(?:這個|这个|本|我們的|我们的)?(?:專案|项目|項目)?的?'
+                 r'(?:命名規則|命名规则|命名規範|命名规范|規範|规范|慣例|惯例)(?:是|為|为|採用|采用)[^。；！？?\n]{2,40}')],
+     "project"),
 )
-_RE_SENTENCE = re.compile(r"[^.!?\n]+[.!?]?")
+# A sentence ends at . ! ? and Chinese 。；！？; a dot followed by a non-space is inside it ("Python 3.12",
+# "topic.md", "v0.21.6")
+_RE_SENTENCE = re.compile(r"(?:[^.!?\n。；！？]|\.(?=\S))+[.!?。；！？]?")
+# A question is never a fact to keep: "Do I always need a visa?", "我們決定了嗎？"
+_RE_QUESTION = re.compile(r"[?？]\s*$|[嗎吗呢]\s*[。.]?\s*$")
 _EXTRACT_MAX_CHARS = 300
 
 # What a fact must not be. Facts are injected into later prompts, so instructions and tool transcripts stored as
@@ -686,7 +706,8 @@ class HolographicMemoryProvider(MemoryProvider):
             target = self._open(key) if key is not None else None
         if target:
             author = turn_author if turn_author is not None else self._author
-            self._auto_extract_facts([{"role": "user", "content": user_content}], target[0], author=author)
+            self._auto_extract_facts([{"role": "user", "content": user_content}], target[0], author=author,
+                                     retriever=target[1])
 
     @_serialized
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
@@ -1053,10 +1074,14 @@ class HolographicMemoryProvider(MemoryProvider):
         "fact_feedback": lambda self, a: self._feedback(a),
     }
 
-    def _auto_extract_facts(self, messages: list, store: MemoryStore, author: dict | None = None) -> None:
+    def _auto_extract_facts(self, messages: list, store: MemoryStore, author: dict | None = None,
+                            retriever: FactRetriever | None = None) -> None:
         """Store user sentences that state a preference or decision. A sentence the user asked to forget (a
         tombstone) or one that is a past version of a fact (changed, ended or corrected away) is skipped: old
-        messages must not bring it back."""
+        messages must not bring it back. So is a question, and a restatement of a fact the store already holds
+        (write_check's "similar", checked before storing: the fact_store add action shows it to the agent, an
+        unattended extractor has nobody to show it to; a possible conflict is a change and is kept)."""
+        retriever = retriever or (self._retriever if store is self._store else None)
         # Compaction handoff summaries arrive as role="user" and match the decision patterns; never store the
         # compactor's own output as a fact. A merge-into-tail row holds genuine prior user text BEFORE
         # _MERGED_SUMMARY_DELIMITER (after the header) and the summary AFTER it — harvest only that segment.
@@ -1074,13 +1099,16 @@ class HolographicMemoryProvider(MemoryProvider):
             if not isinstance(content, str) or len(content) < 10:
                 continue
             for sentence in (m.group(0).strip() for m in _RE_SENTENCE.finditer(content)):
-                if len(sentence) < 10 or len(sentence) > _EXTRACT_MAX_CHARS or _fact_problem(sentence):
+                if len(sentence) < 10 or len(sentence) > _EXTRACT_MAX_CHARS or _fact_problem(sentence) \
+                        or _RE_QUESTION.search(sentence):
                     continue
                 for patterns, category in _EXTRACT_CATEGORIES:
                     if any(p.search(sentence) for p in patterns):
                         try:
                             if store.forgotten_match(sentence) or store.past_version(
                                     sentence, statuses=("changed", "ended", "corrected")):
+                                break
+                            if retriever is not None and retriever.near_duplicate(sentence) is not None:
                                 break
                             if store.add_fact_status(sentence, category=category, trust=extract_trust,
                                                      source=self._source("auto_extract", author))[1]:

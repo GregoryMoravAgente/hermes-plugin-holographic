@@ -7,7 +7,9 @@ script, from the function words the text uses ("the", "el", "le", "o", "yang": E
 Indonesian); Latin text with none of them gets the stems of all five. Stems come from Snowball (English, Russian,
 Spanish, French, Portuguese, Indonesian, Hindi), Larkey's light10 for Arabic (as in Lucene) next to Snowball's, and a
 light suffix stripper for Bengali. Folding drops Latin accents, Arabic vowel marks and letter variants and the Indic
-nukta, and turns native digits into ASCII. A stem is a search key, not a dictionary lemma. Identifiers (anything with
+nukta, and turns native digits into ASCII. A stem is a search key, not a dictionary lemma. Russian and English
+words also get root keys (word_roots: "ночные" / "ночь", "teacher" / "teaches"), matched at _DERIV_WEIGHT in search and
+recall, never in duplicate checks. Identifiers (anything with
 a digit, or a dotted / pathed token) are never stemmed and never stopwords. Chinese, Japanese, Korean and the scripts
 of Southeast Asia are compared by character n-grams instead (see UNSEGMENTED)."""
 
@@ -17,6 +19,8 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from functools import cached_property, lru_cache
+
+from .cjk_fold import SIMPLIFIED, TRADITIONAL
 
 try:  # pure Python, BSD; optional: without it words compare exactly (Arabic and Bengali keep their light stemmers)
     import snowballstemmer
@@ -29,6 +33,10 @@ except ImportError:  # pragma: no cover - exercised only without the dependency
 PUNCT = ".,;:!?\"'()[]{}#@<>«»“”„…"
 _MIN_STEM = 3  # shorter stems match too much as prefixes ("ма*")
 _LOOSE_FROM, _LOOSE_MIN = 7, 5  # stems this long also match on their first len-2 (at least 5) letters
+_SHORT_LOOSE = True  # Russian stems of _SHORT_FROM-6 letters also match on their first len-1 letters ("покупа" / "покупк")
+_SHORT_FROM = 6  # not five: "больш(ой)" would leave "боль", which begins "больница"
+_ROOTS = True  # same-root keys: "ночь" / "ночной", "город" / "городской", "teach" / "teacher"
+_DERIV_WEIGHT = 0.6  # a same-root word or a shorter shared beginning counts this much of an exact match
 
 # -- scripts and folding -----------------------------------------------------------------------------------------
 
@@ -69,6 +77,10 @@ _FOLD = str.maketrans({
     "়": None, "ঁ": None,  # Bengali nukta and candrabindu
     **{chr(base + d): str(d) for base in (0x660, 0x6F0, 0x966, 0x9E6) for d in range(10)},  # native digits
 })
+# Traditional Chinese characters compare as Simplified ones (學校 = 学校, 醫院 = 医院): a Taiwan user's fact and a mainland
+# user's question, or the other way round, share their characters. OpenCC's table (cjk_fold.py); stored text unchanged.
+_HAN_FOLD = True
+_FOLD_HAN = {**_FOLD, **str.maketrans(TRADITIONAL, SIMPLIFIED)}
 
 
 def _fold_text(text: str) -> str:
@@ -82,13 +94,14 @@ def _fold_text(text: str) -> str:
         else:
             latin = c.isascii() or _script(c) == "latin"
         out.append(c)
-    return unicodedata.normalize("NFC", "".join(out)).translate(_FOLD)
+    return unicodedata.normalize("NFC", "".join(out)).translate(_FOLD_HAN if _HAN_FOLD else _FOLD)
 
 
 @lru_cache(maxsize=65536)
 def fold(word: str) -> str:
     """Comparison form of a lower-cased word: Latin accents dropped ("está" = "esta"), Arabic vowel marks, tatweel and
-    letter variants normalised (أ إ آ -> ا, ى -> ي, ة -> ه), the Indic nukta dropped, native digits as ASCII."""
+    letter variants normalised (أ إ آ -> ا, ى -> ي, ة -> ه), the Indic nukta dropped, native digits as ASCII, Traditional
+    Chinese characters as Simplified."""
     return _fold_text(word)
 
 
@@ -168,6 +181,12 @@ STOP = {
 }
 STOPWORDS = frozenset().union(*STOP.values())
 
+# Question words that say nothing about the subject of a QUESTION ("какая сегодня погода": "какая" met "как" in every
+# fact that says "считать как …"), but are part of a statement ("Иван знает, почему" is not "Иван знает, куда"): left
+# out of a query's terms only, never out of a fact's words, duplicate or conflict checks.
+QUERY_ONLY_STOP = _folded("""какой какая какое какие какого какому каким каком какую каких какими каков который которая
+    которое которые которого которой которому которым котором которую которых сколько куда откуда почему зачем""")
+
 NEGATORS = _folded("""nicht kein keine keinen keinem keiner nie niemals nichts
     not no never nobody nothing cannot don't doesn't didn't isn't aren't wasn't weren't won't can't
     couldn't shouldn't haven't hasn't dont doesnt didnt isnt cant wont не нет никогда ни nunca jamás tampoco nadie
@@ -213,8 +232,89 @@ GREETINGS = frozenset(_greeting_key(g) for g in """
     ขอบคุณมากครับ|ขอบคุณมากค่ะ|ราตรีสวัสดิ์""".split("|"))
 
 
+# Pieces a courtesy message is made of in English and Russian, beyond the whole greetings above: thanks, sign-offs,
+# reactions, "how are you"-questions and the words that pad them ("today", "there", "so much"). A message whose every
+# clause is a run of these pieces ("Hi, good morning!", "Thanks a lot, that's all for now", "Good morning! How are you
+# today?", "спасибо, на этом всё") asks nothing. A clause with any other word ("how is Tim doing at school") is a
+# question. Compared like GREETINGS (no case, accents, spaces or punctuation inside a clause).
+COURTESY = frozenset(_greeting_key(g) for g in """
+    good|morning|afternoon|evening|night|day|hi|hello|hey|heya|hiya|yo|sup|whatsup|howdy|there|all|everyone|guys|
+    team|folks|mate|buddy|dear|again|today|tonight|so|much|a lot|very|too|really|
+    thanks|thank you|thx|ty|cheers|appreciate it|much appreciated|you're welcome|no problem|np|no worries|
+    that's all|that's it|for now|all good|all set|ok|okay|k|kk|great|cool|nice|awesome|perfect|excellent|super|
+    sounds good|got it|understood|noted|sure|yes|yeah|yep|no|nope|lol|haha|hahaha|hehe|wow|oh|ah|hm|hmm|
+    see you|see ya|see you later|see you tomorrow|bye|goodbye|bye bye|take care|talk later|later|
+    have a nice day|have a good day|have a great day|have a good one|have a good evening|have a good night|
+    have a good weekend|have a nice weekend|happy friday|happy monday|happy weekend|happy holidays|
+    how are you|how are you doing|how are things|how's it going|how is it going|how have you been|what's new|
+    how's your day|how's your day going|how is your day going|how was your day|how's your week|how's your week going|
+    how was your weekend|how's everything|you good|well done|good job|nice one|
+    sleep well|sweet dreams|fine|i'm fine|i'm good|and you|you too|same to you|have a great weekend|have a great week|
+    have a nice week|have a good week|happy weekend|happy birthday|congrats|congratulations|good luck|
+    добрый|доброе|доброго|утро|утра|день|дня|вечер|вечера|ночи|привет|приветик|приветствую|здравствуй|здравствуйте|
+    хай|всем|всех|ребята|друзья|еще раз|ещё раз|снова|сегодня|
+    спасибо|спс|благодарю|большое|огромное|пожалуйста|не за что|отлично|супер|класс|круто|здорово|прекрасно|понятно|
+    ясно|хорошо|ок|окей|ладно|договорились|принято|понял|поняла|ага|угу|да|нет|ха|хаха|ахах|ахаха|лол|ого|ух ты|
+    на этом всё|на этом все|это всё|это все|пока всё|пока все|всё|все|пока|до встречи|до завтра|увидимся|до связи|
+    хорошего дня|хорошего вечера|хороших выходных|спокойной ночи|удачи|всего доброго|
+    как дела|как ты|как вы|как у тебя дела|как у вас дела|как поживаешь|как поживаете|как прошёл день|как прошел день|
+    как твой день|как настроение|что нового|как сам|как сама|как твоя неделя|как прошла неделя|как выходные|
+    как прошли выходные|с пятницей|с праздником|с выходными|с днём рождения|с днем рождения|поздравляю|
+    сладких снов|спи спокойно|и тебе|и вам|взаимно|у меня всё хорошо|у меня все хорошо|нормально|""".split("|"))
+_CLAUSE = re.compile(r"[.,;:!?…\n\r]+")
+# Pieces that only pad a courtesy ("good", "day", "today", "fine", "сегодня", "всё"): a clause of these alone is a
+# question or an answer ("fine?" about a fine, "сегодня?" about a lesson), not small talk.
+_COURTESY_PADDING = frozenset(_greeting_key(g) for g in """
+    good|afternoon|evening|night|day|there|all|everyone|guys|team|folks|mate|buddy|dear|again|today|tonight|so|much|
+    a lot|very|too|really|fine|later|
+    добрый|доброе|доброго|утра|день|дня|вечер|вечера|ночи|всем|всех|ребята|друзья|еще раз|ещё раз|снова|сегодня|
+    большое|огромное|всё|все|пока|нормально""".split("|"))
+
+
+def _clause_cuts(clause: str) -> tuple[str, frozenset]:
+    """The clause folded as _greeting_key folds it, and the positions a piece may start or end at: word boundaries,
+    and any position next to a character of a script written without spaces (Chinese, Japanese, Thai)."""
+    folded = _fold_text(unicodedata.normalize("NFC", clause).lower())
+    key, cuts, gap = [], {0}, True
+    for c in folded:
+        if c.isalnum() or unicodedata.category(c)[0] == "M":
+            if key and (gap or UNSEGMENTED.match(c) or UNSEGMENTED.match(key[-1])):
+                cuts.add(len(key))
+            key.append(c)
+            gap = False
+        else:
+            gap = True
+    cuts.add(len(key))
+    return "".join(key), frozenset(cuts)
+
+
+@lru_cache(maxsize=4096)
+def _courtesy_clause(clause: str) -> int:
+    """0: the clause is not made of greeting and courtesy pieces alone (pieces start and end at word boundaries, so
+    "history" is not "hi" + "story"); 1: it is, of padding only; 2: it is, with a greeting, thanks, sign-off, reaction
+    or "how are you"."""
+    key, cuts = _clause_cuts(clause)
+    pieces = COURTESY | GREETINGS
+    longest = max(len(p) for p in pieces)
+    best = [-1] * (len(key) + 1)  # best[i]: -1 unreachable, 1 padding only, 2 with a real courtesy piece
+    best[0] = 1
+    for end in sorted(cuts):
+        for start in sorted(c for c in cuts if end - longest <= c < end):
+            piece = key[start:end]
+            if best[start] > 0 and piece in pieces:
+                best[end] = max(best[end], best[start], 1 if piece in _COURTESY_PADDING else 2)
+    return max(best[len(key)], 0) if key else 0
+
+
 def is_greeting(text: str) -> bool:
-    return _greeting_key(text) in GREETINGS
+    """A whole-message greeting, or a message every clause of which is made only of greeting and courtesy pieces, with
+    at least one that is more than padding ("Hi, good morning!", "Thanks, that's all for now", "спасибо, на этом всё";
+    not "fine?" or "сегодня?")."""
+    if _greeting_key(text) in GREETINGS:
+        return True
+    clauses = [c for c in _CLAUSE.split(text or "") if _greeting_key(c)]
+    kinds = [_courtesy_clause(c) for c in clauses]
+    return bool(kinds) and all(kinds) and max(kinds) == 2
 
 
 def is_identifier(token: str) -> bool:
@@ -302,6 +402,96 @@ def _keys(word: str, langs: tuple[str, ...]) -> frozenset:
     return frozenset(keys)
 
 
+# -- same-root words ---------------------------------------------------------------------------------------------
+# Snowball removes inflection and some derivation, not all: "ночь" is "ноч" but "ночные" is "ночн"; "teacher",
+# "swimmer" and "dentist" stay apart from "teach", "swim" and "dental". A root key strips one or two derivational
+# suffixes off the stem, so the noun, the adjective, the verb and the agent noun of one root meet. A root is a real
+# beginning of the word (the FTS prefix query finds the other forms), and a match through it counts _DERIV_WEIGHT of an
+# exact one. Alternating consonants ("друг" / "дружба", "собака" / "собачий") are not joined.
+_NOT_RUSSIAN = re.compile(r"[іїєґў]")  # Ukrainian and Belarusian letters
+_RU_ADJ = re.compile(r"(?:ый|ий|ой|ая|яя|ое|ее|ые|ие|ого|его|ому|ему|ым|им|ых|их|ую|юю|ыми|ими)$")
+_RU_VERB = re.compile(r"(?:ть|ться|тся|ет|ют|ут|ит|ат|ят|ем|ешь|ишь|ете|ите|ется|ится|ются|утся|ятся|ла|ло|ли|лся|"
+                      r"лась|лись)$")
+_RU_VERBAL_NOUN = re.compile(r"ни(?:е|я|ю|ем|и|й|ям|ями|ях)$")
+_RU_ADJ_SUFFIXES = ("ическ", "еск", "ск", "енн", "онн", "ичн", "ов", "ев", "ив", "н")
+_EN_SUFFIXES = ("ist", "ian", "er", "or", "al", "ic")
+# -er words that are not "one who …": "mother" is not one who moths, "summer" not one who sums
+_EN_NOT_AGENT = frozenset("""mother father brother sister daughter water number summer winter corner paper letter order
+    member other under after never over ever together weather power matter answer finger dinner butter tower flower
+    river silver center centre monster master chapter cancer danger hunger anger manner banner border shoulder
+    ladder filter shower sweater copper hammer wonder rubber pepper oyster lobster liver offer cover enter remember
+    consider deliver discover gather former latter outer inner upper lower proper super tiger spider timber lumber
+    minister register semester character temper litter corridor mirror horror error color colour honor honour
+    favor favour labor labour humor humour mayor motor tractor doctor actor sector factor vendor""".split())
+
+
+def word_roots(word: str, stem_: str, lang: str) -> frozenset:
+    """Root keys of a folded word whose stem in *lang* is *stem_* (Russian and English; empty for other languages)."""
+    if not _ROOTS or not stem_ or is_identifier(word):
+        return frozenset()
+    if lang == "ru":
+        return _ru_roots(word, stem_)
+    if lang == "en":
+        return _en_roots(word, stem_)
+    return frozenset()
+
+
+@lru_cache(maxsize=65536)
+def _ru_roots(word: str, stem_: str) -> frozenset:
+    out = set()
+
+    def keep(s: str) -> str:
+        s = s[:-1] if s.endswith("ь") else s
+        if len(s) >= _MIN_STEM and s != stem_:
+            out.add(s)
+        return s
+
+    if _RU_VERBAL_NOUN.search(word) and stem_[-2:] in ("ен", "ан") and len(stem_) >= 5:  # плаван(ие) → плав
+        keep(stem_[:-2])
+    elif _RU_ADJ.search(word):  # ночн(ые) → ноч, городск(ой) → город, банковск(ий) → банков → банк, школьн(ый) → школ
+        s = stem_
+        for _ in range(2):
+            cut = next((x for x in _RU_ADJ_SUFFIXES if s.endswith(x) and len(s) - len(x) >= _MIN_STEM), "")
+            if not cut:
+                break
+            s = keep(s[:-len(cut)])
+    elif _RU_VERB.search(word) and stem_[-1:] in ("а", "я", "и", "е") and len(stem_) >= 4:  # плава(ет) → плав
+        keep(stem_[:-3] if stem_[-3:] in ("ова", "ева", "ыва", "ива") and len(stem_) >= 6 else stem_[:-1])
+    elif stem_.endswith("ост") and len(stem_) >= 6:  # сладост(и) → слад
+        keep(stem_[:-3])
+    elif stem_.endswith("ниц"):  # учительниц(а) → учитель
+        keep(stem_[:-3])
+    elif stem_.endswith(("ник", "чик")) and len(stem_) >= 6:  # праздник → праздн, как праздничн(ый)
+        keep(stem_[:-2])
+    elif stem_.endswith("к") and (len(stem_) >= 5 or stem_.endswith("чк")):  # соседк(а) → сосед, дочк(а) → доч; банк — нет
+        keep(stem_[:-1])
+    return frozenset(out)
+
+
+@lru_cache(maxsize=65536)
+def _en_roots(word: str, stem_: str) -> frozenset:
+    """One step off the Porter2 stem, never two: teacher → teach, swimmer → swim, driver → drive, dentist / dental →
+    dent, electrician → electric, investor → invest, photographi → photograph (battery stops at batter, not bat;
+    general at gener, not gene). Words and stems in _EN_NOT_AGENT get none ("mothers" is not "moths")."""
+    if word in _EN_NOT_AGENT or stem_ in _EN_NOT_AGENT:
+        return frozenset()
+    out = set()
+    if stem_.endswith("i") and len(stem_) >= 7:  # Porter2 writes a final -y as -i: photographi, allergi, veterinari;
+        out.add(stem_[:-1])                      # not every → ever, party → part, Sophie → soph
+    else:
+        cut = next((x for x in _EN_SUFFIXES if stem_.endswith(x) and len(stem_) - len(x) >= 3), "")
+        agent = cut in ("er", "or")
+        if cut:
+            s = stem_[:-len(cut)]
+            doubled = agent and len(s) >= 4 and s[-1] == s[-2] and s[-1] not in "aeiouls"
+            s = s[:-1] if doubled else s  # swimm → swim, runn → run
+            if len(s) >= 4 or (agent and len(s) >= 3):
+                out.add(s)
+                if agent and not doubled and s[-1] not in "aeiouy" and s[-2:-1] in tuple("aeiou"):
+                    out.add(s + "e")  # driv → drive, bak → bake, writ → write (a doubled letter says no -e: swimmer)
+    return frozenset(r for r in out if len(r) >= 3 and r != stem_)
+
+
 # -- tokenisation --------------------------------------------------------------------------------------------------
 
 # French/Italian elision: "d'Eva", "l'offre", "qu'on" are Eva, offre, on.
@@ -377,6 +567,8 @@ class Word:
     identifier: bool
     scan: bool  # matched against the facts' text: the FTS5 index cannot find its other forms
     fts: bool = True  # the FTS5 index can find the word itself (not Arabic or Indic script)
+    roots: frozenset = frozenset()  # same-root keys (word_roots), compared at _DERIV_WEIGHT
+    root_lang: str = ""  # "en" / "ru" when the word's language is determined: roots are built and compared only then
 
 
 @dataclass(frozen=True)
@@ -387,6 +579,8 @@ class Analysis:
     text: str  # folded, lower-cased text, for boundary matches
     langs: tuple  # languages of the Latin words (all of LATIN when undetermined)
     german: bool = False  # determined German: its compounds end in the word they name ("Familienkatze" is a Katze)
+    roots: frozenset = frozenset()  # (language, root key) of every word (search and recall only, not duplicate checks)
+    lang_keys: frozenset = frozenset()  # (language, key) of the words whose language is determined
 
 
 def _stop(word: str, script: str, votes: dict, sentence: bool) -> bool:
@@ -421,7 +615,12 @@ def analyze(text: str) -> Analysis:
     # Spanish, French, Portuguese and Indonesian write compound words with a hyphen; English text and text of no
     # determined language keep letters-only hyphenated tokens as identifiers ("hr-ovh")
     compounds = determined and "en" not in langs
-    words, bag, keys = [], set(), set()
+    english = determined and "en" in langs  # a tie ("on" is English and French) still includes English
+    # Cyrillic is Russian for roots unless the text has letters Russian does not (Ukrainian, Belarusian): the Russian
+    # suffix rules would join "головний" (main) with "гол" (goal)
+    russian = _NOT_RUSSIAN.search(lowered) is None
+    lang_keys = set()
+    words, bag, keys, roots = [], set(), set(), set()
     for group in groups:
         raw, extra = _resolve_hyphen(group, langs, determined) if "-" in group else (group, [])
         word, script, ident = fold(raw), word_script(raw), is_identifier(raw)
@@ -429,21 +628,29 @@ def analyze(text: str) -> Analysis:
             ident = False  # "week-end", "sexta-feira", "rendez-vous": a compound word, not a host name
         unsegmented = UNSEGMENTED.search(raw) is not None
         word_langs = () if ident or unsegmented else langs if script == "latin" else _SCRIPT_LANGS.get(script, ())
+        is_stop = not ident and not unsegmented and _stop(word, script, votes, len(latin) >= 4)
         word_keys = _keys(word, word_langs) if word_langs else frozenset({word})
         bag.add(word)
         keys |= word_keys
         for piece in (fold(e) for e in extra):  # the whole and the parts of a hyphenated word, for containment
             bag.add(piece)
             keys |= _keys(piece, word_langs) if word_langs and _letters_only(piece) else {piece}
+        root_lang = "" if is_stop or ident or unsegmented or "-" in word else \
+            "en" if script == "latin" and english else "ru" if script == "cyrillic" and russian else ""
+        word_roots_ = word_roots(word, stem(word, root_lang), root_lang) - word_keys if root_lang else frozenset()
+        if root_lang:
+            roots |= {(root_lang, r) for r in word_roots_}
+            lang_keys |= {(root_lang, k) for k in word_keys}
         words.append(Word(
             text=word, stem=stem(word, word_langs[0]) if word_langs else word, keys=word_keys,
-            stop=not ident and not unsegmented and _stop(word, script, votes, len(latin) >= 4), identifier=ident,
+            stop=is_stop, identifier=ident,
             # Indonesian prefixes (me-, di-, ber-) hide a word from a prefix query; text of undetermined language
             # might be Indonesian
             scan=script in _SCAN_SCRIPTS or (script == "latin" and ("id" in word_langs or "de" in word_langs)),
-            fts=script not in _SCAN_SCRIPTS))
+            fts=script not in _SCAN_SCRIPTS, roots=word_roots_, root_lang=root_lang))
     return Analysis(tuple(words), frozenset(bag), frozenset(keys), _fold_text(lowered), langs,
-                    german=determined and "de" in langs and "en" not in langs)
+                    german=determined and "de" in langs and "en" not in langs, roots=frozenset(roots),
+                    lang_keys=frozenset(lang_keys))
 
 
 def name_keys(name: str) -> tuple[tuple[frozenset, bool], ...]:
@@ -515,19 +722,19 @@ UNSEGMENTED = re.compile(r"[฀-໿က-႟ក-៿]+|[぀-ヿ㐀-䶿一-鿿豈-�
 _SEA = re.compile(r"[฀-໿က-႟ក-៿]")
 # Chinese function characters (particles, pronouns, question words, auxiliaries). A gram made only of them (可以, 什么,
 # 怎么, 我们) carries no topic; a gram with one of them carries half; others carry full weight.
-CJK_FUNCTION = frozenset("的是了吗呢吧啊呀哦嗯么怎什哪谁几多少在有和与及或就都也还要会能可以把被给让对为从到这那你我他她它们个一不没很太该应些吗嘛"
-                         "はがをにのでともへやかねよなだ")  # + Japanese particles and copula
+CJK_FUNCTION = frozenset(_fold_text("的是了吗呢吧啊呀哦嗯么怎什哪谁几多少在有和与及或就都也还要会能可以把被给让对为从到这那你我他她它们个一不没很太该应些吗嘛"
+                         "はがをにのでともへやかねよなだ"))  # + Japanese particles and copula
 # Thai function words: a trigram inside them carries no topic, one touching them half (Thai letters, unlike Chinese
 # characters, mean nothing alone, so Thai is weighted by words found in the run, longest first).
 _TH_FUNCTION = sorted(set("""ของ ที่ และ ใน กับ ไม่ ได้ จะ แล้ว ไหม อะไร ยังไง อย่างไร คือ เป็น มี ให้ ครับ ค่ะ คะ นะ เลย ด้วย แบบ
     ไหน เท่าไหร่ กี่ ว่า ก็ หรือ แต่ จาก ถึง เรา ฉัน ผม คุณ เขา นี้ นั้น หน่อย ควร""".split()), key=len, reverse=True)
 # Whole runs that are chat fillers, as "ok", "yes", "thanks" are in the English list: they recall nothing.
-FILLER_RUNS = frozenset("""はい うん ええ いいえ 了解 了解です りょうかい オーケー ありがとう ありがとうございます お願い お願いします
+FILLER_RUNS = frozenset(_fold_text(w) for w in """はい うん ええ いいえ 了解 了解です りょうかい オーケー ありがとう ありがとうございます お願い お願いします
     よろしく そう そうです わかった わかりました 네 예 응 아니 아니요 좋아 좋아요 그래 그래요 알겠어 알겠어요 알겠습니다 오케이
     고마워 고마워요 감사 감사합니다 부탁해 부탁해요 ครับ ค่ะ คะ นะ จ้ะ จ้า โอเค ได้ ได้เลย ใช่ ขอบคุณ ขอบคุณครับ ขอบคุณค่ะ
     ขอบคุณมาก""".split())
 _HAN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
-CJK_NEGATORS = frozenset("不没无别非未")
+CJK_NEGATORS = frozenset(_fold_text("不没无别非未"))
 _MAX_GRAMS = 32
 # Bengali, Arabic-Indic, Persian and Devanagari digits: the FTS5 index keeps them as written, so a number is also
 # searched in each of them ("2027" finds "২০২৭"); folding makes the comparison itself digit-agnostic.
@@ -570,7 +777,7 @@ def query_grams(text: str) -> list[tuple[str, float]]:
     """Weighted substrings to look for when *text* contains unsegmented script: its content n-grams, plus the Latin
     words and identifiers written into it ("HR24", "hr-ovh", "Python"), which the tokenizer glues to the
     neighbouring characters. Lower-cased; weight-0 grams dropped; [] for text without unsegmented script."""
-    lowered = (text or "").lower()
+    lowered = _fold_text((text or "").lower())
     if not UNSEGMENTED.search(lowered):
         return []
     grams: dict[str, float] = {}
@@ -589,18 +796,18 @@ def content_chars(text: str) -> list[str]:
     """Distinct Chinese characters (also in Japanese text) that carry meaning: no function characters or negators.
     Kana, Hangul and Thai are left out: their characters are sounds, not words."""
     chars = []
-    for run in UNSEGMENTED.findall((text or "").lower()):
+    for run in UNSEGMENTED.findall(_fold_text((text or "").lower())):
         if run not in FILLER_RUNS:
             chars += [c for c in run if _HAN.match(c) and c not in CJK_FUNCTION and c not in CJK_NEGATORS]
     return list(dict.fromkeys(chars))
 
 
 def gram_coverage(grams: list[tuple[str, float]], text: str) -> float:
-    """Weighted share of the grams present in *text* (case-insensitive)."""
+    """Weighted share of the grams present in *text* (case-insensitive, folded as the grams are)."""
     total = sum(w for _, w in grams)
     if not total:
         return 0.0
-    lowered = (text or "").lower()
+    lowered = _fold_text((text or "").lower())
     return sum(w for g, w in grams if g in lowered) / total
 
 
@@ -621,6 +828,8 @@ class Term:
     keys: frozenset = frozenset()
     scan: bool = False
     fts_ok: bool = True
+    roots: frozenset = frozenset()  # same-root keys, matched at _DERIV_WEIGHT
+    root_lang: str = ""  # the language its roots (and the fact's) are compared in; "": no root matching
 
     @property
     def loose(self) -> str:
@@ -630,6 +839,15 @@ class Term:
         if self.identifier or len(self.tokens) != 1 or len(self.stem) < _LOOSE_FROM or word_script(self.word) != "cyrillic":
             return ""
         return self.stem[:max(_LOOSE_MIN, len(self.stem) - 2)]
+
+    @property
+    def short_loose(self) -> str:
+        """The same for Russian stems of six letters, one letter shorter ("покупа" / "покупк" share "покуп",
+        "работа" / "рабоч" share "рабо"); matched at _DERIV_WEIGHT, since a four-letter beginning says less."""
+        if not _SHORT_LOOSE or self.identifier or len(self.tokens) != 1 or not _SHORT_FROM <= len(self.stem) < _LOOSE_FROM \
+                or self.root_lang != "ru":
+            return ""
+        return self.stem[:-1]
 
     def fts(self, operators: dict | None = None) -> str:
         """FTS5 expression built only from operator-free tokens: the exact word (a phrase when it splits into
@@ -645,6 +863,17 @@ class Term:
                           if len(k) >= _MIN_STEM and k.translate(FTS_OPERATORS) == k and k.split() == [k])
         parts = [f'"{p}"*' for p in prefixes] + ([] if self.word in prefixes else [exact])
         return parts[0] if len(parts) == 1 else "(" + " OR ".join(parts) + ")"
+
+    def fts_extra(self) -> str:
+        """FTS5 expression of the root keys and the short beginning only, "" when there are none. A separate query:
+        OR-ed into fts() it would score a fact that has the word itself twice (the root prefix matches it too) and
+        push it above facts that answer better; here it only brings in facts the word's own forms miss."""
+        if self.identifier or len(self.tokens) != 1 or self.tokens[0] != self.word:
+            return ""
+        prefixes = sorted(k for k in self.roots | ({self.short_loose} if self.short_loose else set())
+                          if len(k) >= _MIN_STEM and k.translate(FTS_OPERATORS) == k and k.split() == [k])
+        parts = [f'"{p}"*' for p in prefixes]
+        return "" if not parts else parts[0] if len(parts) == 1 else "(" + " OR ".join(parts) + ")"
 
     @cached_property
     def _bounded(self) -> re.Pattern:
@@ -670,9 +899,31 @@ class Term:
         return tuple(k for k in self.keys if len(k) >= 4)
 
     def found_in(self, fact: Analysis) -> bool:
-        """Does a fact contain this term: the same word, a shared key (word or stem), the loose beginning, or (for
-        identifiers and multi-token words) the same token run with word boundaries, so "pve-01" does not match
-        inside "pve-010"."""
+        """Does a fact contain this term, exactly or through a word of the same root (see match)."""
+        return self.match(fact) > 0.0
+
+    def match(self, fact: Analysis) -> float:
+        """How a fact contains this term: 1.0 for the word itself, a shared key, the loose beginning or the same
+        identifier; _DERIV_WEIGHT for a word of the same root ("ночные" / "ночь", "teacher" / "teaches") or the
+        short beginning of a middle-length Russian stem; 0.0 for none."""
+        if self._exact(fact):
+            return 1.0
+        if self.identifier or len(self.tokens) != 1:
+            return 0.0
+        lang = self.root_lang
+        if lang and fact.roots | fact.lang_keys:  # only roots and keys of the same, determined language meet
+            fact_roots = {r for lng, r in fact.roots if lng == lang}
+            if (self.roots and not self.roots.isdisjoint(k for lng, k in fact.lang_keys if lng == lang)) \
+                    or (fact_roots and not (self.keys | self.roots).isdisjoint(fact_roots)):
+                return _DERIV_WEIGHT
+        short = self.short_loose  # Russian only, so against the fact's Russian words only (not "покупки" in Ukrainian)
+        if short and short in fact.text and any(lng == "ru" and k.startswith(short) for lng, k in fact.lang_keys):
+            return _DERIV_WEIGHT
+        return 0.0
+
+    def _exact(self, fact: Analysis) -> bool:
+        """The same word, a shared key (word or stem), the loose beginning, or (for identifiers and multi-token
+        words) the same token run with word boundaries, so "pve-01" does not match inside "pve-010"."""
         if self.word in fact.bag:
             return True
         if not self.identifier and len(self.tokens) <= 1 and not self.keys.isdisjoint(fact.keys):
@@ -692,7 +943,7 @@ def query_terms(text: str) -> list[Term]:
     """Distinct informative terms of a natural-language query, in order of appearance."""
     seen, terms = set(), []
     for w in analyze(text).words:
-        if w.stop or (not w.identifier and len(w.text) < 2):
+        if w.stop or w.text in QUERY_ONLY_STOP or (not w.identifier and len(w.text) < 2):
             continue
         tokens = tuple(w.text.translate(FTS_OPERATORS).split())
         if not tokens:
@@ -701,5 +952,6 @@ def query_terms(text: str) -> list[Term]:
         key = w.stem if single else w.text
         if key not in seen:
             seen.add(key)
-            terms.append(Term(w.text, key, w.identifier, tokens, w.keys if single else frozenset({w.text}), w.scan, w.fts))
+            terms.append(Term(w.text, key, w.identifier, tokens, w.keys if single else frozenset({w.text}), w.scan, w.fts,
+                              w.roots if single else frozenset(), w.root_lang if single else ""))
     return terms

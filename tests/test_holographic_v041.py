@@ -262,8 +262,17 @@ def test_queries_are_safe_without_the_stemmer(store, caplog, monkeypatch, query)
 
 
 def test_prefix_matches_are_validated(store):
-    store.add_fact("The walker has boots")
-    assert _r(store).search("walk", min_trust=0) == []
+    store.add_fact("The cart has wheels")
+    assert _r(store).search("car", min_trust=0) == []
+
+
+def test_same_root_word_ranks_below_the_word_itself(store):
+    # 0.9.0: "walker" is a word of the same root as "walk" (a bare prefix match before 0.4.1, then dropped); it is
+    # found, below a fact with the word itself.
+    walker = store.add_fact("The walker has boots")
+    walk = store.add_fact("A long walk every Sunday")
+    found = [f["fact_id"] for f in _r(store).search("the walk", min_trust=0)]  # English: roots need the language
+    assert found == [walk, walker]
 
 
 def test_unknown_words_count_against_relevance(tmp_path):

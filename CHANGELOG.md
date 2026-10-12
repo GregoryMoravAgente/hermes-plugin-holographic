@@ -1,5 +1,79 @@
 # Changelog
 
+## 0.9.0 — 2026-10-13
+
+Words of the same root meet in Russian and English; Traditional and Simplified Chinese meet; small talk recalls less;
+auto-extraction understands Chinese.
+
+### Added
+
+- **Same-root words.** Snowball removes inflection but keeps derivations apart: "ночные" is `ночн`, "ночь" is `ноч`;
+  "teacher" stays `teacher`. A root key strips derivational suffixes off the stem: Russian adjective, verbal-noun, verb
+  and diminutive suffixes (`ночные` / `ночь`, `городской` / `город`, `плавание` / `плавает`); in English one step only,
+  agent nouns, -ist, -ian, -al, -ic and Porter2's -i (`teacher` / `teaches`, `swimmer` / `swims`, `dentist` /
+  `dental`, `photography` / `photograph`; `battery` stops at `batter`, not `bat`). Russian stems of six letters also
+  match on their first five (`покупа` / `покупк`). Roots are built only for text whose language is determined —
+  English by its function words (a tie that includes English counts), Russian for Cyrillic without Ukrainian or
+  Belarusian letters — and a word's roots and beginnings meet only words of the same language, so Spanish `comer`,
+  French `le lit` and Ukrainian `головний` join nothing.
+- **A root never recalls on its own.** Suffix rules cannot tell a derivation from a look-alike (`войной` / `вой`,
+  `полный` / `пол`, `летает` / `лето`), so automatic recall needs at least one word of the message itself in the fact;
+  roots then add 0.6 of a word (`_DERIV_WEIGHT`) to its coverage. In `search` a root brings in facts the word's own
+  forms missed, through a separate FTS5 query (OR-ed into the main one, a fact holding the word would match the root
+  prefix too and score twice), and whenever any candidate meets any term only through a root — its own or the
+  fact's — the candidates are ranked by the IDF-weighted share of the query they hold, below facts with the word
+  itself. A term with roots is weighed by every fact that may hold it (its forms or its root).
+- **Traditional and Simplified Chinese meet.** Traditional characters compare as Simplified ones everywhere text is
+  compared (search, recall, duplicate checks, function characters and fillers): `學校` finds `学校`, `醫院` finds `医院`.
+  The table (`cjk_fold.py`, 3,222 single characters, the preferred value of each, chains resolved) is derived from
+  OpenCC ver.1.4.2 `TSCharacters.txt`, Apache-2.0 (`LICENSES/OpenCC-Apache-2.0.txt`). Stored text keeps its script.
+  The n-gram scan moved from SQL `instr` to the facts' cached analysis, so it sees folded text: at 5,000 Chinese facts
+  the first search after start takes about 1.5 s, later ones 0.12 s with recall (0.42 s in 0.8.0).
+- **Courtesy messages.** A message whose every clause is made of greetings, thanks, sign-offs, reactions and "how are
+  you" pieces, at least one of them more than padding, recalls nothing: "Hi, good morning!", "Thanks, that's all for
+  now", "Good night, sleep well", "спасибо, на этом всё", "Как твоя неделя?", and the whole-message greetings of every
+  language combined ("hola, buenos días"). Pieces start and end at word boundaries ("history" is not "hi" + "story");
+  padding alone is a question ("fine?" about a library fine, "сегодня?" about a lesson), and so is a clause with any
+  other word ("доброе утро, во сколько балет?").
+- **Chinese auto-extraction** (`auto_extract`, off by default), after
+  [#2](https://github.com/itpartypattaya/hermes-plugin-holographic/pull/2) by @au61987ai-code — thank you. Preference,
+  habit, decision and project-rule sentences in Traditional and Simplified Chinese; `。；！？` end a sentence. A
+  preference must open the sentence ("I" or no subject: `你喜歡什麼` and `他喜歡吃辣` are not the user's); `不用` (no
+  need), `不會` and passing opinions (`以我來看`) are left out; a project statement needs a deciding subject or the
+  project / its naming rules as the subject (`這個文件是我寫的` is not a rule).
+
+### Changed
+
+- **Auto-extraction**, every language: a question is never stored (`?`, `？`, `嗎 / 吗 / 呢` at the end); a dot followed
+  by a non-space no longer ends a sentence (`Python 3.12`, `topic.md` were cut in half); a sentence that restates a
+  fact the store already holds (write_check's `similar`, checked before anything is written; a possible conflict is a
+  change and is stored) is skipped. #2 removed the stored copy instead, which since 0.8.0 would be a forget (erase,
+  tombstone, consumers scrubbing) and would block the sentence from ever being extracted again.
+- Russian question words (`какой / какая …`, `который …`, `сколько`, `куда`, `откуда`, `почему`, `зачем`) are left out of
+  a query's terms, as English `what / which / how / why` are function words: "какая" met "как" in every fact that says
+  "считать как …", so "какая сегодня погода" recalled five facts of a live store. They stay in facts: "Иван знает,
+  почему" and "Иван знает, куда" are different facts for the duplicate check.
+- "the walk" finds "The walker" again, as a word of the same root, below facts with "walk" itself. A bare prefix still
+  does not count ("car" does not find "cart"); one word without context ("walk") is of no determined language and gets
+  no roots.
+- `write_check` collects its candidates with exact words only (`search(..., roots=False)`, scan included), so a word of
+  the same root cannot crowd a conflict out of them; duplicate and conflict overlaps never use roots.
+
+### Measured
+
+Blind sets by agents that never saw the code (README, Languages). Same-root words, second Russian and English set:
+Russian first 45 → 55 %, found 55 → 60 %, recalled 55 → 55 %; English first 60 → 60 %, found 70 → 75 %, recalled
+60 → 60 %. Small talk, a fresh set (30 small-talk messages and 15 questions per language): quiet English 50 → 67 %,
+Russian 63 → 70 %; questions found 100 % before and after. Every earlier set of the 14 languages gives the 0.8.0
+numbers, except the Russian unseen set's one miss ("во сколько ночные бэкапы"), now found (not recalled: the fact
+shares only a root with it), and one more extra fact recalled in one language of the Japanese / Korean / Thai /
+German set. Chinese, a fresh set with facts in both scripts: questions in the other script found and recalled
+33 → 100 %; all questions first 55 → 75 %, recalled 50 → 70 %; small talk quiet 80 % both. 432 tests against a
+hermes-agent 0.21.6 core. Two independent reviews (Codex CLI): the first found look-alike joins, language leaks, a
+ranking and a weighting fault and a `write_check` side effect; the second, padding-only courtesy, question words lost
+from duplicate checks and a capital-letter name rule that lost ordinary words ("Baby" / "babies") — removed, it gained
+nothing measurable. Each is fixed and its examples are tests.
+
 ## 0.8.0 — 2026-10-12
 
 The store keeps the history of every fact, records where each version came from, and makes "forget" final.

@@ -137,3 +137,109 @@ def test_helper_detects_prefix_metadata_and_merged_forms():
     )
     assert not is_compaction_summary_message(_user(DECISION_MSG))
     assert not is_compaction_summary_message(_user(""))
+
+
+# ---------------------------------------------------------------------------
+# Chinese extraction, questions, restatements (0.9.0; the Chinese patterns, the full-width terminators and dropping a
+# restatement come from itpartypattaya/hermes-plugin-holographic#2 by au61987ai-code, adapted to 0.8.0's forgetting)
+# ---------------------------------------------------------------------------
+
+ZH_PREFERENCE = "我偏好簡潔且可驗證的解法，不要過度工程。"
+ZH_HABITUAL = "我一律使用繁體中文回覆，不會用簡體。"
+ZH_DECISION = "我們決定專案以 Julia 作為唯一的模擬核心。"
+ZH_DECLARATIVE = "命名規則是先日期後主題，再加版本號。"
+
+
+@pytest.mark.parametrize("message,expected_category", [
+    (ZH_PREFERENCE, "user_pref"),
+    (ZH_HABITUAL, "user_pref"),
+    (ZH_DECISION, "project"),
+    (ZH_DECLARATIVE, "project"),
+    ("我习惯用简体中文回复所有的消息。", "user_pref"),
+    ("我们决定项目统一使用 Python 3.12。", "project"),
+    ("项目使用 PostgreSQL 作为主数据库。", "project"),
+])
+def test_zh_extraction_stores_the_sentence_under_the_right_category(tmp_path, message, expected_category):
+    provider = _make_provider(tmp_path, auto_extract=True)
+    provider.on_session_end([_user(message)])
+    facts = provider._store.list_facts(limit=100)
+    assert [f["content"] for f in facts] == [message]
+    assert facts[0]["category"] == expected_category
+    provider.shutdown()
+
+
+def test_zh_full_width_terminators_split_a_paragraph_into_one_fact_per_clause(tmp_path):
+    provider = _make_provider(tmp_path, auto_extract=True)
+    provider.on_session_end([_user("我偏好繁體中文的回覆內容。我也偏好簡單直接的解法！我們決定使用 Julia 語言。")])
+    assert _fact_contents(provider) == ["我偏好繁體中文的回覆內容。", "我也偏好簡單直接的解法！",
+                                        "我們決定使用 Julia 語言。"]
+    provider.shutdown()
+
+
+def test_zh_sentence_is_stored_under_one_category_only(tmp_path):
+    provider = _make_provider(tmp_path, auto_extract=True)
+    provider.on_session_end([_user("我們決定命名規則是 YYMMDDNN-topic.md，這是專案的固定規則。")])
+    assert len(provider._store.list_facts(limit=100)) == 1
+    provider.shutdown()
+
+
+@pytest.mark.parametrize("message", [
+    "我不太確定這個能不能用，先看看再說吧。",        # uncertainty
+    "你知道為什麼會這樣嗎？",                       # a question
+    "你必須先備份資料庫再動手，不得跳過。",           # an order to the assistant
+    "你好，今天天氣不錯，出去走走吧。",               # chit-chat
+    "請幫我檢查一下這個檔案的內容。",                 # a request
+    "你喜歡什麼樣的音樂和電影呢？",                  # someone else's preference, and a question
+    "他喜歡吃辣的食物，每天都要。",                   # someone else's preference
+    "我不用了，謝謝你的幫忙喔。",                    # "no need, thanks"
+    "以我來看這個方案其實還不錯。",                   # a passing opinion
+    "這個文件是我昨天晚上寫的。",                     # "I wrote this document", not a project rule
+    "我們決定好要去哪裡吃飯了嗎",                     # a question without a question mark
+])
+def test_zh_utterances_that_are_not_durable_facts_are_not_stored(tmp_path, message):
+    provider = _make_provider(tmp_path, auto_extract=True)
+    provider.on_session_end([_user(message)])
+    assert _fact_contents(provider) == []
+    provider.shutdown()
+
+
+def test_a_question_is_not_extracted_in_any_language(tmp_path):
+    provider = _make_provider(tmp_path, auto_extract=True)
+    provider.on_session_end([_user("Do I always need a visa for Japan? Мы решили ехать в июле?")])
+    assert _fact_contents(provider) == []
+    provider.shutdown()
+
+
+def test_a_restatement_is_not_stored_again_and_leaves_no_tombstone(tmp_path):
+    # Checked before storing: dropping a stored copy would be a forget in 0.8.0 (erase, tombstone, scrubs downstream)
+    provider = _make_provider(tmp_path, auto_extract=True)
+    provider.on_session_end([_user("I prefer green tea without sugar in the morning.")])
+    provider.on_session_end([_user("I prefer green tea without sugar in the mornings.")])
+    assert len(_fact_contents(provider)) == 1
+    assert provider._store.read("SELECT COUNT(*) FROM forgotten")[0][0] == 0
+    provider.shutdown()
+
+
+def test_a_change_is_not_a_restatement(tmp_path):
+    provider = _make_provider(tmp_path, auto_extract=True)
+    provider.on_session_end([_user("We decided the monthly budget is 500 dollars.")])
+    provider.on_session_end([_user("We decided the monthly budget is 600 dollars.")])
+    assert len(_fact_contents(provider)) == 2
+    provider.shutdown()
+
+
+def test_a_dot_inside_a_word_does_not_end_the_sentence(tmp_path):
+    provider = _make_provider(tmp_path, auto_extract=True)
+    provider.on_session_end([_user("We decided to pin Python 3.12 and keep notes in topic.md files. I prefer tea.")])
+    assert sorted(_fact_contents(provider)) == ["I prefer tea.",
+                                                "We decided to pin Python 3.12 and keep notes in topic.md files."]
+    provider.shutdown()
+
+
+def test_zh_restatement_is_not_stored_again(tmp_path):
+    # Both sentences are extracted on their own; the second says nearly what the first does
+    provider = _make_provider(tmp_path, auto_extract=True)
+    provider.on_session_end([_user("我偏好所有回覆一律使用繁體中文與台灣用語。")])
+    provider.on_session_end([_user("我偏好所有的回覆都一律使用繁體中文與台灣用語。")])
+    assert _fact_contents(provider) == ["我偏好所有回覆一律使用繁體中文與台灣用語。"]
+    provider.shutdown()

@@ -39,7 +39,7 @@ In `config.yaml` under `plugins.hermes-memory-store`:
 | Key | Default | Description |
 |-----|---------|-------------|
 | `db_path` | `$HERMES_HOME/memory_store.db` | SQLite database path |
-| `auto_extract` | `false` | Store user sentences that state a preference or decision (English, Russian) at session end and before context compression, at trust 0.4 |
+| `auto_extract` | `false` | Store user sentences that state a preference or decision (English, Russian, Chinese) at session end and before context compression, at trust 0.4; questions and restatements of a stored fact are skipped |
 | `mirror_memory_writes` | `false` | Also store every built-in memory `add` (MEMORY.md / USER.md) as a fact |
 | `default_trust` | `0.5` | Trust score of a new fact |
 | `min_trust_threshold` | `0.3` | Facts below this trust are not recalled |
@@ -161,12 +161,33 @@ A word matches another when they share its plain form or its stem in the languag
 - **German compounds**: a word matches the end of a compound in German text (`Katze` finds `Familienkatze`, `Laptop`
   finds `Arbeitslaptop`). A compound in the question is not taken apart (`Erdnussallergie` does not find `allergisch
   gegen Erdnüsse`).
+- **Words of the same root** (Russian and English, 0.9.0): Snowball removes inflection but keeps derivations apart.
+  A root key strips derivational suffixes off the stem: Russian adjective, verbal-noun, verb and diminutive suffixes
+  (`ночные` / `ночь`, `городской` / `город`, `плавание` / `плавает`), English agent nouns, -ist, -ian, -al, -ic and -y,
+  one step only (`teacher` / `teaches`, `swimmer` / `swims`, `dentist` / `dental`, `photography` / `photograph`).
+  Russian stems of six letters also match on their first five (`покупа` / `покупк`). Only in text whose language is
+  determined (English by its function words; Cyrillic without Ukrainian or Belarusian letters), and only within that
+  language. A root counts 0.6 of the word itself and **never recalls a fact on its own**: suffix rules cannot tell a
+  derivation from a look-alike (`войной` / `вой`, `полный` / `пол`), so automatic recall needs a word of the message
+  itself, and roots add to it. In `search` a root brings in facts the word's forms missed and ranks them below facts
+  with the word. Not joined: alternating consonants and prefixes (`друг` / `дружба`, `страховка` / `застрахован`),
+  four-letter beginnings (`большое` is not `больница`). Duplicate and conflict checks do not use roots.
+- **Courtesy** (0.9.0): a message whose every clause is greetings, thanks, sign-offs, reactions or "how are you",
+  at least one of them more than padding, recalls nothing ("Hi, good morning!", "Thanks, that's all for now",
+  "спасибо, на этом всё", and any combination of the whole-message greetings of every language). Pieces start and end
+  at word boundaries; padding alone ("fine?", "сегодня?") is a question. Russian question words (`какой`, `который`,
+  `сколько`, `почему` …) are left out of a query's terms, like English `what` / `which` / `how`, but kept in facts.
 - **Names** in Latin script are matched as written (and with an English `'s`): `Jean` is not mentioned by `jeans`.
   Names in other scripts carry their inflections (`Маши` mentions `Маша`, `لإيفا` mentions `إيفا`).
 - **Chinese, Japanese, Korean, Thai** (no spaces between words): character n-grams, bigrams for Chinese, Japanese and
   Korean, trigrams for Thai. Grammar weighs less: Chinese function characters (的 是 了), Japanese particles (は が を
   に の), Thai function words (ของ ที่ และ); a message that is only a filler (はい, 네, โอเค) recalls nothing. Chinese
   characters (also in Japanese) count one by one as well; kana, Hangul and Thai letters, which are sounds, do not.
+  Traditional characters compare as Simplified ones (0.9.0): `學校` finds `学校`, `醫院` finds `医院`, so a fact a Taiwan
+  or Hong Kong user wrote meets a mainland user's question and the other way round; the stored text keeps its script.
+  The table is OpenCC's (`cjk_fold.py`, 3,222 characters, Apache-2.0, [licence](LICENSES/OpenCC-Apache-2.0.txt)). The
+  n-gram scan reads the facts' folded text, analysed once per fact: at 5,000 Chinese facts the first search after start
+  takes about 1.5 s, later ones 0.12 s with recall (0.42 s in 0.8.0, whose scan ran in SQL).
 - **Arabic, Indic scripts, Indonesian and German** are also matched word by word against the text of the facts (so are
   Latin words of a question of undetermined language, when the store holds Indonesian or German facts): the SQLite FTS5
   index splits Indic words at their vowel signs and cannot see past Arabic and Indonesian prefixes or into German
@@ -183,7 +204,7 @@ off-topic questions recall nothing. No keywords in these stores.
 | | Main set (20 questions): found / recalled | Unseen set (8 questions, 15 unrelated facts added): found / recalled | Quiet (all sets) |
 |---|---|---|---|
 | English | 100 % / 100 % | 100 % / 100 % | 14 / 14 |
-| Russian | 100 % / 100 % | 88 % / 88 % | 14 / 14 |
+| Russian | 100 % / 100 % | 100 % / 88 % ¹ | 14 / 14 |
 | Chinese | 100 % / 100 % | 100 % / 100 % | 14 / 14 |
 | Spanish | 100 % / 100 % | 100 % / 100 % | 10 / 10 |
 | Hindi | 100 % / 100 % | 100 % / 100 % | 9 / 10 |
@@ -223,11 +244,37 @@ How the numbers were obtained, honestly:
   70 %), and two fixes followed. Its numbers published with 0.4.2 (recalled 90 / 100 / 100 %) were partly luck: facts
   of a named person saved in the same second came back in arbitrary order. They now come back newest first, every
   time, and the numbers above are what that gives.
+- **Words of the same root and courtesy (0.9.0)** were measured on blind sets written by separate agents that never
+  saw the code. Same-root words, two sets each for Russian and English (24 facts, 20 unrelated facts that share
+  beginnings or roots with them, 20 questions — 12 asked with another word of the fact's root, 4 with another form, 4
+  with a synonym — and 10 traps). The first set was run once before and once after; its misses were read and three
+  faults fixed, so it no longer counts. On the second: Russian first 45 → 55 %, found 55 → 60 %, recalled 55 → 55 %;
+  English first 60 → 60 %, found 70 → 75 %, recalled 60 → 60 %. Then an independent review (Codex CLI) found
+  look-alike joins that these sets had no trap for (`войной` / `вой`, `mothers` / `moth`, Spanish `comer` / `come`);
+  since then a root never recalls on its own, roots stay within a determined language, and the second set gives the
+  same found and recalled numbers. A second review found padding-only courtesy ("fine?") and question words lost from
+  duplicate checks (fixed) and a capital-letter name rule that lost ordinary words ("Baby" / "babies"; removed — on
+  every set it changed nothing). Small talk: a fresh set per language (24 facts that use small-talk words, 30
+  small-talk messages, 15 questions), run once on the final code: quiet English 50 → 67 %, Russian 63 → 70 %,
+  questions found 100 % before and after; what still recalls is a word in another sense or a famous name ("Peter
+  Pan", "Лев Толстой", "скрипичный ключ"), which matching words cannot tell apart. Every earlier set gives the 0.8.0
+  numbers, except ¹ the Russian unseen set: its one miss ("во сколько ночные бэкапы", nightly / night) is now found,
+  not recalled (a root alone); that question is the one the change was written for, so this number is not blind.
+  Speed at 5,000 facts is unchanged (0.03 s for a search and a recall).
+- **Traditional and Simplified Chinese (0.9.0)**: two blind sets by separate agents (24 facts, half in each script; 20
+  unrelated facts; 20 questions — 6 in the fact's script, 6 in the other one, 4 paraphrases, 4 synonyms — and 10 small
+  talk). On the first, a question in the other script was found but recalled in 3 of 6; its misses were read and the
+  folding written. On the second, run once on the final code: other-script questions found and recalled 33 → 100 %,
+  all questions first 55 → 75 %, found 55 → 75 %, recalled 50 → 70 %, small talk quiet 80 % before and after;
+  same-script questions 100 % both; synonyms with no shared character 0 % both (keywords cover them). Folding also
+  makes a same word in another sense meet across scripts ("圍棋是誰發明的？" recalls the family's Go lessons, written
+  `围棋`), as it always did within one script.
 - **Not measured**: other languages (exact words, no stems, no function-word list).
 
 ### Synonyms and other roots: keywords
 
-Words are matched, not meanings: "relocating" does not find "move", 宠物 (pet) does not find 猫 (cat). The plugin calls
+Words are matched, not meanings: "relocating" does not find "move", 宠物 (pet) does not find 猫 (cat); words of one root
+are joined only in Russian and English (see Languages). The plugin calls
 no model, but the agent that stores a fact is one: `fact_store add` takes `keywords`, 3–8 words someone might ask
 with that the fact does not contain (synonyms, other roots, broader terms, the same in the user's other languages).
 They are kept with the fact's tags, searched like its text, never shown in the recalled block, and old versions index
@@ -272,7 +319,7 @@ What it does not do: find a fact through a synonym or another root that no keywo
 "nightly backups" → "night market"; Hindi `बनाना` is both "to cook" and "to make a plan"; Portuguese `dirigir` is "to
 drive" and "to run a company". Stems are search keys, not lemmas: an irregular form can miss (`ponies` / `pony`). A
 negation counts for the whole clause up to a "but" ("likes cats but not dogs" is detail, not a conflict), not for a
-single word. `auto_extract` and the refusal of instruction-like text recognise English and Russian phrasing only. The
+single word. `auto_extract` recognises English, Russian and Chinese phrasing, the refusal of instruction-like text English and Russian only. The
 main sets of all fourteen languages run in CI (`tests/test_holographic_languages.py`).
 
 ## Data and privacy
@@ -321,7 +368,9 @@ HERMES_AGENT_REPO=~/.hermes/hermes-agent PYTHONPATH=~/.hermes/hermes-agent pytho
 ```
 
 CI runs the suite on Linux, macOS and Windows against hermes-agent `main`, plus `hermes plugins validate`, the check
-the plugin catalog runs at admission. Maintenance notes are in [HANDOFF.md](HANDOFF.md).
+the plugin catalog runs at admission. 0.9.0: 432 tests pass against a hermes-agent 0.21.6 core (3 skipped: optional
+dependencies), 388 without the core (the auto-extraction tests need it). Maintenance notes are in [HANDOFF.md](HANDOFF.md).
 
 Original plugin by dusterbloom (hermes-agent PR #2351); its history is in hermes-agent
-(`git log -- plugins/memory/holographic`). MIT licence.
+(`git log -- plugins/memory/holographic`). MIT licence; the Traditional → Simplified Chinese table in `cjk_fold.py` is
+derived from OpenCC under Apache-2.0 ([LICENSES/OpenCC-Apache-2.0.txt](LICENSES/OpenCC-Apache-2.0.txt)).
