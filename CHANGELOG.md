@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.12.0 — 2026-10-13
+
+Fixes from an audit of 0.6.2–0.11.0: a write transaction that could stay open after a failed COMMIT, `forget`
+waiting on readers, credentials in extracted facts, and the language layer (names with `ı` / `ł`, a damaged
+Chinese dictionary, stems of an undetermined language, lexicalised German compounds, Japanese kanji folded as
+Chinese, Spanish `va`).
+
+### Fixed — store
+
+- **A failed COMMIT no longer leaves the transaction open.** `_tx` ran COMMIT outside its guard: in rollback-journal
+  mode (the core keeps DELETE on a SQLite it deems WAL-reset-vulnerable, and on network file systems) a reader in
+  another process makes COMMIT fail with "database is locked" after the busy timeout, and the open transaction
+  swallowed every later write of the process — nothing was committed again until it exited. COMMIT is inside the
+  guard now; a failure rolls back, drops the caches and raises. (WAL files, the usual case, were never affected.)
+- **`forget` does not wait for a foreign reader.** Its VACUUM and WAL checkpoint ran with the connection's 10 s
+  busy timeout under the provider lock, so a reader in another process (a backup, the nightly dreaming pass)
+  stalled every memory operation for about 11 s. Both run with busy timeout 0 now: the scrub comes back as
+  `pending` at once and is retried at the next open or forget, as before.
+- **Credentials are never stored.** A credential word with a value next to it (`password hunter2`, `пароль от
+  wifi: Qwerty123`, `API key sk-…`, `pin code 4821`) is refused by auto-extraction and by `fact_store` add /
+  change / correct, with the reason. The word alone is still a fact (`I use a password manager`).
+- **Short Chinese, Japanese and Korean sentences are extracted**: the ten-character floor was Latin-tuned
+  (`我们决定用Go。` is eight); a sentence with CJK characters needs six.
+- A dot between a lower-case and a capital letter ends a sentence (`tea.I use` — a missing space; `Python 3.12`,
+  `topic.md` unchanged). `revert` after a revert says why there is nothing to revert. `scope: user` falls back to
+  `user_id_alt` when the platform gives no `user_id`. A database written by a newer release (`meta.history_schema`
+  above the known one) is not opened for writing — the migration would have stamped the schema back; readers read.
+- Docs: the tombstone digest is specified for consumers (`meta.tombstone_key`, HMAC-SHA256, the normalisation);
+  the `-<sha256[:10]>` suffix of a sanitised or cut file name; which contexts migrate; config is read at start.
+
+### Fixed — languages
+
+- **Names with `ı` or `ł` are found from text of any language.** The as-written form (what FTS5's unicode61
+  indexes: `ışık`, `łukasz`) was added to a word's keys only in Turkish, Polish, Italian or Dutch text; an English
+  "Who is Işık?" built the prefix query `isik*` and never reached the indexed token. Any Latin text adds it now,
+  on both the fact and the question side (`Who is Łukasz?` finds `Łukasz is …`). Typing the name without the
+  letter (`Lukasz`) still does not reach the `ł` spelling: that is the index, not this fix.
+- **A damaged `zh_words.txt.gz` no longer breaks Chinese.** A file with a valid header and a corrupt stream raised
+  `zlib.error` on every Chinese text and was retried on each call (every other loader already caught it). It now
+  loads once as no words: pairs-only Chinese, as without the file.
+- **Stems of an undetermined language must look like words.** In Latin text of no determined language every
+  stemmer's output was a key with no check, so Indonesian's read `media` as me- + `dia` (he, she) and `beer` as
+  `be`: "social media" found and recalled every Indonesian fact that says `dia`. A stem of a language the text was
+  not determined as is kept only when it has at least the minimum stem length and is not a function word of that
+  language. Determined text, and the English / Russian / Spanish / French benches, are unchanged.
+- **Lexicalised German compounds stay whole.** `Hochzeit` (a wedding) was split to hoch|zeit, so "Wann hast du
+  Zeit?" recalled "Die Hochzeit ist im Juni" at full weight; likewise `Frühstück` (Stück), `Weihnachten` (Nacht),
+  `Augenblick`, `Verstand`, `Reisende`, and `Tablette` was cut tab|lette by the build although the comment said
+  it stays whole. A list of such words (and their forms) is never split, before the dictionary's own cuts. The
+  build script no longer cuts a noun with the splitter's own judgement — only Wikidata's P5238 analysis makes a
+  compound; **the shipped `de_compounds.tsv.gz` is not rebuilt yet** (the build needs the SPARQL download; the
+  README's held-out numbers still describe the 0.11.0 table) — the list covers the reported cases until then.
+- **Japanese kanji are not folded as Traditional Chinese.** The Traditional → Simplified table was applied to every
+  Han character, Japanese ones included (書→书, 紙→纸), and a Japanese question met a Chinese fact through a kanji it
+  had rewritten (手紙, a letter, vs 手纸). Text with kana keeps its kanji now; the variants table is built the same
+  way. A question in kanji only cannot be told from Chinese and is still folded, so a Japanese fact keeps that
+  form too (`締切` still meets `締切は明日`); the Chinese-question → Japanese-fact direction through that form
+  remains, and needs the question's script in the n-gram match to close.
+- **Spanish `va`, `van`, `vas`, `voy` tell the language** without being dropped as function words: "Eva va a la
+  escuela" was determined as French / Italian (no Spanish stems, no verb forms); the forms of `ir` now vote for
+  Spanish and stay words of the question ("¿Cómo va Javier?" still meets `fue`).
+
 ## 0.11.0 — 2026-10-13
 
 Dictionaries for more languages: English words of one root from Open English Wordnet, Japanese spelling variants from

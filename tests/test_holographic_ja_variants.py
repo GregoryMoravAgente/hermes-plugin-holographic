@@ -69,7 +69,7 @@ def test_spelling_variants_compare_as_one(a, b):
     "日本語をはなす", "いつも元気",  # a hiragana homophone, and いつも (何時も holds 何時, "what time")
 ])
 def test_kana_inside_other_words_is_left_alone(phrase):
-    folded = text.analyze(phrase).text
+    folded = text.analyze(phrase).text.split("\n")[0]  # the first line: as the variants folded it (the others: as written)
     assert folded == text._fold_text(phrase, False)
 
 

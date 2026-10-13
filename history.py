@@ -84,6 +84,11 @@ class HistoryUnavailable(RuntimeError):
     """History is read in a context that may not migrate (a subagent or cron job) before any writer set it up."""
 
 
+class HistoryTooNew(RuntimeError):
+    """The file carries a history schema this version does not know: a newer release wrote it. A writer refuses
+    to open it (its migration would stamp the schema back and could mis-read new columns); readers still read."""
+
+
 def normalize(text: str) -> str:
     """What two texts must share to count as the same fact for tombstones: NFKC, casefold, whitespace collapsed,
     end punctuation dropped."""
@@ -176,6 +181,10 @@ class HistoryMixin:
 
     def _migrate_history(self) -> None:
         """Inside the migration transaction: tombstone key, versions for every fact, reconciliation, schema mark."""
+        found = self._meta("history_schema")
+        if found is not None and found.strip().isdigit() and int(found) > HISTORY_SCHEMA_VERSION:
+            raise HistoryTooNew(f"this database was written by a newer holographic (history schema {found}, this "
+                                f"version knows {HISTORY_SCHEMA_VERSION}): update the plugin; not opened for writing")
         self._tombstone_key()
         self._reconcile_history()
         self._write("INSERT INTO meta (key, value) VALUES ('history_schema', ?) "
@@ -424,6 +433,11 @@ class HistoryMixin:
             cur = self._current_version(fact_id)
             prev = self._version(cur["supersedes"])
             if prev is None:
+                if self._one("SELECT 1 FROM fact_versions WHERE fact_id = ? AND version_id != ?",
+                             (fact_id, cur["version_id"])):  # the other versions were reverted away (corrected)
+                    raise ValueError(f"fact #{fact_id}: nothing to revert; version {cur['seq']} is the one before "
+                                     "the reverted ones, and a revert is not undone by another revert (change it "
+                                     "again instead)")
                 raise ValueError(f"fact #{fact_id} has a single version: nothing to revert (forget deletes it)")
             self._close_version(cur["version_id"], "corrected", trust=fact["trust_score"])
             if prev["status"] == "ended":  # undo a resume: the fact is ended again
@@ -489,6 +503,11 @@ class HistoryMixin:
         with self._lock:
             if self._conn.in_transaction or self._meta("scrub_pending") is None:
                 return self._meta("scrub_pending") is None
+            # Without waiting on another process (busy timeout 0 for these two statements only, as the recall
+            # counts do): a reader blocks the checkpoint for as long as it reads, and every provider operation
+            # waits behind a forget, so "pending" must come back at once rather than after the 10 s timeout.
+            timeout = self._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+            self._conn.execute("PRAGMA busy_timeout = 0")
             try:
                 self._conn.execute("VACUUM")
                 busy = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
@@ -496,6 +515,8 @@ class HistoryMixin:
             except sqlite3.Error as exc:
                 logger.warning("holographic: scrub after forget deferred (%s)", exc)
                 return False
+            finally:
+                self._conn.execute(f"PRAGMA busy_timeout = {int(timeout)}")
             if done:
                 self._conn.execute("DELETE FROM meta WHERE key = 'scrub_pending'")
                 self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -600,5 +621,5 @@ class HistoryMixin:
         return out
 
 
-__all__ = ["HISTORY_SCHEMA", "HistoryMixin", "HistoryUnavailable", "CLOSED", "SOURCE_FIELDS", "normalize", "parse_day",
-           "version_state", "source_of"]
+__all__ = ["HISTORY_SCHEMA", "HistoryMixin", "HistoryUnavailable", "HistoryTooNew", "CLOSED", "SOURCE_FIELDS", "normalize",
+           "parse_day", "version_state", "source_of"]

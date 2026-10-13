@@ -123,14 +123,33 @@ left without facts, the category banks. Then, to remove copies the database itse
 4. `PRAGMA wal_checkpoint(TRUNCATE)` empties the write-ahead log.
 
 Steps 3–4 can be blocked by another process holding the database (a reader in the middle of a long query). The
-result then says `scrub: "pending"` and the store retries at its next open or next forget. The acceptance test
-greps the raw bytes of the `.db` and `-wal` files for a word that only the forgotten fact contained.
+store does not wait for it (busy timeout 0 for these two statements; every other memory operation of the agent
+queues behind a forget): the result says `scrub: "pending"` at once and the store retries at its next open or next
+forget. The acceptance test greps the raw bytes of the `.db` and `-wal` files for a word that only the forgotten
+fact contained.
+
+In rollback-journal mode (the core keeps `journal_mode=DELETE` instead of WAL on a SQLite it considers
+WAL-reset-vulnerable, and on network file systems) a reader in another process blocks the *commit* itself: the
+forget then fails with "database is locked" after the busy timeout, nothing is changed, no tombstone is written,
+and the connection is rolled back so the next write works. Retry the forget.
 
 ### Tombstones
 
 `forgotten(fact_id, forgotten_at, digests)` keeps the id (ids are never reused: `AUTOINCREMENT`) and a keyed hash
 (HMAC-SHA256 with a per-database random key) of the normalised text of every version — **never the text**.
-Tombstones are kept forever. They are used for two things:
+Tombstones are kept forever.
+
+A consumer that holds a text and wants to know whether it was forgotten can compute the digest itself — the
+format is stable:
+
+- `digests` is a JSON list of lower-case hex strings;
+- each is `HMAC-SHA256(key, normalize(text))`, where `key` is the bytes of `meta.tombstone_key` (hex, 16 random
+  bytes, created the first time a writer opens the file; every per-user / per-chat database has its own) and
+  `normalize` = Unicode NFKC → `casefold()` → whitespace collapsed to single spaces → leading and trailing
+  `" .!?;,"` stripped (`history.normalize`).
+
+A paraphrase does not match: only the texts the fact's versions actually had are covered. Tombstones are used for
+two things:
 
 - auto-extraction silently skips a sentence that matches a tombstone, so a forgotten fact does not come back from
   old messages; an `add` from a cron job (a nightly extraction re-reading old messages) is refused with
@@ -171,8 +190,12 @@ keep working. Every write is one transaction.
 ## Migration and older versions on the same file
 
 - The first writer of 0.8.0 gives every fact a version: `seq 1`, `current`, `valid_from NULL`, `recorded_at` = the
-  fact's `updated_at` (the latest moment its text is known to have been true), `via legacy`. Read-only contexts
-  (subagents, cron) do not migrate; `as_of` and `history` there answer with a clear error until a writer has.
+  fact's `updated_at` (the latest moment its text is known to have been true), `via legacy`. A context that may
+  write migrates: the main agent, and a cron job with `cron_writes` on (the default). Read-only contexts
+  (subagents, flush, cron with `cron_writes: false`) do not; `as_of` and `history` there answer with a clear error
+  until a writer has.
+- A file whose `meta.history_schema` is higher than this version knows was written by a newer release: a writer
+  refuses to open it ("update the plugin"), so its migration cannot stamp the schema back; readers still read.
 - An older version may write the file in between (a downgrade, a second profile). Each writer open reconciles:
   - a fact without a current version → a `legacy` version;
   - a fact whose text differs from its current version (an older `update`) → the version is closed as `changed`

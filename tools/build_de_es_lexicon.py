@@ -13,9 +13,9 @@ anyway (LICENSES/Wikidata-CC0.txt). Counts of that date: German 242,105 lexemes 
 verbs with 573,450 forms).
 
 Changes (de_compounds.tsv.gz): German noun, adjective and verb lemmas, folded as text.py folds them (accents dropped,
-lower case); every noun of three or more letters judged a compound or one word with text.py's own splitter, over the
-whole dictionary and with stricter limits than at run time, Wikidata's P5238 analysis winning where it has one (two
-readings of one spelling, "Wachstube": left whole), lexemes derived from another one (P5191) or built with an affix
+lower case); every noun of the dictionary is one word unless Wikidata's P5238 analysis says it is a compound (two
+readings of one spelling, "Wachstube": left whole) — until 0.11.0 the build also cut nouns with text.py's own
+splitter, which read "Tablette" as Tab|Lette and "Weihnachten" as Weih|Nachten —, lexemes derived from another one (P5191) or built with an affix
 kept whole, and so are an agent noun of a verb ("Sauger") and the weekdays; for each word a class of how often it is a
 part of the other nouns and the linking elements seen after it; compounds whose cuts the splitter would not find by
 itself written with their cuts; words the run-time splitter needs neither as a part nor to keep a word (or one of its
@@ -196,7 +196,6 @@ def verb_forms(dl: Path, code: str) -> dict:
 # -- German compounds ------------------------------------------------------------------------------------------------
 
 LINK_CODE = {v: k for k, v in T._DE_LINKS.items()}
-JUDGE = dict(need=(3, 3, 2), head_need=(4, 3, 2), need_verb=3)  # the dictionary's own words: stricter than run time
 WEEKDAYS = frozenset("montag dienstag mittwoch donnerstag freitag samstag sonnabend sonntag".split())
 
 
@@ -294,26 +293,19 @@ def build_compounds(dl: Path, exclude=frozenset(), log=print) -> tuple[dict, dic
         for _, p in readings[0]:
             prod[p] += 3
     links = {w: "".join(sorted(obs)) for w, obs in seen.items() if sum(obs.values()) >= 3}
-    # 2. every noun of the dictionary: a compound (cuts) or one word
-    judge = T._DeSplitter(table(prod, links, nouns), {}, **JUDGE)
+    # 2. every noun of the dictionary: a compound where Wikidata says so (cuts), else one word. The build's own
+    # judgement (text.py's splitter with stricter limits) cut lexicalised compounds the dictionary should keep whole:
+    # "Tablette" as Tab|Lette, "Weihnachten" as Weih|Nachten, "Reisende" as Reis|Ende; a noun Wikidata lists without
+    # an analysis is one word here, and the run-time splitter cuts only what the dictionary does not know.
     cuts, atoms, why = {}, set(), collections.Counter()
     for w in nouns:
         if w in analyses:
             readings = analyses[w]
             cuts[w] = frozenset(s for s, _ in readings[0][1:]) if len(readings) == 1 else frozenset()
             why["Wikidata's analysis" if len(readings) == 1 else "two analyses: whole"] += 1
-        elif w in one_word or (w.endswith("er") and (w[:-2] + "en" in verbs or w[:-2] + "n" in verbs)):
-            atoms.add(w)
-            why["derived, affixed, agent noun, weekday: whole"] += 1
-        elif len(w) < 6 or not (seg := judge.choose(w)):
-            atoms.add(w)
-            why["no analysis: one word"] += 1
-        elif prod.get(w, 0) >= math.exp(sum(math.log(1 + prod.get(p[1], 0)) for p in seg) / len(seg)) - 1:
-            atoms.add(w)  # Koehn & Knight: as often a part itself as its parts are
-            why["a part as often as its parts: one word"] += 1
         else:
-            cuts[w] = judge.cuts(seg)
-            why["judged a compound"] += 1
+            atoms.add(w)
+            why["no analysis of Wikidata's: one word"] += 1
     # the linking elements of a compound modifier belong to its last word (Hochzeit+s -> Zeit+s)
     for w, c in cuts.items():
         if c and w in links:

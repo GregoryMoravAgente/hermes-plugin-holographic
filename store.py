@@ -414,7 +414,12 @@ class MemoryStore(HistoryMixin):
 
     @contextlib.contextmanager
     def _tx(self):
-        """One write transaction (BEGIN IMMEDIATE ... COMMIT, ROLLBACK on error); nested calls join the outer one."""
+        """One write transaction (BEGIN IMMEDIATE ... COMMIT, ROLLBACK on error); nested calls join the outer one.
+
+        The COMMIT is inside the guard: in rollback-journal mode (the core keeps DELETE on a SQLite it deems
+        WAL-reset-vulnerable, and on NFS / SMB) a reader in another process makes COMMIT fail with "database is
+        locked" after the busy timeout, and a commit that failed leaves the transaction open; without the ROLLBACK
+        every later _tx() would join that dangling transaction and nothing would ever be committed again."""
         with self._lock:
             if self._conn.in_transaction:
                 yield
@@ -422,11 +427,15 @@ class MemoryStore(HistoryMixin):
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 yield
+                self._conn.execute("COMMIT")
             except BaseException:
-                self._conn.execute("ROLLBACK")
+                if self._conn.in_transaction:
+                    try:
+                        self._conn.execute("ROLLBACK")
+                    except sqlite3.Error as exc:  # the connection is broken: the error raised below says so
+                        logger.warning("holographic: rollback after a failed write failed too (%s)", exc)
                 self._bump()  # anything cached inside the transaction never happened
                 raise
-            self._conn.execute("COMMIT")
 
     def read(self, sql: str, params=()) -> list:
         """Run a read under the store lock (a consistent snapshot against this process's writers)."""

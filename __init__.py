@@ -22,7 +22,7 @@ from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
 from utils import is_truthy_value
 from . import holographic as hrr
-from .history import parse_day
+from .history import HistoryTooNew, parse_day
 from .store import DuplicateContentError, MemoryStore
 from .retrieval import FactRetriever
 from hermes_cli.config import cfg_get
@@ -145,11 +145,19 @@ _EXTRACT_CATEGORIES = (
      "project"),
 )
 # A sentence ends at . ! ? and Chinese 。；！？; a dot followed by a non-space is inside it ("Python 3.12",
-# "topic.md", "v0.21.6")
-_RE_SENTENCE = re.compile(r"(?:[^.!?\n。；！？]|\.(?=\S))+[.!?。；！？]?")
+# "topic.md", "v0.21.6") unless it sits between a lower-case and a capital letter ("tea.I use": a missing space)
+_RE_SENTENCE = re.compile(r"(?:[^.!?\n。；！？]|\.(?=\S)(?!(?<=[a-zа-яё]\.)[A-ZА-ЯЁ]))+[.!?。；！？]?")
 # A question is never a fact to keep: "Do I always need a visa?", "我們決定了嗎？"
 _RE_QUESTION = re.compile(r"[?？]\s*$|[嗎吗呢]\s*[。.]?\s*$")
 _EXTRACT_MAX_CHARS = 300
+# The shortest sentence worth keeping; a Chinese / Japanese / Korean one says as much in far fewer characters
+# ("我们决定用Go。" is eight)
+_EXTRACT_MIN_CHARS, _EXTRACT_MIN_CHARS_CJK = 10, 6
+_RE_CJK = re.compile(r"[぀-ヿ㐀-䶿一-鿿豈-﫿가-힯]")
+
+
+def _extract_floor(text: str) -> int:
+    return _EXTRACT_MIN_CHARS_CJK if _RE_CJK.search(text) else _EXTRACT_MIN_CHARS
 
 # What a fact must not be. Facts are injected into later prompts, so instructions and tool transcripts stored as
 # "facts" would be replayed as context; refused with the reason, so the agent can rewrite it.
@@ -168,6 +176,24 @@ _RE_EXFILTRATION = re.compile(
     r"credentials?|private\s+keys?|seed\s+phrases?)\b"
     r"|(?:отправ|перешл|покаж|раскрой|выложи)\w*.{0,40}(?:парол|секрет|токен|ключ|учётн|учетн)",
     re.IGNORECASE)
+# A credential with its value ("password hunter2", "пароль от wifi: Qwerty!23", "API key sk-…"): never a fact,
+# whoever says it and however it is quoted. The word alone is not enough ("I use a password manager", "the token
+# expires"): the value must look like one (a digit or a symbol in it, or twelve characters and more).
+_RE_CREDENTIAL = re.compile(
+    r"(?:\b(?:pass(?:words?|phrases?|codes?)|pwd|pins?(?:\s+codes?)?|api[\s_-]?keys?|(?:access|auth|bearer|refresh)"
+    r"[\s_-]?tokens?|secret[\s_-]?keys?|tokens?|otp|2fa\s+codes?)\b"
+    r"|парол[ьяюеи]|пин[\s-]?код\w*|токен\w*|ключ\w*\s+api)"
+    r"(?:\s+(?:for|to|of|on|для|от|к|на)(?:\s+\S+(?=\s|$)){1,2})?\s*(?:\b(?:is|was|are)\b|[:=—–-]|это)?\s*[\"'«“`]?"
+    r"(?<!\S)(?P<value>\S{4,})",
+    re.IGNORECASE)
+_VALUE_EDGE = ".,;:!?\"'«»“”`)"
+
+
+def _looks_like_a_secret(token: str) -> bool:
+    value = token.strip(_VALUE_EDGE)
+    return len(value) >= 4 and (len(value) >= 12 or any(c.isdigit() or (not c.isalnum() and c != "'") for c in value))
+
+
 # Quoted spans are reported text ("the test case contains 'ignore previous instructions'"), not instructions.
 _RE_QUOTED_SPAN = re.compile(r"\"[^\"\n]*\"|'[^'\n]*'|«[^»\n]*»|“[^”\n]*”")
 _RE_ROLE_MARKUP = re.compile(r"(?im)^\s*(?:system|assistant|user|tool)\s*:|</?(?:tool_call|function_call|system|assistant)\b|<\|")
@@ -193,6 +219,8 @@ def _fact_problem(content: str) -> str | None:
         return "reads like an instruction to the assistant, not a fact"
     if _RE_EXFILTRATION.search(unquoted):
         return "asks to send credentials somewhere: an instruction, not a fact"
+    if any(_looks_like_a_secret(m.group("value")) for m in _RE_CREDENTIAL.finditer(text)):
+        return "contains what looks like a credential (a password, key, token or PIN with its value): never store those"
     if any(c in _INVISIBLE for c in text):
         return "contains invisible formatting characters"
     if _RE_BLOB.search(text):
@@ -450,8 +478,8 @@ class HolographicMemoryProvider(MemoryProvider):
         self._ident = {k: str(kwargs.get(k) or "").strip() for k in _IDENTITY}
         self._author = {}
         self._authors_seen = False
-        if self._scope == "user":
-            self._init_key = self._user_key(kwargs.get("user_id"))
+        if self._scope == "user":  # user_id_alt: the stable alternate id some platforms give instead
+            self._init_key = self._user_key(kwargs.get("user_id") or kwargs.get("user_id_alt"))
             self._activate(self._init_key)
         elif self._scope in _CHAT_SCOPES:  # the gateway builds one agent per chat (and thread): fixed for the session
             self._activate(self._chat_key(kwargs.get("chat_id"), kwargs.get("thread_id")))
@@ -499,8 +527,9 @@ class HolographicMemoryProvider(MemoryProvider):
             store = MemoryStore(db_path=db_path, default_trust=float(self._config.get("default_trust", 0.5)), hrr_dim=hrr_dim,
                                 migrate=self._tool_writable, tz=_hermes_timezone())
         except Exception as exc:  # a damaged or unreadable database: keep the agent up, say why memory is off
-            self._init_error = (f"cannot open {db_path} ({type(exc).__name__}: {exc}). If the file is damaged, "
-                                f"recover it with: sqlite3 {db_path} \".recover\" | sqlite3 recovered.db")
+            self._init_error = f"cannot open {db_path} ({type(exc).__name__}: {exc})."
+            if not isinstance(exc, HistoryTooNew):
+                self._init_error += f" If the file is damaged, recover it with: sqlite3 {db_path} \".recover\" | sqlite3 recovered.db"
             logger.error("holographic: %s", self._init_error)
             return None
         retriever = FactRetriever(store=store, hrr_dim=hrr_dim, hrr_weight=float(self._config.get("hrr_weight", 0.3)),
@@ -1096,11 +1125,11 @@ class HolographicMemoryProvider(MemoryProvider):
                 content = pre
             elif content is None or is_compaction_summary_message(msg):
                 continue
-            if not isinstance(content, str) or len(content) < 10:
+            if not isinstance(content, str) or len(content) < _extract_floor(content):
                 continue
             for sentence in (m.group(0).strip() for m in _RE_SENTENCE.finditer(content)):
-                if len(sentence) < 10 or len(sentence) > _EXTRACT_MAX_CHARS or _fact_problem(sentence) \
-                        or _RE_QUESTION.search(sentence):
+                if len(sentence) < _extract_floor(sentence) or len(sentence) > _EXTRACT_MAX_CHARS \
+                        or _fact_problem(sentence) or _RE_QUESTION.search(sentence):
                     continue
                 for patterns, category in _EXTRACT_CATEGORIES:
                     if any(p.search(sentence) for p in patterns):

@@ -50,8 +50,8 @@ In `config.yaml` under `plugins.hermes-memory-store`:
 | `prefetch_repeat_turns` | `6` | A fact recalled before a turn is not injected again for this many turns of the session |
 | `recall_source` | `off` | `short`: each fact recalled before a turn also says where it was written (`recorded 2026-10-12 · Anton · this chat`; no ids). Off by default: it costs tokens and tells the room which chat a fact came from. `list`, `history` and `export` always show the source in full |
 | `cron_writes` | `true` | A cron job's explicit `fact_store` / `fact_feedback` calls may write (nightly memory jobs such as hermes-dreaming's extraction and keywords exist to make them). Automatic writes (auto-extraction, mirroring, recall counts) stay off in cron, subagents and flush contexts; `false` makes cron read-only too |
-| `recall_indicator` | `true` | Report recalled facts to the core's recall indicator ("🧠 Holographic — recalled 2 memories"). On Telegram and other messaging platforms that line arrives as a separate message before the reply; `false` turns it off, recall itself is unchanged |
-| `scope` | `profile` | `user`: a separate database per user (`holographic-users/<platform>-<user id>.db` next to `db_path`); in a shared chat the store follows the author of each turn, and with no user identity nothing is recalled or written. `chat`: a separate database per chat (`holographic-chats/<platform>-<chat id>.db`) — for one bot serving many unrelated groups; `thread`: per forum topic / thread (`…-t<thread id>.db`), the chat's own database outside threads. Without a chat (CLI, cron, subagents) nothing is recalled or written |
+| `recall_indicator` | `true` | Report recalled facts to the core's recall indicator ("🧠 Holographic — recalled 2 memories"). On Telegram and other messaging platforms that line arrives as a separate message before the reply; `false` turns it off, recall itself is unchanged. Like every key here it is read when the gateway starts: a change takes effect after a restart |
+| `scope` | `profile` | `user`: a separate database per user (`holographic-users/<platform>-<user id>.db` next to `db_path`); in a shared chat the store follows the author of each turn, and with no user identity nothing is recalled or written. `chat`: a separate database per chat (`holographic-chats/<platform>-<chat id>.db`) — for one bot serving many unrelated groups; `thread`: per forum topic / thread (`…-t<thread id>.db`), the chat's own database outside threads. Without a chat (CLI, cron, subagents) nothing is recalled or written. File names: an id made only of `A-Z a-z 0-9 _ . -` is used as is (Telegram's `-1001234567890`); any other character becomes `_`, the name is cut to 60 characters, and `-<first 10 hex of sha256(the original "platform-id")>` is appended, so distinct ids never share a file |
 
 ## Tools
 
@@ -189,7 +189,11 @@ A word matches another when they share its plain form or its stem in the languag
   (`Tag` in `Alltag`); a question compound whose last part alone is in a fact counts 0.6 too. Words the dictionary knows as one word stay whole (`Matrose` is no `Rose`, `Mitglied` no
   `Lied`, `Ausland` no `Land`); 0.6.0's suffix test stays for words it does not know (`Arbeitslaptop`). On Wikidata's
   own compounds held out of the build, 94.9 % are split, 99.9 % of the splits as Wikidata cuts them; of 204 simple
-  words that look splittable, 4 are still split (`Plattform`, `Tablette`, `Kommode`, `Zoophobie`). A real ambiguity
+  words that look splittable, 4 are still split (`Plattform`, `Tablette`, `Kommode`, `Zoophobie`). Compounds whose
+  meaning is not their parts' are never split (0.12.0: `Hochzeit` is no `Zeit`, `Frühstück` no `Stück`,
+  `Weihnachten` no `Nacht`, `Augenblick`, `Verstand`, `Reisende`, `Wochenende`, `Flugzeug` …, nor their forms;
+  `Tablette` is in that list too), and the build no longer cuts a noun by the splitter's own judgement — only
+  Wikidata's analysis does, from the next rebuild of the table. A real ambiguity
   stays: `Kopfschuppen` (dandruff) is `Kopf` + `Schuppen`, and `Schuppen` is also a shed. `de_compounds.tsv.gz`
   (212 KB), loaded on the first German word (0.15 s, 7 MB); `_DE_COMPOUNDS = False` turns it off.
 - **German and Spanish verb forms** (0.11.0): Snowball keeps `ging` apart from `gehen`, `fue` from `ir` and `ser`,

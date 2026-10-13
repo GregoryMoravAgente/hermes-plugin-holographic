@@ -14,7 +14,8 @@ words also get root keys (word_roots: "ночные" / "ночь", "teacher" / "
 recall, never in duplicate checks. Identifiers (anything with
 a digit, or a dotted / pathed token) are never stemmed and never stopwords. Chinese, Japanese, Korean and the scripts
 of Southeast Asia are compared by character n-grams instead (see UNSEGMENTED); Traditional Chinese characters compare
-as Simplified ones, in text with kana a Japanese spelling variant compares as the word's representative spelling
+as Simplified ones (not Japanese kanji: text with kana keeps them), in text with kana a Japanese spelling variant
+compares as the word's representative spelling
 (子ども / 子供, 引越し / 引っ越し; see _ja_fold), and Chinese text is also split into words, so a pair of characters
 across two words is not that pair (和服 in 我和服务员) and a one-character word is searched alone (see zh_words)."""
 
@@ -130,6 +131,9 @@ _FOLD = str.maketrans({
 })
 # Traditional Chinese characters compare as Simplified ones (學校 = 学校, 醫院 = 医院): a Taiwan user's fact and a mainland
 # user's question, or the other way round, share their characters. OpenCC's table (cjk_fold.py); stored text unchanged.
+# Not in Japanese text (it has kana): its kanji share code points with Traditional characters but are not them (手紙,
+# a letter, is no 手纸; 書 no 书), so a Japanese question no longer meets a Chinese fact through a kanji it rewrote. A
+# question in kanji only cannot be told from Chinese and is folded; a Japanese fact also keeps that form (see analyze).
 _HAN_FOLD = True
 _FOLD_HAN = {**_FOLD, **str.maketrans(TRADITIONAL, SIMPLIFIED)}
 # Japanese spelling variants (表記揺れ) compare as the word's representative spelling, in text that has kana (so Chinese
@@ -140,10 +144,12 @@ _ja_ready = False  # set at the end of this module: the word lists below are fol
 _KANA = re.compile(r"[ぁ-ゖァ-ヺ]")  # hiragana and katakana letters (not ー or ・)
 
 
-def _fold_text(text: str, ja: bool | None = None, dotless: bool = True) -> str:
+def _fold_text(text: str, ja: bool | None = None, dotless: bool = True, han: bool | None = None) -> str:
     """The comparison form of a text (see fold). *ja*: apply the Japanese spelling variants; None decides by the text
     itself (it has kana). analyze decides once for a whole text and passes it on to each of its words. *dotless*=False
-    keeps ı and ł, as FTS5's unicode61 tokenizer does."""
+    keeps ı and ł, as FTS5's unicode61 tokenizer does. *han*: write Traditional Chinese characters as Simplified;
+    None does so unless the text is Japanese (it has kana, or *ja* says so): Japanese kanji share their code points
+    with Traditional characters, and 手紙 (a letter) is no 手纸 (toilet paper), 書 no 书."""
     if text.isascii():
         return text
     out, latin = [], False
@@ -154,10 +160,13 @@ def _fold_text(text: str, ja: bool | None = None, dotless: bool = True) -> str:
         else:
             latin = c.isascii() or _script(c) == "latin"
         out.append(c)
-    folded = unicodedata.normalize("NFC", "".join(out)).translate(_FOLD_HAN if _HAN_FOLD else _FOLD)
+    kana = _KANA.search(text) is not None
+    if han is None:
+        han = _HAN_FOLD and not (kana or ja)
+    folded = unicodedata.normalize("NFC", "".join(out)).translate(_FOLD_HAN if han else _FOLD)
     if dotless:
         folded = folded.translate(_DOTLESS)
-    if _JA_VARIANTS and _ja_ready and (_KANA.search(folded) is not None if ja is None else ja):
+    if _JA_VARIANTS and _ja_ready and (kana if ja is None else ja):
         return _ja_fold(folded)
     return folded
 
@@ -166,8 +175,8 @@ def _fold_text(text: str, ja: bool | None = None, dotless: bool = True) -> str:
 def fold(word: str) -> str:
     """Comparison form of a lower-cased word: Latin accents dropped ("está" = "esta"), Turkish ı and Polish ł as i
     and l, Arabic vowel marks, tatweel and letter variants normalised (أ إ آ -> ا, ى -> ي, ة -> ه), the Indic nukta
-    dropped, native digits as ASCII, Traditional Chinese characters as Simplified, a Japanese spelling variant (in a
-    word with kana) as the representative one."""
+    dropped, native digits as ASCII, Traditional Chinese characters as Simplified (not Japanese kanji: a word with
+    kana keeps them), a Japanese spelling variant (in a word with kana) as the representative one."""
     return _fold_text(word)
 
 
@@ -293,7 +302,13 @@ _WEAK = {
     "pl": _folded("u w z bo ci ale maja nam mu coś ile po od"),
     "nl": _folded("door met van wat heel ben dank"),
 }
-_VOTERS = {lang: words - _WEAK.get(lang, frozenset()) for lang, words in STOP.items()}
+# The other way round: words that tell the language but stay words. The Spanish forms of "ir" ("va", "van", "vas",
+# "voy") are function words of French and Italian here, and without them "Eva va a la escuela" was French or Italian
+# (no Spanish stems, no verb forms); as function words they would be dropped from a question, and "¿Cómo va Javier?"
+# meets "fue" through them (see word_lemmas).
+_VOTE_ONLY = {"es": _folded("va van vas voy")}
+_VOTERS = {lang: (words | _VOTE_ONLY.get(lang, frozenset())) - _WEAK.get(lang, frozenset())
+           for lang, words in STOP.items()}
 
 # Question words that say nothing about the subject of a QUESTION ("какая сегодня погода": "какая" met "как" in every
 # fact that says "считать как …"), but are part of a statement ("Иван знает, почему" is not "Иван знает, куда"): left
@@ -597,14 +612,28 @@ def _native_keys(written: str, lang: str) -> frozenset:
 
 
 @lru_cache(maxsize=65536)
-def _keys(word: str, langs: tuple[str, ...], written: str = "") -> frozenset:
+def _undotted(written: str, langs: tuple[str, ...]) -> frozenset:
+    """A word with ı or ł and its stems in *langs* as FTS5 indexed them (unicode61 drops accents but keeps those
+    letters), for text of any language: "Işık" in an English question has to reach "ışık" in the index, as a Turkish
+    one does through _native_keys; the comparison form stays "isik"."""
+    stems_ = () if is_identifier(written) else tuple(
+        _snowball(_STEMMERS[lang], written, lang) for lang in langs if lang in _STEMMERS and lang not in _NATIVE)
+    return frozenset(_fold_text(s, dotless=False) for s in (written, *stems_) if s == written or len(s) >= _MIN_STEM)
+
+
+@lru_cache(maxsize=65536)
+def _keys(word: str, langs: tuple[str, ...], written: str = "", determined: bool = True) -> frozenset:
     """The word and its stems in *langs*. *written*: the word before folding, for languages Snowball reads better
-    with its letters (_NATIVE); "" when it is the same."""
+    with its letters (_NATIVE) and for a word with ı or ł; "" when it is the same. *determined*=False: the text's
+    language is not known, and a stem is kept only when it could be a word of its language (at least _MIN_STEM
+    letters, not a function word): the Indonesian stemmer reads "media" as me- + "dia" (he, she), and a key "dia"
+    would meet every Indonesian fact that says "dia"."""
     keys = {word}
     for lang in langs:
         stem_ = stem(word, lang)
         if lang not in _NATIVE:
-            keys.add(stem_)
+            if determined or (len(stem_) >= _MIN_STEM and stem_ not in STOP[lang]):
+                keys.add(stem_)
             continue
         if len(stem_) >= _MIN_STEM or stem_ == word:  # Snowball's Turkish leaves "ç" of "cuma", "ai" of "aile"
             keys.add(stem_)
@@ -612,6 +641,8 @@ def _keys(word: str, langs: tuple[str, ...], written: str = "") -> frozenset:
             keys.add(possessive)
         if written:
             keys |= _native_keys(written, lang)
+    if written and ("ı" in written or "ł" in written) and _NATIVE.isdisjoint(langs):
+        keys |= _undotted(written, langs)  # a _NATIVE language in langs added these through _native_keys
     if "ar" in langs:
         if "ar" in _STEMMERS:
             keys.add(fold(_STEMMERS["ar"].stemWord(word)))
@@ -776,7 +807,8 @@ def _en_rule_roots(word: str, stem_: str) -> frozenset:
 # of three letters or more joined by the linking elements German uses (-s-, -es-, -n-, -en-, -er-, -e-, a dropped -e),
 # the analysis with the fewest parts, parts that are rarely parts of other words only when nothing else fits, two
 # analyses that cut differently left whole unless one is clearly more likely ("Staubecken": Stau-Becken or
-# Staub-Ecken). A word the dictionary knows as one word stays whole ("Kartoffel", "Tablette"), and so do its forms; a
+# Staub-Ecken). A word the dictionary knows as one word stays whole ("Kartoffel"), and so do its forms, and so does a
+# compound whose meaning is not its parts' (_DE_ONE_WORD: "Hochzeit", a wedding, is no Zeit); a
 # compound of the dictionary is cut where the dictionary (or Wikidata's own analysis, "combines lexemes") says. The
 # last part names what the word is ("Familienkatze" is a Katze) and matches as the word itself does; the parts before
 # it (modifiers) count _DERIV_WEIGHT and never recall a fact alone. Both ways: a compound in a fact is found by its
@@ -800,6 +832,13 @@ _DE_ADJ_END = ("", "e", "en", "er", "es", "em")
 _DE_VERB_END = ("e", "st", "t", "en", "et", "te", "ten", "test", "tet", "tes", "end", "ende", "enden")
 _DE_CLASS = (0, 2, 9, 40, 200)  # how often a word is a part of other words, by class: the likelier analysis wins
 _DE_TWO_LETTER_HEADS = frozenset({"ol"})  # Öl: Olivenöl, Heizöl
+# Compounds whose meaning is not their parts', never split (nor their forms): "Hochzeit" (a wedding) is no Zeit,
+# "Frühstück" no Stück, "Weihnachten" no Nacht, "Augenblick" (a moment) no Blick, "Verstand" (the mind) no Tand,
+# "Wochenende" no Ende, "Flugzeug" no Zeug, "Reisende" (travellers) no Ende and no Reis; and words the dictionary lacks
+# or cut wrongly ("Tablette" is no Lette). Folded, as the words are. A question "Wann hast du Zeit?" must not recall
+# "Die Hochzeit ist im Juni" at full weight for the Zeit at its end.
+_DE_ONE_WORD = frozenset("""hochzeit fruhstuck weihnachten augenblick verstand tablette kartoffel reisend wochenende
+    jahreszeit mahlzeit handschuh flugzeug fahrzeug spielzeug werkzeug feierabend burgermeister""".split())
 
 
 def _de_vstem(verb: str) -> str:
@@ -968,6 +1007,9 @@ class _DeSplitter:
         compound (or one of its forms); None for a word the table knows nothing of."""
         if len(word) < self.min_word:
             return () if self.known(word) else None
+        if any(word.endswith(end) and (word[:len(word) - len(end)] if end else word) in _DE_ONE_WORD
+               for end in _DE_NOUN_END):
+            return ()  # a lexicalised compound, before the dictionary's own cuts ("Reisende" has one)
         for end in _DE_NOUN_END + _DE_FEM_END:
             base = word[:len(word) - len(end)] if end else word
             if word.endswith(end) and base in self.cuts_of:
@@ -1242,8 +1284,9 @@ def analyze(text: str) -> Analysis:
     german = determined and "de" in langs and "en" not in langs
     forms_lang = "" if not _LEMMA_FORMS else "de" if german else         "es" if determined and "es" in langs and "en" not in langs else ""  # "he went": English as much as Spanish
     heads, compound_mods, lemma_keys = set(), set(), set()
-    # Japanese spelling variants: decided for the whole text, so every word of it folds as the text does
-    fold_word = _fold_ja if _JA_VARIANTS and _KANA.search(lowered) else fold
+    # Japanese spelling variants, and kanji kept as written: decided for the whole text, so every word of it folds as
+    # the text does ("申込" in "申込 締切 いつ？" has no kana of its own)
+    fold_word = _fold_ja if _KANA.search(lowered) else fold
     lang_keys = set()
     words, bag, keys, roots = [], set(), set(), set()
     for group in groups:
@@ -1256,14 +1299,15 @@ def analyze(text: str) -> Analysis:
         unsegmented = UNSEGMENTED.search(raw) is not None
         word_langs = () if ident or unsegmented else langs if script == "latin" else _SCRIPT_LANGS.get(script, ())
         is_stop = not ident and not unsegmented and _stop(word, script, votes, len(latin) >= 4)
-        written = _written(raw) if word_langs and not _NATIVE.isdisjoint(word_langs) else word
+        written = _written(raw) if word_langs and (not _NATIVE.isdisjoint(word_langs) or "ı" in raw or "ł" in raw) \
+            else word
         written = "" if written == word else written  # only a word whose letters folding changed is stemmed twice
-        word_keys = _keys(word, word_langs, written) if word_langs else frozenset({word})
+        word_keys = _keys(word, word_langs, written, determined) if word_langs else frozenset({word})
         bag.add(word)
         keys |= word_keys
         for piece in (fold(e) for e in extra):  # the whole and the parts of a hyphenated word, for containment
             bag.add(piece)
-            keys |= _keys(piece, word_langs) if word_langs and _letters_only(piece) else {piece}
+            keys |= _keys(piece, word_langs, "", determined) if word_langs and _letters_only(piece) else {piece}
         root_lang = "" if is_stop or ident or unsegmented or "-" in word else \
             "en" if script == "latin" and english else "ru" if script == "cyrillic" and russian else ""
         word_roots_ = word_roots(word, stem(word, root_lang), root_lang) - word_keys if root_lang else frozenset()
@@ -1292,8 +1336,11 @@ def analyze(text: str) -> Analysis:
     unknown = frozenset(w for w in bag if de_parts(w) is None) if german and _DE_COMPOUNDS and _de_splitter() else None
     folded = _fold_text(lowered)
     if fold_word is _fold_ja:
-        written_ja = _fold_text(lowered, False)
-        folded = folded if written_ja == folded else f"{folded}\n{written_ja}"
+        # A Japanese text also keeps its spelling as written, so a question in kanji only (not folded: it has no kana)
+        # still meets it (締切 / 締切は明日), and, since such a question folds its kanji as Traditional Chinese
+        # characters (締切 -> 缔切), that form of the written text too
+        forms = (folded, _fold_text(lowered, False), _fold_text(lowered, False, han=True))
+        folded = "\n".join(dict.fromkeys(forms))
     return Analysis(tuple(words), frozenset(bag), frozenset(keys), folded, langs,
                     german=german, determined=determined, roots=frozenset(roots), lang_keys=frozenset(lang_keys), seamed=zh_seamed(folded),
                     dutch=_NL_COMPOUNDS and determined and "nl" in langs and "en" not in langs, heads=frozenset(heads),
@@ -1446,7 +1493,7 @@ def _ja_kind(c: str) -> str:
 def _ja_table() -> tuple:
     """({spelling: (representative, edges or None)}, {first character: lengths, longest first}), loaded once. A
     representative maps to itself with no edge rules: it is consumed as it stands, so no shorter variant matches in it.
-    Spellings are folded as text is (Traditional -> Simplified first); one that folds onto two words is dropped."""
+    Spellings are folded as Japanese text is (kanji kept, see _fold_text); one that folds onto two words is dropped."""
     global _JA_TABLE
     if _JA_TABLE is None:
         with _JA_LOCK:
@@ -1460,8 +1507,8 @@ def _ja_table() -> tuple:
                                 pairs[variant] = target
                 except (OSError, EOFError, ValueError, zlib.error):  # missing or damaged data file: no variants
                     pairs = {}
-                han = _FOLD_HAN if _HAN_FOLD else _FOLD  # what _fold_text does to Japanese script, without its loop
-                base = {s: unicodedata.normalize("NFC", s).lower().translate(han) for s in {*pairs, *pairs.values()}}
+                # what _fold_text does to Japanese text (no Traditional -> Simplified), without its loop
+                base = {s: unicodedata.normalize("NFC", s).lower().translate(_FOLD) for s in {*pairs, *pairs.values()}}
                 targets = {base[t] for t in pairs.values()}
                 protected = "\0".join(w for w in (*FILLER_RUNS, *GREETINGS) if _KANA.search(w))
                 folded: dict[str, set] = {}
@@ -1587,8 +1634,8 @@ def _zh_table() -> _ZhTable:
                             for rest in rests:
                                 words[first + rest[:-1]] = logp[rest[-1]]
                             longest[first] = max(map(len, rests))
-                except (OSError, EOFError, ValueError, KeyError, IndexError, UnicodeDecodeError):  # no data: no words
-                    words, longest, total, names = {}, {}, 0.0, frozenset()
+                except (OSError, EOFError, ValueError, KeyError, IndexError, UnicodeDecodeError, zlib.error):
+                    words, longest, total, names = {}, {}, 0.0, frozenset()  # no data, or damaged: no words
                 _ZH_TABLE = _ZhTable(words, longest, -total, total, names)
     return _ZH_TABLE
 
