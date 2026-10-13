@@ -32,6 +32,22 @@ hermes config set memory.provider holographic
 
 or `hermes memory setup` and pick `holographic`.
 
+The catalog entry may still pin an older release while a version bump waits for review; to install a given release
+exactly, pass its commit: `hermes plugins install holographic --ref <40-character sha of the tag> --force`.
+
+### Memory went off after `hermes update`
+
+Core dropped its bundled copy on 2026-10-11 (Hermes v0.21.7) and installs this plugin in its place. If that
+install fails (a dependency resolution error in the plugin workspace, a network error), Hermes reports "Memory
+provider 'holographic' is not installed, so external memory is off", and a failed install may leave `memory.provider`
+empty and `holographic` listed under `plugins.disabled` in `config.yaml`. Your facts are not touched:
+`memory_store.db` stays where it was. To bring memory back:
+
+1. `hermes plugins install holographic` (add `--force` if a copy is already in `~/.hermes/plugins/holographic/`);
+   if it fails on dependencies, update Hermes first — the cause is usually in core's lock, not in this plugin.
+2. In `config.yaml`: remove `holographic` from `plugins.disabled`, and set `memory.provider: holographic`.
+3. Restart the gateway (or start a new CLI session) and check with `hermes memory status`.
+
 ## Config
 
 In `config.yaml` under `plugins.hermes-memory-store`:
