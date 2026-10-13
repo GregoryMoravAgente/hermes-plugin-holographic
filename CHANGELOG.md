@@ -101,6 +101,8 @@ Italian, Turkish, Polish and Dutch at the level of Spanish and French.
   `pronounce` is in it, but its spelling change is too large for the filter.
 - Russian and English dictionaries share one loader (`_related(lang, stem)`); a copy without a data file has no roots
   in that language.
+- The bundled language data (`cjk_fold.py` and every `*.gz` table) moved into `dictionaries/`, listed with their
+  sources and licences in `dictionaries/__init__.py`.
 - Turkish `ı` and Polish `ł` fold to `i` and `l` in every text (only text with those letters changes).
 - Latin text of no determined language is stemmed in English, Spanish, French, Portuguese, Indonesian and German as
   before; in Turkish, Polish or Dutch only when it has their letters, in Italian never (Polish stems joined `army` /

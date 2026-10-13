@@ -33,7 +33,10 @@ from functools import cached_property, lru_cache
 from pathlib import Path
 from typing import NamedTuple
 
-from .cjk_fold import SIMPLIFIED, TRADITIONAL
+from .dictionaries.cjk_fold import SIMPLIFIED, TRADITIONAL
+
+# the bundled language data (tables and their licences: dictionaries/__init__.py, LICENSES/)
+_DICTIONARIES = Path(__file__).with_name("dictionaries")
 
 _STEMMER_NAMES = (("en", "english"), ("ru", "russian"), ("es", "spanish"), ("fr", "french"), ("pt", "portuguese"),
                   ("id", "indonesian"), ("de", "german"), ("hi", "hindi"), ("ar", "arabic"), ("it", "italian"),
@@ -679,7 +682,7 @@ def _related(lang: str, stem_: str) -> frozenset:
             if pairs is None:
                 pairs = {}
                 try:
-                    with gzip.open(Path(__file__).with_name(f"{lang}_derivation.tsv.gz"), "rt", encoding="utf-8") as fh:
+                    with gzip.open(_DICTIONARIES / f"{lang}_derivation.tsv.gz", "rt", encoding="utf-8") as fh:
                         for line in fh:
                             a, tab, b = line.rstrip("\n").partition("\t")
                             if tab and not line.startswith("#"):
@@ -780,7 +783,7 @@ def _en_rule_roots(word: str, stem_: str) -> frozenset:
 # parts, a compound in a question finds a fact that writes its parts apart ("Termin beim Zahnarzt").
 _DE_COMPOUNDS = True
 _DE_QUESTION_HEAD = _DERIV_WEIGHT  # a compound of the question whose last part alone is in a fact: "Elternabend" / "Abend"
-_DE_FILE = Path(__file__).with_name("de_compounds.tsv.gz")
+_DE_FILE = _DICTIONARIES / "de_compounds.tsv.gz"
 _DE_TABLE: list = []  # [splitter] once loaded; [None] for a copy without the data file
 _DE_LOCK = threading.Lock()
 # separable verb particles, prepositions and prefixes: never a part ("Ausland" is not aus + Land)
@@ -1019,7 +1022,7 @@ def _compound_keys(parts: tuple) -> tuple:
 # weight like a stem, in text of that language only (Snowball's own stem already joins the regular forms). Forms that
 # are also another word ("Macht", "vino", "cuenta") or a form of another verb are not in the table.
 _LEMMA_FORMS = True
-_FORMS_FILE = Path(__file__).with_name("de_es_forms.tsv.gz")
+_FORMS_FILE = _DICTIONARIES / "de_es_forms.tsv.gz"
 _FORMS: dict[str, tuple] = {}  # language -> (form -> lemmas, lemma -> forms)
 _FORMS_LOCK = threading.Lock()
 
@@ -1419,7 +1422,7 @@ _LATIN_IN_CJK = re.compile(r"[A-Za-z][A-Za-z0-9._:/-]*[A-Za-z0-9]|[A-Za-z0-9]*\d
 # 子供達), so folding folded text changes nothing. Variants inside the filler and greeting lists are left out, so those
 # still compare as written. Hiragana variants of two letters (いす, かに, おば) are not in the table. Loaded on the first
 # text with kana.
-_JA_FILE = Path(__file__).with_name("ja_variants.tsv.gz")
+_JA_FILE = _DICTIONARIES / "ja_variants.tsv.gz"
 _JA_TABLE: tuple | None = None
 _JA_LOCK = threading.Lock()
 _JA_PARTICLES = frozenset("のはがをにでともへやかねよ")  # hiragana that may stand before or after a word
@@ -1545,7 +1548,7 @@ class _ZhTable(NamedTuple):
 
 
 _ZH_WORDS = True
-_ZH_FILE = Path(__file__).with_name("zh_words.txt.gz")
+_ZH_FILE = _DICTIONARIES / "zh_words.txt.gz"
 _ZH_TABLE: _ZhTable | None = None
 _ZH_LOCK = threading.Lock()
 _ZH_DIGITS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"  # round(4 * ln f), one character

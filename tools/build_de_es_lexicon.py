@@ -488,12 +488,12 @@ def main(argv: list[str]) -> None:
     words, over = build_compounds(dl)
     lines = [f"{w}\t{k}{c}{l or ''}" for w, (k, c, l) in sorted(words.items())]
     lines += [f"{w}\t={','.join(map(str, c))}" for w, c in sorted(over.items())]
-    size = write(ROOT / "de_compounds.tsv.gz", HEAD.format(
+    size = write(ROOT / "dictionaries" / "de_compounds.tsv.gz", HEAD.format(
         what="German compound dictionary for text.py's splitter",
         fmt="word TAB kinds (N noun, A adjective, V verb) class (0-4) [linking elements] | word TAB =cut,cut"), lines)
     print(f"de_compounds.tsv.gz: {size} bytes")
     lines = build_forms(dl, "de", top["de"]) + build_forms(dl, "es", top["es"])
-    size = write(ROOT / "de_es_forms.tsv.gz", HEAD.format(
+    size = write(ROOT / "dictionaries" / "de_es_forms.tsv.gz", HEAD.format(
         what="German and Spanish verb forms whose Snowball stem differs from their lemma's",
         fmt="language TAB lemma TAB forms"), lines)
     print(f"de_es_forms.tsv.gz: {size} bytes")

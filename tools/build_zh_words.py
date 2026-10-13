@@ -25,7 +25,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 src, dst, commit = sys.argv[1:4]
-cjk = runpy.run_path(str(Path(__file__).resolve().parent.parent / "cjk_fold.py"))
+cjk = runpy.run_path(str(Path(__file__).resolve().parent.parent / "dictionaries" / "cjk_fold.py"))
 FOLD = str.maketrans(cjk["TRADITIONAL"], cjk["SIMPLIFIED"])
 HAN = re.compile(r"^[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+$")
 DIGITS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"

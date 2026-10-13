@@ -540,7 +540,8 @@ the plugin catalog runs at admission. 0.11.0: 612 tests pass without the core (2
 need it), 600 with snowballstemmer 2.2.0 (14 skipped: no Polish stemmer). Maintenance notes are in [HANDOFF.md](HANDOFF.md).
 
 Original plugin by dusterbloom (hermes-agent PR #2351); its history is in hermes-agent
-(`git log -- plugins/memory/holographic`). MIT licence; the Traditional → Simplified Chinese table in `cjk_fold.py` is
+(`git log -- plugins/memory/holographic`). MIT licence. The bundled language data live in `dictionaries/` (the list
+with sources in its `__init__.py`, rebuilt by the scripts in `tools/`); the Traditional → Simplified Chinese table in `cjk_fold.py` is
 derived from OpenCC under Apache-2.0 ([LICENSES/OpenCC-Apache-2.0.txt](LICENSES/OpenCC-Apache-2.0.txt)), the Russian
 derivation pairs in `ru_derivation.tsv.gz` from DerivBase.Ru (UDer 1.1) under Apache-2.0
 ([LICENSES/DerivBase.Ru-Apache-2.0.txt](LICENSES/DerivBase.Ru-Apache-2.0.txt)), the Japanese spelling variants in
