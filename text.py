@@ -3,34 +3,55 @@
 Every word gets comparison keys: its folded form plus its stem in the language of the text, and two words match when
 their keys meet, so "Маши" finds "Маша", "kucingnya" finds "kucing" and "لإيفا" finds "إيفا". The language comes from
 the script (Cyrillic: Russian; Arabic script: Arabic; Devanagari: Hindi; Bengali script: Bengali) and, for Latin
-script, from the function words the text uses ("the", "el", "le", "o", "yang": English, Spanish, French, Portuguese,
-Indonesian); Latin text with none of them gets the stems of all five. Stems come from Snowball (English, Russian,
-Spanish, French, Portuguese, Indonesian, Hindi), Larkey's light10 for Arabic (as in Lucene) next to Snowball's, and a
-light suffix stripper for Bengali. Folding drops Latin accents, Arabic vowel marks and letter variants and the Indic
-nukta, and turns native digits into ASCII. A stem is a search key, not a dictionary lemma. Russian and English
+script, from the function words the text uses ("the", "el", "le", "o", "yang", "der", "il", "bir", "się", "het":
+English, Spanish, French, Portuguese, Indonesian, German, Italian, Turkish, Polish, Dutch); Latin text with none of them
+gets the stems of all ten. Stems come from Snowball (English, Russian, Spanish, French, Portuguese, Indonesian, German,
+Hindi, Italian, Turkish, Polish, Dutch; the last four stemmed as written and folded, see _NATIVE), Larkey's light10 for
+Arabic (as in Lucene) next to Snowball's, and a light suffix stripper for Bengali. Folding drops Latin accents (and
+writes Turkish ı and Polish ł as i and l), Arabic vowel marks and letter variants and the Indic nukta, and turns
+native digits into ASCII. A stem is a search key, not a dictionary lemma. Russian and English
 words also get root keys (word_roots: "ночные" / "ночь", "teacher" / "teaches"), matched at _DERIV_WEIGHT in search and
 recall, never in duplicate checks. Identifiers (anything with
 a digit, or a dotted / pathed token) are never stemmed and never stopwords. Chinese, Japanese, Korean and the scripts
-of Southeast Asia are compared by character n-grams instead (see UNSEGMENTED)."""
+of Southeast Asia are compared by character n-grams instead (see UNSEGMENTED); Traditional Chinese characters compare
+as Simplified ones, in text with kana a Japanese spelling variant compares as the word's representative spelling
+(子ども / 子供, 引越し / 引っ越し; see _ja_fold), and Chinese text is also split into words, so a pair of characters
+across two words is not that pair (和服 in 我和服务员) and a one-character word is searched alone (see zh_words)."""
 
 from __future__ import annotations
 
 import gzip
+import io
+import math
 import re
 import sys
 import threading
 import unicodedata
+import zlib
 from dataclasses import dataclass
 from functools import cached_property, lru_cache
 from pathlib import Path
+from typing import NamedTuple
 
 from .cjk_fold import SIMPLIFIED, TRADITIONAL
 
+_STEMMER_NAMES = (("en", "english"), ("ru", "russian"), ("es", "spanish"), ("fr", "french"), ("pt", "portuguese"),
+                  ("id", "indonesian"), ("de", "german"), ("hi", "hindi"), ("ar", "arabic"), ("it", "italian"),
+                  ("tr", "turkish"), ("pl", "polish"), ("nl", "dutch"))
+
+
+def _load_stemmers(snowball) -> dict:
+    """Stemmers by language code, each only if this snowballstemmer has its algorithm: Polish is not in 2.x (in 3.1.1,
+    the version Hermes pins, it is), and without it Polish words compare as written (folded) while the rest of Polish
+    (function words, greetings) still works. "dutch" is Porter's algorithm in 2.x and Snowball's newer one in 3.x,
+    which also takes off diminutives ("katje" / "kat")."""
+    available = frozenset(snowball.algorithms())
+    return {code: snowball.stemmer(name) for code, name in _STEMMER_NAMES if name in available}
+
+
 try:  # pure Python, BSD; optional: without it words compare exactly (Arabic and Bengali keep their light stemmers)
     import snowballstemmer
-    _STEMMERS = {code: snowballstemmer.stemmer(name) for code, name in (
-        ("en", "english"), ("ru", "russian"), ("es", "spanish"), ("fr", "french"), ("pt", "portuguese"),
-        ("id", "indonesian"), ("de", "german"), ("hi", "hindi"), ("ar", "arabic"))}
+    _STEMMERS = _load_stemmers(snowballstemmer)
 except ImportError:  # pragma: no cover - exercised only without the dependency
     _STEMMERS = {}
 
@@ -71,7 +92,30 @@ def word_script(word: str) -> str:
 # query cannot see past them. Words in these scripts are matched against the text of every fact instead.
 _SCAN_SCRIPTS = frozenset({"arabic", "devanagari", "bengali", "indic"})
 _SCRIPT_LANGS = {"cyrillic": ("ru",), "arabic": ("ar",), "devanagari": ("hi",), "bengali": ("bn",)}
-LATIN = ("en", "es", "fr", "pt", "id", "de")
+LATIN = ("en", "es", "fr", "pt", "id", "de", "it", "tr", "pl", "nl")
+# Latin text of no determined language is stemmed in every language of LATIN but these, which need their own letters
+# first: Polish and Turkish stems of English words join unrelated ones ("army" / "arm", "apply" / "apple", "policy" /
+# "police" are one stem in Polish), and Italian has no letters of its own
+_HYPHEN_COMPOUNDS = frozenset({"es", "fr", "pt", "id", "de"})
+_EVIDENCE = {"it": None, "tr": re.compile("[ığş\u0307]"), "pl": re.compile("[ąęłńśźżć]"), "nl": re.compile("ij")}
+# Latin languages whose words are also matched word by word against the facts' text (see Word.scan): Indonesian
+# prefixes, German compounds, Dutch plurals that change the word ("raam" / "ramen"), Turkish consonant changes ("kitap"
+# / "kitabı") and Turkish and Polish letters typed without their marks ("toplanti", "szkola") hide a word from an FTS5
+# prefix query.
+_SCAN_LATIN = frozenset({"id", "de", "tr", "pl", "nl"})
+# Languages stemmed as written as well as folded: Snowball reads the letters folding drops (Turkish "çocuğun" is
+# "çocuk", folded "cocugun" stays "cocugu"; Polish "domów" is "dom", "domow" stays), and a word typed without its marks
+# still meets one typed with them through the folded stem.
+_NATIVE = frozenset({"it", "tr", "pl", "nl"})
+# Turkish dotless ı and Polish ł are letters of their own to Unicode (no accent to drop), but are typed as i and l on
+# keyboards without them, and Turkish upper-case I lower-cases to i in Python: they compare as i and l. FTS5's
+# unicode61 keeps them, so a word that has them is also searched as written (see _native_keys).
+_DOTLESS = str.maketrans({"ı": "i", "ł": "l"})
+# Dutch writes compounds as one word, as German does ("kinderarts", "reservesleutels"). True: a word matches the end of
+# a compound in Dutch text too, as in German. Off: measured on 10 questions that ask by the end of a compound and 7
+# that use that end in its own sense, it found 2 more right facts but recalled 4 more wrong ones ("huis" in
+# "ziekenhuis", "weer" in "brandweer", "kast" in "koelkast").
+_NL_COMPOUNDS = False
 
 _FOLD = str.maketrans({
     "œ": "oe", "æ": "ae",  # Latin ligatures ("cœur" = "coeur")
@@ -85,9 +129,18 @@ _FOLD = str.maketrans({
 # user's question, or the other way round, share their characters. OpenCC's table (cjk_fold.py); stored text unchanged.
 _HAN_FOLD = True
 _FOLD_HAN = {**_FOLD, **str.maketrans(TRADITIONAL, SIMPLIFIED)}
+# Japanese spelling variants (表記揺れ) compare as the word's representative spelling, in text that has kana (so Chinese
+# text is never touched): 子ども = 子供, 引越し = 引越 = 引っ越し, スマホ = スマフォ. SudachiDict's synonym source, spellings of
+# one word only (ja_variants.tsv.gz, tools/build_ja_variants.py); stored text unchanged. See _ja_fold.
+_JA_VARIANTS = True
+_ja_ready = False  # set at the end of this module: the word lists below are folded before the table may load
+_KANA = re.compile(r"[ぁ-ゖァ-ヺ]")  # hiragana and katakana letters (not ー or ・)
 
 
-def _fold_text(text: str) -> str:
+def _fold_text(text: str, ja: bool | None = None, dotless: bool = True) -> str:
+    """The comparison form of a text (see fold). *ja*: apply the Japanese spelling variants; None decides by the text
+    itself (it has kana). analyze decides once for a whole text and passes it on to each of its words. *dotless*=False
+    keeps ı and ł, as FTS5's unicode61 tokenizer does."""
     if text.isascii():
         return text
     out, latin = [], False
@@ -98,15 +151,27 @@ def _fold_text(text: str) -> str:
         else:
             latin = c.isascii() or _script(c) == "latin"
         out.append(c)
-    return unicodedata.normalize("NFC", "".join(out)).translate(_FOLD_HAN if _HAN_FOLD else _FOLD)
+    folded = unicodedata.normalize("NFC", "".join(out)).translate(_FOLD_HAN if _HAN_FOLD else _FOLD)
+    if dotless:
+        folded = folded.translate(_DOTLESS)
+    if _JA_VARIANTS and _ja_ready and (_KANA.search(folded) is not None if ja is None else ja):
+        return _ja_fold(folded)
+    return folded
 
 
 @lru_cache(maxsize=65536)
 def fold(word: str) -> str:
-    """Comparison form of a lower-cased word: Latin accents dropped ("está" = "esta"), Arabic vowel marks, tatweel and
-    letter variants normalised (أ إ آ -> ا, ى -> ي, ة -> ه), the Indic nukta dropped, native digits as ASCII, Traditional
-    Chinese characters as Simplified."""
+    """Comparison form of a lower-cased word: Latin accents dropped ("está" = "esta"), Turkish ı and Polish ł as i
+    and l, Arabic vowel marks, tatweel and letter variants normalised (أ إ آ -> ا, ى -> ي, ة -> ه), the Indic nukta
+    dropped, native digits as ASCII, Traditional Chinese characters as Simplified, a Japanese spelling variant (in a
+    word with kana) as the representative one."""
     return _fold_text(word)
+
+
+@lru_cache(maxsize=65536)
+def _fold_ja(word: str) -> str:
+    """fold() for a word of a text that has kana: the word itself may have none ("申込" in "申込 締切 いつ？")."""
+    return _fold_text(word, True)
 
 
 def _folded(words: str) -> frozenset:
@@ -182,8 +247,50 @@ STOP = {
     তিনি তাঁরা আমার আমাদের তোমার তোমাদের আপনার আপনাদের তার তাদের তাঁর তাঁদের কে কী কি কেন কোন কোথায় কখন কবে কীভাবে
     কিভাবে কেমন কত কতটা কাকে কার একটি একটা এক জন্য সাথে সঙ্গে থেকে দিয়ে নিয়ে হয় হয়ে হলে হবে হচ্ছে ছিল ছিলেন আছে
     আছেন নেই না নয় হ্যাঁ ঠিক আচ্ছা ধন্যবাদ হ্যালো নমস্কার প্রতি করে করেন করা করছে যায় খুব এর এ তে র"""),
+# Italian, Turkish, Polish, Dutch (unreleased). Left out: everyday English words ("go", "one", "ten", "pod", Turkish
+# "size") and the name Mia (Italian "mia", my). Words that are also content words, names or abbreviations elsewhere are
+# listed but do not tell the language (_WEAK).
+"it": _folded("""
+    il lo la i gli le un uno una di a da in con su per tra fra del dello della dei degli delle al allo alla ai agli
+    alle dal dallo dalla dai dagli dalle nel nello nella nei negli nelle sul sullo sulla sui sugli sulle col coi e ed o
+    ma anche che chi cui non né se come dove quando quanto quanta quanti quante quale quali perché cosa io tu lui lei
+    noi voi loro mi ti ci vi si ne me te ce ve mio miei mie tuo tua tuoi tue suo sua suoi sue nostro nostra nostri
+    nostre vostro vostra vostri vostre questo questa questi queste quello quella quelli quelle quel è sono sei siamo
+    siete era erano ero essere stato stata stati ha ho hai abbiamo avete hanno aveva avevo avere può posso puoi
+    possiamo possono devo deve dobbiamo devono devi vuole voglio vuoi più molto poco tutto tutti tutta tutte ogni già
+    ancora sempre così poi allora qui qua lì là ok okay sì no grazie ciao prego bene va"""),
+"tr": _folded("""
+    ve veya ya ile ama fakat ancak çünkü için gibi kadar daha en çok az bir bu şu o bunlar şunlar onlar ben sen biz siz
+    onu bunu şunu ona buna şuna bana sana bize beni seni bizi sizi benim senin onun bizim sizin onların bunun şunun de
+    da ki mi mı mu mü ne neden niye nasıl nerede nereye nereden zaman kim kimi kime kimin hangi hangisi kaç kaçta var
+    yok değil evet hayır tamam olan olarak oldu olur olacak ise her hiç şey sonra önce şimdi zaten artık hep bile
+    sadece yani teşekkürler teşekkür sağol merhaba selam lütfen tabii peki"""),
+"pl": _folded("""
+    i a o u w we z ze na do od po za przy przez dla bez nad przed między się nie tak jak co kto gdzie kiedy dlaczego
+    czemu ile jaki jaka jakie jakiego jakiej jakim jakimi który która które którego której którym czy to ta te tego tej
+    tym tych jest są był była było byli będzie być mam ma masz mamy macie mają miał miała może można musi trzeba już
+    jeszcze też także tylko bardzo ja ty on ona ono my wy oni mnie mi ciebie cię ci tobie mu jego jej ich im nas nam
+    was wam mój moja moje mojego twój twoja twoje swój swoja swoje nasz nasza nasze wasz wasza ale lub albo że żeby
+    więc bo oraz jakiś coś ktoś ok okej dzięki dziękuję cześć proszę no"""),
+"nl": _folded("""
+    de het een en of maar niet geen wel ook nog al dan als dat die dit deze wat wie waar wanneer waarom hoe welke welk
+    hoeveel ik jij je u hij zij ze wij we jullie hen hun mij me mijn jouw jou zijn haar ons onze is ben bent was waren
+    wordt worden werd heeft heb hebt hebben had hadden kan kun kunt kunnen moet moeten moest wil wilt willen zal zullen
+    zou in op aan bij met van voor naar uit over onder tot om door te tegen zonder na er hier daar nu zo heel veel meer
+    ja nee oké ok bedankt dank hallo hoi doei graag z'n zo'n"""),
 }
 STOPWORDS = frozenset().union(*STOP.values())
+# Function words of a new language that are also content words, names or abbreviations of another ("come" and "dove"
+# in English, Spanish "come"; Turkish "kim", "ben"; Polish "bo", single "u", "w", "z"; Dutch "door", "met", "van", the
+# Thai "wat"): they do not vote for their language, and are dropped only in text that language alone is best
+# supported in, so "Ana come carne" stays Spanish and "Anton met Eva at the door" English.
+_WEAK = {
+    "it": _folded("per come dove ci vi io lei ed chi fra sei col"),
+    "tr": _folded("kim ben ki var bile sen beni yani daha az sana ama"),
+    "pl": _folded("u w z bo ci ale maja nam mu coś ile po od"),
+    "nl": _folded("door met van wat heel ben dank"),
+}
+_VOTERS = {lang: words - _WEAK.get(lang, frozenset()) for lang, words in STOP.items()}
 
 # Question words that say nothing about the subject of a QUESTION ("какая сегодня погода": "какая" met "как" in every
 # fact that says "считать как …"), but are part of a statement ("Иван знает, почему" is not "Иван знает, куда"): left
@@ -195,14 +302,16 @@ NEGATORS = _folded("""nicht kein keine keinen keinem keiner nie niemals nichts
     not no never nobody nothing cannot don't doesn't didn't isn't aren't wasn't weren't won't can't
     couldn't shouldn't haven't hasn't dont doesnt didnt isnt cant wont не нет никогда ни nunca jamás tampoco nadie
     ningún ninguna ninguno ne pas jamais aucun aucune non não nem nenhum nenhuma tidak tak bukan belum jangan لا لم لن
-    ليس ليست नहीं न मत না নয় নেই নি""")
+    ليس ليست नहीं न मत না নয় নেই নি nessuno nessuna niente nulla değil yok hiç asla hayır nigdy nic żaden żadna żadne
+    nikt niet geen nooit niets niemand""")  # not Italian "mai" (never): "Chiang Mai", French "mai"
 
 
 # Function words a claim still needs ("with sugar" / "without sugar"), and conjunctions after which a negation belongs
 # to another clause ("likes cats but not dogs").
-CLAIM_WORDS = _folded("with without avec sans con sin com sem dengan tanpa mit ohne مع بدون साथ बिना সাথে ছাড়া с без")
+CLAIM_WORDS = _folded("with without avec sans con sin com sem dengan tanpa mit ohne مع بدون साथ बिना সাথে ছাড়া с без "
+                      "senza ile olmadan z ze bez met zonder")
 CONTRASTIVE = _folded("but however pero sino mais mas porém tapi tetapi namun aber sondern jedoch لكن बल्कि लेकिन किंतु "
-                      "কিন্তু но")
+                      "কিন্তু но però tuttavia invece bensì ama fakat ancak lakin ale lecz jednak maar echter")
 
 
 def _greeting_key(text: str) -> str:
@@ -233,10 +342,21 @@ GREETINGS = frozenset(_greeting_key(g) for g in """
     どうもありがとう|どうも|よろしく|よろしくお願いします|はじめまして|
     안녕|안녕하세요|안녕하십니까|좋은 아침|좋은 아침이에요|고마워|고마워요|고맙습니다|감사합니다|감사해요|잘 자|잘 자요|
     สวัสดี|สวัสดีครับ|สวัสดีค่ะ|อรุณสวัสดิ์|อรุณสวัสดิ์ครับ|อรุณสวัสดิ์ค่ะ|ขอบคุณ|ขอบคุณครับ|ขอบคุณค่ะ|ขอบคุณมาก|
-    ขอบคุณมากครับ|ขอบคุณมากค่ะ|ราตรีสวัสดิ์""".split("|"))
+    ขอบคุณมากครับ|ขอบคุณมากค่ะ|ราตรีสวัสดิ์|
+    buongiorno|buon giorno|buonasera|buona sera|buonanotte|buona notte|buon pomeriggio|ciao|ciao a tutti|salve|grazie|
+    grazie mille|mille grazie|molte grazie|grazie tante|come stai|come va|tutto bene|arrivederci|a dopo|a domani|
+    merhaba|merhabalar|selam|selamlar|herkese merhaba|günaydın|tünaydın|iyi günler|iyi akşamlar|iyi geceler|nasılsın|
+    nasılsınız|naber|teşekkürler|teşekkür ederim|çok teşekkürler|çok teşekkür ederim|sağ ol|sağ olun|eyvallah|
+    görüşürüz|hoşça kal|
+    cześć|dzień dobry|dobry wieczór|dobranoc|witam|witaj|witajcie|siema|hej|cześć wszystkim|jak się masz|co słychać|
+    dziękuję|dzięki|dziękuję bardzo|bardzo dziękuję|wielkie dzięki|do zobaczenia|na razie|
+    hallo|hoi|goedemorgen|goedemiddag|goedenavond|goedenacht|hallo allemaal|hoi allemaal|hoe gaat het|hoe is het|
+    dank je|dank je wel|dankjewel|dank u|dank u wel|bedankt|heel erg bedankt|tot ziens|tot morgen|doei|
+    fijne dag""".split("|"))
 
 
-# Pieces a courtesy message is made of in English and Russian, beyond the whole greetings above: thanks, sign-offs,
+# Pieces a courtesy message is made of in English and Russian (and, unreleased, Italian, Turkish, Polish and Dutch),
+# beyond the whole greetings above: thanks, sign-offs,
 # reactions, "how are you"-questions and the words that pad them ("today", "there", "so much"). A message whose every
 # clause is a run of these pieces ("Hi, good morning!", "Thanks a lot, that's all for now", "Good morning! How are you
 # today?", "спасибо, на этом всё") asks nothing. A clause with any other word ("how is Tim doing at school") is a
@@ -264,7 +384,36 @@ COURTESY = frozenset(_greeting_key(g) for g in """
     как дела|как ты|как вы|как у тебя дела|как у вас дела|как поживаешь|как поживаете|как прошёл день|как прошел день|
     как твой день|как настроение|что нового|как сам|как сама|как твоя неделя|как прошла неделя|как выходные|
     как прошли выходные|с пятницей|с праздником|с выходными|с днём рождения|с днем рождения|поздравляю|
-    сладких снов|спи спокойно|и тебе|и вам|взаимно|у меня всё хорошо|у меня все хорошо|нормально|""".split("|"))
+    сладких снов|спи спокойно|и тебе|и вам|взаимно|у меня всё хорошо|у меня все хорошо|нормально|
+    buongiorno|buonasera|buonanotte|buon pomeriggio|ciao|salve|ehi|grazie|grazie mille|mille grazie|grazie tante|
+    molte grazie|prego|di niente|figurati|perfetto|ottimo|benissimo|bene|va bene|d'accordo|capito|certo|sì|tutto bene|
+    tutto ok|come stai|come va|come state|sto bene|anche tu|anche a te|altrettanto|arrivederci|a dopo|a domani|a presto|
+    ci vediamo|alla prossima|buona giornata|buona serata|buon weekend|buon fine settimana|sogni d'oro|auguri|
+    complimenti|bravo|brava|è tutto|per ora è tutto|per oggi è tutto|ahah|
+    a tutti|tutti|ragazzi|di nuovo|ancora|oggi|stamattina|molto|tante|davvero|per ora|per oggi|
+    merhaba|merhabalar|selam|selamlar|günaydın|tünaydın|iyi günler|iyi akşamlar|iyi geceler|iyi sabahlar|teşekkürler|
+    teşekkür ederim|teşekkür ederiz|çok teşekkürler|çok teşekkür ederim|sağ ol|sağol|sağ olun|eyvallah|rica ederim|
+    bir şey değil|tamam|tamamdır|peki|tabii|tabi|olur|anladım|anlaşıldı|harika|süper|mükemmel|güzel|çok güzel|evet|
+    hayır|nasılsın|nasılsınız|naber|ne haber|nasıl gidiyor|iyiyim|ben de iyiyim|sen nasılsın|siz nasılsınız|sen de|
+    siz de|sana da|size de|görüşürüz|görüşmek üzere|hoşça kal|hoşça kalın|kendine iyi bak|iyi hafta sonları|
+    iyi şanslar|kolay gelsin|tebrikler|bu kadar|şimdilik bu kadar|hepsi bu|vay|
+    herkese|herkes|arkadaşlar|millet|bugün|tekrar|çok|şimdilik|canım|canlarım|canlar|tatlım|dostlar|akşam|sabah|
+    yarın|
+    cześć|dzień dobry|dobry wieczór|dobranoc|dobrej nocy|witam|witaj|witajcie|siema|siemka|hej|hejka|dziękuję|dzięki|
+    dziękuję bardzo|bardzo dziękuję|wielkie dzięki|stokrotne dzięki|dziękuję ci|dziękuję wam|nie ma za co|proszę|
+    świetnie|ekstra|dobrze|okej|jasne|rozumiem|zrozumiałem|zrozumiałam|spoko|tak|nie|jak się masz|jak się macie|
+    jak się czujesz|co słychać|co u ciebie|co u was|jak leci|wszystko dobrze|wszystko w porządku|w porządku|
+    u mnie dobrze|u mnie wszystko dobrze|nawzajem|wzajemnie|ty też|do zobaczenia|do jutra|na razie|pa|papa|
+    trzymaj się|miłego dnia|miłego wieczoru|udanego weekendu|miłego weekendu|kolorowych snów|śpij dobrze|gratulacje|
+    powodzenia|wszystkiego najlepszego|to wszystko|na dziś to wszystko|na razie to wszystko|
+    wszystkim|wszystkich|kochani|dzisiaj|dziś|jeszcze raz|bardzo|na dziś|ponownie|
+    hallo|hoi|hé|hee|goedemorgen|goedemiddag|goedenavond|goedenacht|dag|bedankt|dank je|dank je wel|dankjewel|dank u|
+    dank u wel|heel erg bedankt|alvast bedankt|graag gedaan|geen probleem|geen dank|top|prima|mooi|fijn|oké|helder|
+    duidelijk|begrepen|komt goed|ja|nee|goed|hoe gaat het|hoe gaat het met je|hoe gaat het met jou|hoe is het|
+    hoe is het met je|alles goed|alles prima|met mij gaat het goed|tot ziens|tot morgen|tot straks|tot later|tot zo|
+    doei|fijne dag|fijne avond|fijn weekend|prettig weekend|slaap lekker|welterusten|gefeliciteerd|succes|jij ook|
+    u ook|insgelijks|dat is alles|dat was het|voor nu|
+    allemaal|iedereen|jongens|vandaag|nogmaals|heel|erg|""".split("|"))
 _CLAUSE = re.compile(r"[.,;:!?…\n\r]+")
 # Pieces that only pad a courtesy ("good", "day", "today", "fine", "сегодня", "всё"): a clause of these alone is a
 # question or an answer ("fine?" about a fine, "сегодня?" about a lesson), not small talk.
@@ -272,7 +421,12 @@ _COURTESY_PADDING = frozenset(_greeting_key(g) for g in """
     good|afternoon|evening|night|day|there|all|everyone|guys|team|folks|mate|buddy|dear|again|today|tonight|so|much|
     a lot|very|too|really|fine|later|
     добрый|доброе|доброго|утра|день|дня|вечер|вечера|ночи|всем|всех|ребята|друзья|еще раз|ещё раз|снова|сегодня|
-    большое|огромное|всё|все|пока|нормально""".split("|"))
+    большое|огромное|всё|все|пока|нормально|
+    a tutti|tutti|ragazzi|di nuovo|ancora|oggi|stamattina|molto|tante|davvero|per ora|per oggi|
+    herkese|herkes|arkadaşlar|millet|bugün|tekrar|çok|şimdilik|canım|canlarım|canlar|tatlım|dostlar|akşam|sabah|
+    yarın|
+    wszystkim|wszystkich|kochani|dzisiaj|dziś|jeszcze raz|bardzo|na dziś|ponownie|
+    allemaal|iedereen|jongens|vandaag|nogmaals|heel|erg""".split("|"))
 
 
 def _clause_cuts(clause: str) -> tuple[str, frozenset]:
@@ -381,7 +535,17 @@ def stem(word: str, lang: str | None = None) -> str:
     if lang == "bn":
         return _bengali_stem(word)
     stemmer = _STEMMERS.get(lang)
-    return fold(stemmer.stemWord(word)) if stemmer else word
+    return fold(_snowball(stemmer, word, lang)) if stemmer else word
+
+
+def _snowball(stemmer, word: str, lang: str) -> str:
+    """Snowball's stem. Dutch: a leading ge- that Snowball 3.x takes off is put back. It is taken off so that a past
+    participle meets its verb ("gemaakt" / "maak"), and that turns nouns into other words ("gezin", family, into "zin",
+    sense; "gerecht", dish, into "recht", right; "gezicht", face, into "zicht", view; "geboekt" into "boek", book)."""
+    stem_ = stemmer.stemWord(word)
+    if lang == "nl" and word.startswith("ge") and not stem_.startswith("ge") and len(word) > 4:
+        return "ge" + stem_
+    return stem_
 
 
 # A conjunction (و ف) and/or a preposition (ب ك ل) glued to a word that starts with alef, as names and the article
@@ -389,9 +553,62 @@ def stem(word: str, lang: str | None = None) -> str:
 _AR_CLITICS = re.compile(r"^[وف]?[بكل]?(?=ا)")
 
 
+_TR_VOWELS = frozenset("aeıioöuü")
+
+
+def _tr_possessive(word: str, stem_: str) -> str:
+    """Snowball's Turkish leaves the buffer s of a possessive after a vowel ("kedisi" is "kedis", "annesi" "annes",
+    "toplantısı" "toplantıs"): the noun without it ("kedi", "anne", "toplantı"); "" when the stem is not that."""
+    if len(stem_) >= 4 and stem_[-1] == "s" and stem_[-2] in _TR_VOWELS and word.startswith(stem_) \
+            and word[len(stem_):len(stem_) + 1] in ("ı", "i", "u", "ü"):
+        return stem_[:-1]
+    return ""
+
+
+def _written(raw: str) -> str:
+    """A lower-cased word as Snowball reads it: Turkish İ lower-cases to i with a combining dot, which is just i."""
+    return unicodedata.normalize("NFC", raw.replace("i\u0307", "i"))
+
+
 @lru_cache(maxsize=65536)
-def _keys(word: str, langs: tuple[str, ...]) -> frozenset:
-    keys = {word, *(stem(word, lang) for lang in langs)}
+def _native_stems(written: str, lang: str) -> tuple[str, ...]:
+    """Stems of a word of a _NATIVE language as written (not folded), unfolded; () without its stemmer."""
+    stemmer = _STEMMERS.get(lang)
+    if stemmer is None or is_identifier(written):
+        return ()
+    stem_ = _snowball(stemmer, written, lang)
+    possessive = _tr_possessive(written, stem_) if lang == "tr" else ""
+    return tuple(s for s in (stem_, possessive) if len(s) >= _MIN_STEM)
+
+
+@lru_cache(maxsize=65536)
+def _native_keys(written: str, lang: str) -> frozenset:
+    """Keys of a word of a _NATIVE language stemmed as written, folded afterwards; and, when it has ı or ł, the word
+    and its stems as FTS5 indexed them (unicode61 drops accents but keeps those letters), so the prefix query reaches
+    "toplantı" and "szkoła" in the index although the comparison form is "toplanti", "szkola"."""
+    stems_ = _native_stems(written, lang)
+    keys = {fold(s) for s in stems_}
+    if "ı" in written or "ł" in written:
+        keys |= {_fold_text(s, dotless=False) for s in (written, *stems_)}
+    return frozenset(keys)
+
+
+@lru_cache(maxsize=65536)
+def _keys(word: str, langs: tuple[str, ...], written: str = "") -> frozenset:
+    """The word and its stems in *langs*. *written*: the word before folding, for languages Snowball reads better
+    with its letters (_NATIVE); "" when it is the same."""
+    keys = {word}
+    for lang in langs:
+        stem_ = stem(word, lang)
+        if lang not in _NATIVE:
+            keys.add(stem_)
+            continue
+        if len(stem_) >= _MIN_STEM or stem_ == word:  # Snowball's Turkish leaves "ç" of "cuma", "ai" of "aile"
+            keys.add(stem_)
+        if lang == "tr" and (possessive := _tr_possessive(word, stem_)):
+            keys.add(possessive)
+        if written:
+            keys |= _native_keys(written, lang)
     if "ar" in langs:
         if "ar" in _STEMMERS:
             keys.add(fold(_STEMMERS["ar"].stemWord(word)))
@@ -408,10 +625,9 @@ def _keys(word: str, langs: tuple[str, ...]) -> frozenset:
 
 # -- same-root words ---------------------------------------------------------------------------------------------
 # Snowball removes inflection and some derivation, not all: "ночь" is "ноч" but "ночные" is "ночн"; "teacher",
-# "swimmer" and "dentist" stay apart from "teach", "swim" and "dental". A root key strips one or two derivational
-# suffixes off the stem, so the noun, the adjective, the verb and the agent noun of one root meet. A root is a real
-# beginning of the word (the FTS prefix query finds the other forms), and a match through it counts _DERIV_WEIGHT of an
-# exact one. Alternating consonants ("друг" / "дружба", "собака" / "собачий") are not joined.
+# "swimmer" and "decision" stay apart from "teach", "swim" and "decide". Root keys are the stems a dictionary links to
+# the word's stem by a derivation (below), so the noun, the adjective, the verb and the agent noun of one root meet; a
+# match through one counts _DERIV_WEIGHT of an exact one and never recalls a fact alone.
 _NOT_RUSSIAN = re.compile(r"[іїєґў]")  # Ukrainian and Belarusian letters
 _RU_ADJ = re.compile(r"(?:ый|ий|ой|ая|яя|ое|ее|ые|ие|ого|его|ому|ему|ым|им|ых|их|ую|юю|ыми|ими)$")
 _RU_VERB = re.compile(r"(?:ть|ться|тся|ет|ют|ут|ит|ат|ят|ем|ешь|ишь|ете|ите|ется|ится|ются|утся|ятся|ла|ло|ли|лся|"
@@ -445,29 +661,39 @@ def word_roots(word: str, stem_: str, lang: str) -> frozenset:
 # build_ru_derivation.py). Suffix rules cannot tell "ночные" / "ночь" from "полный" / "пол"; the dictionary can, and it
 # also has what rules cannot reach ("друг" / "дружеский"). "rules" keeps 0.9.0's first rules, "both" joins the two.
 _RU_DERIVATION = "dict"
-_RU_PAIRS: dict | None = None
-_RU_PAIRS_LOCK = threading.Lock()
+# English the same way from Open English Wordnet 2025 (CC BY 4.0, built on Princeton WordNet 3.1): its derivation and
+# pertainym links between single words, as Snowball stem pairs of the shape of a derivation (tools/
+# build_en_derivation.py): "pay" / "payment", "decide" / "decision", "angry" / "anger"; rules gave "Peter" / "pet" and
+# "meters" / "met". "rules" keeps the one-step suffix rules of 0.9.0, "both" joins the two.
+_EN_DERIVATION = "dict"
+_PAIRS: dict[str, dict] = {}
+_PAIRS_LOCK = threading.Lock()
 
 
-def _ru_related(stem_: str) -> frozenset:
-    """Stems linked to *stem_* by a derivation in the dictionary (loaded on first use, about 47,000 pairs)."""
-    global _RU_PAIRS
-    if _RU_PAIRS is None:
-        with _RU_PAIRS_LOCK:
-            if _RU_PAIRS is None:
-                pairs: dict[str, tuple] = {}
+def _related(lang: str, stem_: str) -> frozenset:
+    """Stems linked to *stem_* by a derivation in the *lang* dictionary (loaded on the first word of that language)."""
+    pairs = _PAIRS.get(lang)
+    if pairs is None:
+        with _PAIRS_LOCK:
+            pairs = _PAIRS.get(lang)
+            if pairs is None:
+                pairs = {}
                 try:
-                    with gzip.open(Path(__file__).with_name("ru_derivation.tsv.gz"), "rt", encoding="utf-8") as fh:
+                    with gzip.open(Path(__file__).with_name(f"{lang}_derivation.tsv.gz"), "rt", encoding="utf-8") as fh:
                         for line in fh:
                             a, tab, b = line.rstrip("\n").partition("\t")
                             if tab and not line.startswith("#"):
                                 a, b = sys.intern(a), sys.intern(b)  # each stem kept once
                                 pairs[a] = pairs.get(a, ()) + (b,)
                                 pairs[b] = pairs.get(b, ()) + (a,)
-                except OSError:  # a copy without the data file: no dictionary roots
+                except (OSError, EOFError, ValueError, zlib.error):  # missing or damaged data file: no roots
                     pairs = {}
-                _RU_PAIRS = pairs
-    return frozenset(_RU_PAIRS.get(stem_, ()))
+                _PAIRS[lang] = pairs
+    return frozenset(pairs.get(stem_, ()))
+
+
+def _ru_related(stem_: str) -> frozenset:
+    return _related("ru", stem_)
 
 
 @lru_cache(maxsize=65536)
@@ -511,6 +737,13 @@ def _ru_rule_roots(word: str, stem_: str) -> frozenset:
 
 @lru_cache(maxsize=65536)
 def _en_roots(word: str, stem_: str) -> frozenset:
+    if _EN_DERIVATION == "dict":
+        return _related("en", stem_)
+    rules = _en_rule_roots(word, stem_)
+    return rules | _related("en", stem_) if _EN_DERIVATION == "both" else rules
+
+
+def _en_rule_roots(word: str, stem_: str) -> frozenset:
     """One step off the Porter2 stem, never two: teacher → teach, swimmer → swim, driver → drive, dentist / dental →
     dent, electrician → electric, investor → invest, photographi → photograph (battery stops at batter, not bat;
     general at gener, not gene). Words and stems in _EN_NOT_AGENT get none ("mothers" is not "moths")."""
@@ -533,10 +766,318 @@ def _en_roots(word: str, stem_: str) -> frozenset:
     return frozenset(r for r in out if len(r) >= 3 and r != stem_)
 
 
+# -- German compounds --------------------------------------------------------------------------------------------
+# German writes a compound as one word: "Zahnarzttermin" is Zahn + Arzt + Termin, and no stem of it meets "Termin" or
+# "Zahnarzt". In text whose language is determined as German, a word is split by a dictionary of German lexemes from
+# Wikidata (CC0; de_compounds.tsv.gz, tools/build_de_es_lexicon.py), the way Koehn & Knight split compounds: parts
+# of three letters or more joined by the linking elements German uses (-s-, -es-, -n-, -en-, -er-, -e-, a dropped -e),
+# the analysis with the fewest parts, parts that are rarely parts of other words only when nothing else fits, two
+# analyses that cut differently left whole unless one is clearly more likely ("Staubecken": Stau-Becken or
+# Staub-Ecken). A word the dictionary knows as one word stays whole ("Kartoffel", "Tablette"), and so do its forms; a
+# compound of the dictionary is cut where the dictionary (or Wikidata's own analysis, "combines lexemes") says. The
+# last part names what the word is ("Familienkatze" is a Katze) and matches as the word itself does; the parts before
+# it (modifiers) count _DERIV_WEIGHT and never recall a fact alone. Both ways: a compound in a fact is found by its
+# parts, a compound in a question finds a fact that writes its parts apart ("Termin beim Zahnarzt").
+_DE_COMPOUNDS = True
+_DE_QUESTION_HEAD = _DERIV_WEIGHT  # a compound of the question whose last part alone is in a fact: "Elternabend" / "Abend"
+_DE_FILE = Path(__file__).with_name("de_compounds.tsv.gz")
+_DE_TABLE: list = []  # [splitter] once loaded; [None] for a copy without the data file
+_DE_LOCK = threading.Lock()
+# separable verb particles, prepositions and prefixes: never a part ("Ausland" is not aus + Land)
+_DE_PREFIXES = frozenset("""ab an auf aus bei da dar ein emp ent er fort ge her hin miss mit nach ob um un ur ver vor
+    weg zer zu zur zum uber unter durch wider wieder gegen hinter neben ohne seit statt trotz entlang zuruck zusammen
+    dran drin drum los voll""".split())
+# derivational suffixes that are also words: never the last part ("dauerhaft" is no Haft, "Gefährdung" no Dung)
+_DE_NOT_HEADS = frozenset("""bar haft lein chen ion sam tum ling heit keit schaft ung nis lich isch los mal weise tion
+    ismus ist ent ant ei erei in innen iker ik lei ich dung""".split())
+_DE_LINKS = {"_": "", "s": "s", "z": "es", "n": "n", "m": "en", "r": "er", "e": "e", "x": "ens", "y": "nen"}
+_DE_NOUN_END = ("", "e", "en", "n", "er", "s", "es", "ern", "ens", "nen", "se", "sen")
+_DE_FEM_END = ("in", "innen")  # Lehrerin, Ärztinnen: the female form of a noun, not a compound with -in
+_DE_ADJ_END = ("", "e", "en", "er", "es", "em")
+_DE_VERB_END = ("e", "st", "t", "en", "et", "te", "ten", "test", "tet", "tes", "end", "ende", "enden")
+_DE_CLASS = (0, 2, 9, 40, 200)  # how often a word is a part of other words, by class: the likelier analysis wins
+_DE_TWO_LETTER_HEADS = frozenset({"ol"})  # Öl: Olivenöl, Heizöl
+
+
+def _de_vstem(verb: str) -> str:
+    """The stem a verb lends a compound: schwimmen → schwimm (Schwimmbad), wandern → wander (Wanderweg)."""
+    if verb.endswith(("eln", "ern")) and len(verb) >= 6:
+        return verb[:-1]
+    return verb[:-2] if verb.endswith("en") and len(verb) >= 5 else ""
+
+
+class _DeSplitter:
+    """The splitter over a table of words (word -> (kinds, class, links)) and dictionary cuts (word -> cut positions).
+    kinds: N noun, A adjective, V verb; class 0-4: how often the word is a part of other words; links: the linking
+    elements seen after it as a modifier (codes of _DE_LINKS, "d" a dropped -e), None for any. *need*: the least class
+    of a part of 3, 4 and 5+ letters (*head_need* for the last part, *need_verb* for a verb's stem). The build
+    (tools/build_de_es_lexicon.py) judges the dictionary's own words with this class and stricter limits."""
+
+    def __init__(self, words: dict, cuts: dict, need=(2, 1, 1), head_need=None, need_verb=3, margin=1.0,
+                 min_part=3, min_word=6, max_parts=4):
+        self.words, self.cuts_of = words, cuts
+        self.need, self.head_need, self.need_verb = need, head_need or need, need_verb
+        self.margin, self.min_part, self.min_word, self.max_parts = margin, min_part, min_word, max_parts
+
+    @classmethod
+    def load(cls, path) -> "_DeSplitter":
+        words, cuts = {}, {}
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            for line in fh:
+                word, tab, code = line.rstrip("\n").partition("\t")
+                if not tab or line.startswith("#"):
+                    continue
+                if code.startswith("="):
+                    cuts[word] = tuple(int(c) for c in code[1:].split(",") if c)
+                else:
+                    i = next(i for i, c in enumerate(code) if c.isdigit())
+                    words[word] = (sys.intern(code[:i]), int(code[i]), code[i + 1:] or None)
+        return cls(words, cuts)
+
+    def _ok(self, part: str, cls: int, need) -> bool:
+        return len(part) >= self.min_part and part not in _DE_PREFIXES and cls >= need[min(len(part), 5) - 3]
+
+    def _kinds(self, word: str) -> str:
+        entry = self.words.get(word)
+        return entry[0] if entry else ""
+
+    def _modifiers(self, s: str) -> list:
+        """(lemma, class, kind) readings of s before another part: a noun with a linking element, an adjective, a
+        verb's stem."""
+        out, words = [], self.words
+        if len(s) < self.min_part or s in _DE_PREFIXES:
+            return out
+        for code, link in _DE_LINKS.items():
+            base = s[:len(s) - len(link)] if link else s
+            entry = words.get(base) if s.endswith(link) else None
+            if entry and "N" in entry[0] and (entry[2] is None or code in entry[2]) and self._ok(base, entry[1], self.need):
+                out.append((base, entry[1], "N"))
+        entry = words.get(s + "e")  # Schule → Schulbus
+        if entry and "N" in entry[0] and (entry[2] is None or "d" in entry[2]) and self._ok(s, entry[1], self.need):
+            out.append((s + "e", entry[1], "N"))
+        entry = words.get(s)
+        if entry and "A" in entry[0] and self._ok(s, entry[1], self.need):
+            out.append((s, entry[1], "A"))
+        for stem_ in (s, s[:-1] if s.endswith("e") else ""):  # Schwimmbad, Wartezimmer
+            if len(stem_) >= self.min_part and stem_ not in _DE_PREFIXES:
+                for verb in (stem_ + "en", stem_ + "n"):
+                    entry = words.get(verb)
+                    if entry and "V" in entry[0] and entry[1] >= self.need_verb and _de_vstem(verb) == stem_:
+                        out.append((verb, entry[1], "V"))
+        return out
+
+    def _heads(self, s: str) -> list:
+        """(lemma, class, kind) readings of s as the last part: a noun in any of its forms, a verb's infinitive used
+        as a noun (Abendessen)."""
+        out, words = [], self.words
+        for end in _DE_NOUN_END:
+            base = s[:len(s) - len(end)] if end else s
+            entry = words.get(base) if s.endswith(end) else None
+            if entry and "N" in entry[0] and base not in _DE_NOT_HEADS and \
+                    (self._ok(base, entry[1], self.head_need) or base in _DE_TWO_LETTER_HEADS):
+                out.append((base, entry[1], "N"))
+        for end in ("", "s"):
+            base = s[:len(s) - len(end)] if end else s
+            entry = words.get(base) if s.endswith(end) else None
+            if entry and entry[0] == "V" and base.endswith("en") and entry[1] >= self.need_verb:
+                out.append((base, entry[1], "V"))
+        return out
+
+    def known(self, word: str) -> bool:
+        """A word of the table that is not a compound, or one of its forms: never split."""
+        kinds = self._kinds
+        if any(word.endswith(e) and "N" in kinds(word[:len(word) - len(e)] if e else word) for e in _DE_NOUN_END):
+            return True
+        if any(word.endswith(e) and ("N" in kinds(word[:-len(e)]) or "N" in kinds(word[:-len(e)] + "e"))
+               for e in _DE_FEM_END):
+            return True
+        if any(word.endswith(e) and "A" in kinds(word[:len(word) - len(e)] if e else word) for e in _DE_ADJ_END):
+            return True
+        for end in _DE_VERB_END:
+            base = word[:-len(end)]
+            if word.endswith(end) and ("V" in kinds(base + "en") or "V" in kinds(base + "n")):
+                return True
+        if word.startswith("ge") and word.endswith(("t", "en")):  # participles: gemacht, gefahren
+            base = word[2:-1] if word.endswith("t") else word[2:-2]
+            if "V" in kinds(base + "en") or "V" in kinds(base + "n"):
+                return True
+        return bool(kinds(word))
+
+    def segmentations(self, word: str) -> list:
+        """Every reading of word as modifiers + a last part, each part (surface, lemma, class, kind)."""
+        memo: dict = {}
+
+        def segs(i: int, depth: int) -> list:
+            if (i, depth) not in memo:
+                out = [((word[i:], *head),) for head in self._heads(word[i:])] if i else []
+                if depth < self.max_parts - 1:
+                    for j in range(i + self.min_part, min(len(word) - 2, i + 24) + 1):
+                        readings = self._modifiers(word[i:j])
+                        if readings:
+                            tails = segs(j, depth + 1)
+                            out += [((word[i:j], *m), *t) for m in readings for t in tails]
+                memo[(i, depth)] = out
+            return memo[(i, depth)]
+
+        # "-ende" after a verb's stem is a present participle (Reisende), not Ende
+        return [s for s in segs(0, 0) if not (s[-1][1] == "ende" and s[-2][3] == "V")]
+
+    @staticmethod
+    def cuts(parts) -> frozenset:
+        """Positions of the cuts between parts (surfaces, or (surface, ...) tuples)."""
+        out, pos = [], 0
+        for part in parts[:-1]:
+            pos += len(part[0] if isinstance(part, tuple) else part)
+            out.append(pos)
+        return frozenset(out)
+
+    @staticmethod
+    def _score(seg) -> float:
+        return sum(math.log(1 + _DE_CLASS[p[2]]) for p in seg)
+
+    def choose(self, word: str):
+        """The analysis with the fewest parts; analyses that cut differently are joined when one segmentation has
+        all their cuts (Zahnarzt|termin, Zahn|arzttermin: Zahn|arzt|termin), else the likelier wins by *margin*, else
+        None. The word's own entry is not looked at (the build judges the dictionary's words with this)."""
+        by_cuts: dict = {}
+        for seg in self.segmentations(word):
+            by_cuts.setdefault(self.cuts(seg), []).append(seg)
+        if not by_cuts:
+            return None
+        fewest = min(len(c) for c in by_cuts)
+        top = [c for c in by_cuts if len(c) == fewest]
+
+        def best(c):
+            return max(by_cuts[c], key=self._score)
+
+        if len(top) > 1:
+            union = frozenset().union(*top)
+            if union in by_cuts:
+                top = [union]
+            else:
+                top.sort(key=lambda c: self._score(best(c)), reverse=True)
+                if self._score(best(top[0])) - self._score(best(top[1])) < self.margin:
+                    return None
+        return best(top[0])
+
+    def analyse(self, word: str) -> tuple | None:
+        """Surfaces of the parts of a folded word ("zahn", "arzt", "termin"); () for a word of the table that is no
+        compound (or one of its forms); None for a word the table knows nothing of."""
+        if len(word) < self.min_word:
+            return () if self.known(word) else None
+        for end in _DE_NOUN_END + _DE_FEM_END:
+            base = word[:len(word) - len(end)] if end else word
+            if word.endswith(end) and base in self.cuts_of:
+                cut = list(self.cuts_of[base])
+                return tuple(word[a:b] for a, b in zip([0, *cut], [*cut, len(word)])) if cut else ()
+        if self.known(word):
+            return ()
+        seg = self.choose(word)
+        return tuple(p[0] for p in seg) if seg else None
+
+    def split(self, word: str) -> tuple:
+        """Surfaces of the parts of a folded word; () when it is not split."""
+        return self.analyse(word) or ()
+
+
+def _de_splitter():
+    """The splitter, loaded on the first German word that might be a compound; None without the data file."""
+    if not _DE_TABLE:
+        with _DE_LOCK:
+            if not _DE_TABLE:
+                try:
+                    _DE_TABLE.append(_DeSplitter.load(_DE_FILE))
+                except (OSError, EOFError, ValueError, zlib.error, StopIteration, IndexError, KeyError):  # damaged
+                    _DE_TABLE.append(None)
+    return _DE_TABLE[0]
+
+
+@lru_cache(maxsize=65536)
+def de_parts(word: str) -> tuple | None:
+    """Parts of a folded German word; () when the dictionary knows it as one word, None when it knows nothing of it
+    (or is missing)."""
+    splitter = _de_splitter() if _DE_COMPOUNDS and word.isalpha() else None
+    return splitter.analyse(word) if splitter else None
+
+
+def _compound_keys(parts: tuple) -> tuple:
+    """(head keys, modifier keys, keys of each modifier) of a compound's parts. Heads: the last part and every run of
+    parts that ends with it ("termin", "arzttermin": a Zahnarzttermin is an Arzttermin); modifiers: every run before
+    it ("zahn", "arzt", "zahnarzt"). A part keeps its linking element, whose stem drops it ("familien" / "famili").
+    Each modifier's keys come with the keys of all the modifiers together, which stand in for any of them."""
+    n = len(parts)
+    head = frozenset().union(*(_keys("".join(parts[i:]), ("de",)) for i in range(1, n)))
+    mods = frozenset().union(*(_keys("".join(parts[i:j]), ("de",)) for i in range(n - 1) for j in range(i + 1, n)))
+    joined = _keys("".join(parts[:-1]), ("de",)) if n > 2 else frozenset()
+    return head, mods, tuple(_keys(p, ("de",)) | joined for p in parts[:-1])
+
+
+# -- German and Spanish verb forms -------------------------------------------------------------------------------
+# Snowball leaves the forms of a strong or irregular verb apart from its lemma: "ging" is not "gehen", "fuhr" not
+# "fahren", "fue" not "ir" (or "ser"), "hizo" not "hacer". A table of such forms from Wikidata's German and Spanish
+# lexemes (CC0; de_es_forms.tsv.gz, tools/build_de_es_lexicon.py) gives the word the stems of its lemmas, at full
+# weight like a stem, in text of that language only (Snowball's own stem already joins the regular forms). Forms that
+# are also another word ("Macht", "vino", "cuenta") or a form of another verb are not in the table.
+_LEMMA_FORMS = True
+_FORMS_FILE = Path(__file__).with_name("de_es_forms.tsv.gz")
+_FORMS: dict[str, tuple] = {}  # language -> (form -> lemmas, lemma -> forms)
+_FORMS_LOCK = threading.Lock()
+
+
+def _forms(lang: str) -> tuple:
+    """(form -> lemmas, lemma -> forms) of *lang*, loaded on its first word; empty without the data file."""
+    table = _FORMS.get(lang)
+    if table is None:
+        with _FORMS_LOCK:
+            table = _FORMS.get(lang)
+            if table is None:
+                forms: dict = {}
+                lemmas: dict = {}
+                try:
+                    with gzip.open(_FORMS_FILE, "rt", encoding="utf-8") as fh:
+                        for line in fh:
+                            code, _, rest = line.partition("\t")
+                            if code != lang:
+                                continue
+                            lemma, _, written = rest.rstrip("\n").partition("\t")
+                            lemma = sys.intern(lemma)
+                            lemmas[lemma] = tuple(written.split())
+                            for form in lemmas[lemma]:
+                                forms[form] = forms.get(form, ()) + (lemma,)
+                    # a form under more than three verbs is an error of the source ("tuviese" under twelve)
+                    forms = {form: under for form, under in forms.items() if len(under) <= 3}
+                except (OSError, EOFError, ValueError, zlib.error, IndexError, KeyError):  # missing or damaged
+                    forms, lemmas = {}, {}
+                table = _FORMS[lang] = (forms, lemmas)
+    return table
+
+
+@lru_cache(maxsize=65536)
+def word_lemmas(word: str, lang: str) -> tuple:
+    """(lemma stems, lemmas) of a folded German or Spanish word: the lemmas whose form it is ("ging": gehen), and
+    the word itself when it is a lemma of the table (its forms are searched for it); ((), ()) for other words."""
+    if not _LEMMA_FORMS or lang not in ("de", "es") or not word.isalpha():
+        return (), ()
+    forms, lemmas = _forms(lang)
+    found = forms.get(word, ())
+    own = (word,) if word in lemmas else ()
+    return tuple(dict.fromkeys(stem(lemma, lang) for lemma in found)), found + own
+
+
 # -- tokenisation --------------------------------------------------------------------------------------------------
 
-# French/Italian elision: "d'Eva", "l'offre", "qu'on" are Eva, offre, on.
-_ELISION = re.compile(r"^(?:l|d|j|m|n|s|t|c|qu|jusqu|lorsqu|puisqu|quoiqu|dell|all|nell|sull|dall|un)'(?=[^\W\d_])")
+# French/Italian elision: "d'Eva", "l'offre", "qu'on" are Eva, offre, on; Italian "quest'anno", "dov'è", "com'è",
+# "cos'è", "anch'io", "nessun'altra" are anno, è, è, è, io, altra (not before a lone s: English "dev's", "Bell's").
+_ELISION = re.compile(r"^(?:l|d|j|m|n|s|t|c|qu|jusqu|lorsqu|puisqu|quoiqu|dell|all|nell|sull|dall|un)'(?=[^\W\d_])"
+                      r"|^(?:quest|quell|dov|com|cos|anch|nessun|tutt|sant|senz|bell|buon|quant|quand|qual|dev)'"
+                      r"(?=[^\W\d_])(?!s$)")
+# Turkish writes the case ending of a name after an apostrophe ("Ankara'da", "Ayşe'nin", "HR24'ün", "hr-ovh'de"): in
+# text that may be Turkish the name is the word, and the whole stays in the bag. These endings only (folded), so
+# "Eva's", "o'clock" and "rock'n'roll" are left alone.
+_TR_ENDINGS = _folded("""a e ı i u ü ya ye yı yi yu yü na ne nı ni nu nü da de ta te nda nde dan den tan ten ndan nden
+    ın in un ün nın nin nun nün yın yin yun yün la le yla yle lar ler lara lere larda lerde lardan lerden ların lerin
+    ları leri sı si su sü sına sine sında sinde sından sinden sının sinin daki deki taki teki ndaki ndeki dır dir dur
+    dür tır tir tur tür dı di du dü tı ti tu tü ydı ydi ca ce ça çe""")
 # Pronouns after the verb, taken off only in text of that language: French inversion ("prend-il", "a-t-elle",
 # "est-ce", "vas-y"; not the noun "rendez-vous") and Portuguese enclisis ("chama-se", "lembra-me").
 _FR_CLITICS = frozenset("je tu il elle on nous vous ils elles ce moi toi lui leur le la les y en".split())
@@ -599,6 +1140,19 @@ def _resolve_hyphen(group: str, langs: tuple, determined: bool) -> tuple[str, li
     return "-".join(kept), [group] * (len(kept) != len(parts)) + parts
 
 
+def _apostrophe(group: str, langs: tuple, determined: bool) -> tuple[str, list[str]]:
+    """(the word, extra bag entries) of a word with an apostrophe inside: a Turkish ending off a name ("ankara'da" is
+    ankara) in text that may be Turkish; the Dutch plural and possessive 's ("pinda's", "eva's") in Dutch text."""
+    head, _, tail = group.partition("'")
+    if not head or not tail:
+        return group, []
+    if "tr" in langs and fold(tail) in _TR_ENDINGS:
+        return head, [group]
+    if determined and "nl" in langs and "en" not in langs and tail == "s" and len(head) > 1:
+        return head, [group]
+    return group, []
+
+
 @dataclass(frozen=True)
 class Word:
     text: str  # folded, lower-cased
@@ -610,6 +1164,12 @@ class Word:
     fts: bool = True  # the FTS5 index can find the word itself (not Arabic or Indic script)
     roots: frozenset = frozenset()  # same-root keys (word_roots), compared at _DERIV_WEIGHT
     root_lang: str = ""  # "en" / "ru" when the word's language is determined: roots are built and compared only then
+    head: frozenset = frozenset()  # a German compound: keys of its last part (and the runs ending with it)
+    mods: frozenset = frozenset()  # ... keys of the parts before it (and their runs)
+    mod_parts: tuple = ()  # ... keys of each part before it
+    lemmas: frozenset = frozenset()  # German / Spanish: stems of the lemmas whose form the word is ("ging": geh)
+    lemma_of: tuple = ()  # those lemmas, and the word when it is one: a search for it also looks for their forms
+    form_lang: str = ""  # "de" / "es" when the word's language is determined: lemma stems are compared only then
 
 
 @dataclass(frozen=True)
@@ -622,6 +1182,13 @@ class Analysis:
     german: bool = False  # determined German: its compounds end in the word they name ("Familienkatze" is a Katze)
     roots: frozenset = frozenset()  # (language, root key) of every word (search and recall only, not duplicate checks)
     lang_keys: frozenset = frozenset()  # (language, key) of the words whose language is determined
+    determined: bool = False  # the Latin language was told by function words
+    seamed: str = ""  # Chinese: the folded text with SEAM at the seams between its words (zh_seamed); "" otherwise
+    dutch: bool = False  # determined Dutch: compounds as in German ("kinderarts" is an arts), see _NL_COMPOUNDS
+    heads: frozenset = frozenset()  # keys of the last parts of its German compounds (search and recall only)
+    mods: frozenset = frozenset()  # keys of the parts before them
+    lemma_keys: frozenset = frozenset()  # (language, key or lemma stem) of the words of determined German / Spanish
+    suffix_words: frozenset | None = None  # German words the compound dictionary knows nothing of (None: all)
 
 
 def _stop(word: str, script: str, votes: dict, sentence: bool) -> bool:
@@ -631,10 +1198,12 @@ def _stop(word: str, script: str, votes: dict, sentence: bool) -> bool:
     evidence, the English list applies, as it did to all Latin text before 0.5.0."""
     if script != "latin":
         return any(word in STOP[lang] for lang in _SCRIPT_LANGS.get(script, ()))
-    others = {lang: votes[lang] - (word in STOP[lang]) for lang in LATIN}
+    others = {lang: votes[lang] - (word in _VOTERS[lang]) for lang in LATIN}
     best = max(others.values())
     if best:
-        return any(word in STOP[lang] for lang in LATIN if others[lang] == best)
+        top = [lang for lang in LATIN if others[lang] == best]
+        # a _WEAK word only where its language alone is best supported
+        return any(word in STOP[lang] and (len(top) == 1 or word not in _WEAK.get(lang, ())) for lang in top)
     if sentence:
         return any(word in STOP[lang] for lang in LATIN if votes[lang])
     return word in STOP["en"]
@@ -647,30 +1216,46 @@ def analyze(text: str) -> Analysis:
     for token in lowered.split():
         token = _ELISION.sub("", _strip_edges(token))
         groups += [g for g in (_strip_edges(g) for g in _script_split(token)) if g] if token else []
-    # Latin language by function words (ties keep every tied language; none found: all five). A hyphenated word votes
-    # with its first part only: "est-ce" is French by "est", "carry-on" is not French by "on".
+    # Latin language by function words (ties keep every tied language; none found: all of LATIN; _WEAK words do not
+    # vote). A hyphenated word votes with its first part only: "est-ce" is French by "est", "carry-on" is not French
+    # by "on".
     latin = [fold(g.split("-")[0]) for g in groups if word_script(g) == "latin" and _letters_only(g) and g.split("-")[0]]
-    votes = {lang: sum(w in STOP[lang] for w in latin) for lang in LATIN}
+    votes = {lang: sum(w in _VOTERS[lang] for w in latin) for lang in LATIN}
     best = max(votes.values())
-    langs, determined = (tuple(lang for lang in LATIN if votes[lang] == best), True) if best else (LATIN, False)
-    # Spanish, French, Portuguese and Indonesian write compound words with a hyphen; English text and text of no
-    # determined language keep letters-only hyphenated tokens as identifiers ("hr-ovh")
-    compounds = determined and "en" not in langs
+    if best:
+        langs, determined = tuple(lang for lang in LATIN if votes[lang] == best), True
+    else:
+        langs, determined = tuple(lang for lang in LATIN if lang not in _EVIDENCE or (
+            _EVIDENCE[lang] is not None and _EVIDENCE[lang].search(lowered))), False
+    # Spanish, French, Portuguese, Indonesian and German write compound words with a hyphen; English text, text of the
+    # newer languages and text of no determined language keep letters-only hyphenated tokens as identifiers ("hr-ovh",
+    # also in "hr-ovh'de")
+    compounds = determined and _HYPHEN_COMPOUNDS.issuperset(langs)  # every tied language ("de" is es/fr/pt/nl)
     english = determined and "en" in langs  # a tie ("on" is English and French) still includes English
     # Cyrillic is Russian for roots unless the text has letters Russian does not (Ukrainian, Belarusian): the Russian
     # suffix rules would join "головний" (main) with "гол" (goal)
     russian = _NOT_RUSSIAN.search(lowered) is None
+    # German compounds are split, and German or Spanish verb forms get their lemmas, only in text of that language
+    german = determined and "de" in langs and "en" not in langs
+    forms_lang = "" if not _LEMMA_FORMS else "de" if german else         "es" if determined and "es" in langs and "en" not in langs else ""  # "he went": English as much as Spanish
+    heads, compound_mods, lemma_keys = set(), set(), set()
+    # Japanese spelling variants: decided for the whole text, so every word of it folds as the text does
+    fold_word = _fold_ja if _JA_VARIANTS and _KANA.search(lowered) else fold
     lang_keys = set()
     words, bag, keys, roots = [], set(), set(), set()
     for group in groups:
-        raw, extra = _resolve_hyphen(group, langs, determined) if "-" in group else (group, [])
-        word, script, ident = fold(raw), word_script(raw), is_identifier(raw)
+        group, extra = _apostrophe(group, langs, determined) if "'" in group else (group, [])
+        raw, parts = _resolve_hyphen(group, langs, determined) if "-" in group else (group, [])
+        extra += parts
+        word, script, ident = fold_word(raw), word_script(raw), is_identifier(raw)
         if ident and compounds and "-" in raw and _letters_only(raw):
             ident = False  # "week-end", "sexta-feira", "rendez-vous": a compound word, not a host name
         unsegmented = UNSEGMENTED.search(raw) is not None
         word_langs = () if ident or unsegmented else langs if script == "latin" else _SCRIPT_LANGS.get(script, ())
         is_stop = not ident and not unsegmented and _stop(word, script, votes, len(latin) >= 4)
-        word_keys = _keys(word, word_langs) if word_langs else frozenset({word})
+        written = _written(raw) if word_langs and not _NATIVE.isdisjoint(word_langs) else word
+        written = "" if written == word else written  # only a word whose letters folding changed is stemmed twice
+        word_keys = _keys(word, word_langs, written) if word_langs else frozenset({word})
         bag.add(word)
         keys |= word_keys
         for piece in (fold(e) for e in extra):  # the whole and the parts of a hyphenated word, for containment
@@ -682,16 +1267,46 @@ def analyze(text: str) -> Analysis:
         if root_lang:
             roots |= {(root_lang, r) for r in word_roots_}
             lang_keys |= {(root_lang, k) for k in word_keys}
+        plain = script == "latin" and not (ident or "-" in word)
+        parts = (de_parts(word) or ()) if german and plain and not is_stop else ()
+        head, mods, mod_parts = _compound_keys(parts) if parts else (frozenset(), frozenset(), ())
+        heads |= head
+        compound_mods |= mods
+        form_lang = forms_lang if plain else ""  # function words too: "fue" (ser, ir) in a fact meets "va" in a question
+        lemma_stems, lemma_of = word_lemmas(word, form_lang) if form_lang else ((), ())
+        lemma_stems = frozenset(lemma_stems) - word_keys
+        if form_lang:
+            lemma_keys |= {(form_lang, k) for k in word_keys | lemma_stems}
         words.append(Word(
-            text=word, stem=stem(word, word_langs[0]) if word_langs else word, keys=word_keys,
+            text=word, stem=_primary_stem(word, word_langs[0], written) if word_langs else word, keys=word_keys,
             stop=is_stop, identifier=ident,
-            # Indonesian prefixes (me-, di-, ber-) hide a word from a prefix query; text of undetermined language
-            # might be Indonesian
-            scan=script in _SCAN_SCRIPTS or (script == "latin" and ("id" in word_langs or "de" in word_langs)),
-            fts=script not in _SCAN_SCRIPTS, roots=word_roots_, root_lang=root_lang))
-    return Analysis(tuple(words), frozenset(bag), frozenset(keys), _fold_text(lowered), langs,
-                    german=determined and "de" in langs and "en" not in langs, roots=frozenset(roots),
-                    lang_keys=frozenset(lang_keys))
+            # Indonesian prefixes (me-, di-, ber-), compounds and Turkish consonant changes hide a word from a prefix
+            # query (see _SCAN_LATIN); text of undetermined language might be in any of them
+            scan=script in _SCAN_SCRIPTS or (script == "latin" and not _SCAN_LATIN.isdisjoint(word_langs)),
+            fts=script not in _SCAN_SCRIPTS, roots=word_roots_, root_lang=root_lang, head=head, mods=mods,
+            mod_parts=mod_parts, lemmas=lemma_stems, lemma_of=lemma_of, form_lang=form_lang))
+    # the suffix test of 0.6.0 ("katze" ends "familienkatze") stays for the words the dictionary knows nothing of
+    unknown = frozenset(w for w in bag if de_parts(w) is None) if german and _DE_COMPOUNDS and _de_splitter() else None
+    folded = _fold_text(lowered)
+    if fold_word is _fold_ja:
+        written_ja = _fold_text(lowered, False)
+        folded = folded if written_ja == folded else f"{folded}\n{written_ja}"
+    return Analysis(tuple(words), frozenset(bag), frozenset(keys), folded, langs,
+                    german=german, determined=determined, roots=frozenset(roots), lang_keys=frozenset(lang_keys), seamed=zh_seamed(folded),
+                    dutch=_NL_COMPOUNDS and determined and "nl" in langs and "en" not in langs, heads=frozenset(heads),
+                    mods=frozenset(compound_mods), lemma_keys=frozenset(lemma_keys), suffix_words=unknown)
+
+
+def _primary_stem(word: str, lang: str, written: str) -> str:
+    """The stem a word is ranked by (the first language's): for _NATIVE languages the one of the word as written, and
+    never a stem shorter than _MIN_STEM ("cuma" is not "c")."""
+    if lang not in _NATIVE:
+        return stem(word, lang)
+    native = _native_stems(written, lang) if written else ()
+    if native:
+        return fold(native[0])
+    stem_ = stem(word, lang)
+    return stem_ if len(stem_) >= _MIN_STEM else word
 
 
 def name_keys(name: str) -> tuple[tuple[frozenset, bool], ...]:
@@ -746,11 +1361,14 @@ def soft_jaccard(a: list[frozenset], b: list[frozenset]) -> float:
 
 def content_stems(text: str) -> set[str]:
     """Stems of the informative words only (stopwords dropped); runs of unsegmented scripts contribute their
-    content n-grams, so Chinese or Thai text compares by fragments rather than as one huge "word"."""
+    content n-grams, so Chinese or Thai text compares by fragments rather than as one huge "word" (Chinese also by
+    its one-character words, its pairs across a seam marked as such: see run_grams)."""
     out = set()
-    for w in analyze(text).words:
+    analysis = analyze(text)
+    chinese = is_chinese(analysis.text)
+    for w in analysis.words:
         if UNSEGMENTED.search(w.text):
-            out |= {g for g, weight in run_grams(w.text) if weight}
+            out |= {g for g, weight in run_grams(w.text, chinese, False) if weight}
         elif w.identifier or (not w.stop and len(w.text) > 1):
             out.add(w.stem)
     return out
@@ -782,6 +1400,278 @@ _MAX_GRAMS = 32
 _NATIVE_DIGITS = tuple(str.maketrans("0123456789", d) for d in ("০১২৩৪৫৬৭৮৯", "٠١٢٣٤٥٦٧٨٩", "۰۱۲۳۴۵۶۷۸۹", "०१२३४५६७८९"))
 _LATIN_IN_CJK = re.compile(r"[A-Za-z][A-Za-z0-9._:/-]*[A-Za-z0-9]|[A-Za-z0-9]*\d[A-Za-z0-9._:/-]*")
 
+# -- Japanese spelling variants --------------------------------------------------------------------------------------
+# Japanese writes one word in several ways: kanji or kana (子供 / 子ども, 一緒 / いっしょ), with more or less okurigana
+# (引越し / 引越 / 引っ越し, 申込 / 申し込み), katakana loanwords with or without the long vowel or small kana
+# (コンピュータ / コンピューター, ウイルス / ウィルス). Character n-grams cannot join these. SudachiDict's synonym source lists
+# them as spellings of one lexeme; ja_variants.tsv.gz keeps those spellings only, never synonyms (tools/
+# build_ja_variants.py). In text that has kana, each variant is replaced by its word's representative spelling, longest
+# first, left to right; a representative spelled as it is stays (so コンピュータ in コンピューター is not touched). There
+# are no spaces between Japanese words, so a variant is replaced only where its edges can be word edges:
+# - a variant that starts with hiragana not after a kanji (okurigana: "白い草" is not い草) or after other hiragana,
+#   unless that is a particle after a kanji or katakana word ("子供はきょう"; "べんきょう" holds no きょう, "かいちょう"
+#   no いちょう); one written in hiragana only not before hiragana other than a particle or a suffix (たち, さん,
+#   だけ …: "きょうだい" holds no きょう). A variant with a kanji in it may run into hiragana: that is its inflection
+#   or a suffix ("引越しします", "子どもたち");
+# - a katakana edge not against more katakana ("トラック" holds no トラ, "エラー" no エラ); a variant of six or more
+#   letters may sit inside a longer katakana word (セキュリティポリシー), but not before ー or a small kana.
+# Kanji edges are free: 申込書 is 申し込み書. The text is folded again until nothing changes (子どもたち -> 子供たち ->
+# 子供達), so folding folded text changes nothing. Variants inside the filler and greeting lists are left out, so those
+# still compare as written. Hiragana variants of two letters (いす, かに, おば) are not in the table. Loaded on the first
+# text with kana.
+_JA_FILE = Path(__file__).with_name("ja_variants.tsv.gz")
+_JA_TABLE: tuple | None = None
+_JA_LOCK = threading.Lock()
+_JA_PARTICLES = frozenset("のはがをにでともへやかねよ")  # hiragana that may stand before or after a word
+_JA_AFTER = (*_JA_PARTICLES, "たち", "さん", "さま", "ちゃん", "くん", "だけ", "まで", "より", "など", "って", "だった")
+_JA_KATA_CONT = frozenset("ーァィゥェォッャュョヮヵヶヽヾ")  # katakana that cannot begin a word
+_JA_EMBED = 6  # katakana variants this long may sit inside a longer katakana word
+_JA_PASSES = 4  # the fold runs again on its own output, until nothing changes or this many times
+
+
+def _ja_kind(c: str) -> str:
+    """'h' hiragana, 'k' katakana (with ー, not ・), 'c' kanji, '' anything else."""
+    if "ぁ" <= c <= "ゟ":
+        return "h"
+    if "ァ" <= c <= "ヿ" and c != "・" or "ㇰ" <= c <= "ㇿ":
+        return "k"
+    if "㐀" <= c <= "鿿" or "豈" <= c <= "﫿" or c in "々〆〇":
+        return "c"
+    return ""
+
+
+def _ja_table() -> tuple:
+    """({spelling: (representative, edges or None)}, {first character: lengths, longest first}), loaded once. A
+    representative maps to itself with no edge rules: it is consumed as it stands, so no shorter variant matches in it.
+    Spellings are folded as text is (Traditional -> Simplified first); one that folds onto two words is dropped."""
+    global _JA_TABLE
+    if _JA_TABLE is None:
+        with _JA_LOCK:
+            if _JA_TABLE is None:
+                pairs: dict[str, str] = {}
+                try:
+                    with gzip.open(_JA_FILE, "rt", encoding="utf-8") as fh:
+                        for line in fh:
+                            variant, tab, target = line.rstrip("\n").partition("\t")
+                            if tab and not line.startswith("#"):
+                                pairs[variant] = target
+                except (OSError, EOFError, ValueError, zlib.error):  # missing or damaged data file: no variants
+                    pairs = {}
+                han = _FOLD_HAN if _HAN_FOLD else _FOLD  # what _fold_text does to Japanese script, without its loop
+                base = {s: unicodedata.normalize("NFC", s).lower().translate(han) for s in {*pairs, *pairs.values()}}
+                targets = {base[t] for t in pairs.values()}
+                protected = "\0".join(w for w in (*FILLER_RUNS, *GREETINGS) if _KANA.search(w))
+                folded: dict[str, set] = {}
+                for variant, target in pairs.items():
+                    v, t = base[variant], base[target]
+                    if v != t and v not in targets and v not in protected:
+                        folded.setdefault(v, set()).add(t)
+                table: dict[str, tuple] = {t: (t, None) for t in targets}
+                for v, ts in folded.items():
+                    if len(ts) == 1:
+                        kinds = [_ja_kind(c) for c in v]
+                        last = "" if kinds[-1] == "h" and set(kinds) != {"h"} else kinds[-1]  # see above: kanji in it
+                        table[v] = (next(iter(ts)), (kinds[0], last, len(v) >= _JA_EMBED))
+                lengths: dict[str, set] = {}
+                for s in table:
+                    lengths.setdefault(s[0], set()).add(len(s))
+                _JA_TABLE = (table, {c: tuple(sorted(ls, reverse=True)) for c, ls in lengths.items()})
+    return _JA_TABLE
+
+
+def _ja_edges_fit(text: str, start: int, end: int, edges: tuple) -> bool:
+    """May text[start:end] be a word: its hiragana and katakana edges against the characters around it (see above)."""
+    first, last, embed = edges
+    before = _ja_kind(text[start - 1]) if start else ""
+    after = _ja_kind(text[end]) if end < len(text) else ""
+    if first == "h" and (before == "c" or before == "h" and not (
+            text[start - 1] in _JA_PARTICLES and start >= 2 and _ja_kind(text[start - 2]) in ("c", "k"))):
+        return False  # after hiragana only when that is a particle after a kanji or katakana word (今日はきょう-like)
+    if first == "k" and before == "k" and not embed:
+        return False
+    if last == "h" and after == "h" and not text.startswith(_JA_AFTER, end):
+        return False
+    return not (last == "k" and after == "k" and (not embed or text[end] in _JA_KATA_CONT))
+
+
+def _ja_fold(text: str) -> str:
+    """Japanese spelling variants of folded *text* replaced by their representative spellings (see above), again
+    until nothing changes."""
+    table, lengths = _ja_table()
+    for _ in range(_JA_PASSES if table else 0):
+        out, i, done, n = [], 0, 0, len(text)
+        while i < n:
+            for size in lengths.get(text[i], ()):
+                hit = table.get(text[i:i + size])
+                if hit is not None and (hit[1] is None or _ja_edges_fit(text, i, i + size, hit[1])):
+                    if hit[0] != text[i:i + size]:
+                        out += (text[done:i], hit[0])
+                        done = i + size
+                    i += size
+                    break
+            else:
+                i += 1
+        if not out:
+            break
+        text = "".join(out) + text[done:]
+    return text
+
+
+# -- Chinese words ---------------------------------------------------------------------------------------------------
+# Chinese has no spaces, and character pairs cannot tell a word from the halves of two words: 和服 (kimono) is in
+# 我和服务员 ("I and the waiter"), 研究生 (graduate student) in 研究生命 ("to research life"). Text whose Han is Chinese
+# (no kana, no Hangul) is also split into words with jieba's dictionary (zh_words.txt.gz, tools/build_zh_words.py):
+# the most probable split by word frequency, as jieba cuts without its HMM; a character that begins no word stands
+# alone. The words add to the n-grams, they do not replace them (a name the dictionary lacks is still found by its
+# pairs, a partial overlap still counts):
+# - a seam is where two dictionary words of two or more characters meet, or one meets a function character standing
+#   alone (和 | 服务员). A pair across a seam is read as such (和 SEAM 服): a Chinese query's pair inside a word is not
+#   found in a fact that holds it only across a seam (研究 | 生命 holds no 究生, 学校 | 长期 no 校长), and its
+#   pair across a seam only meets the same seam (几岁 | 了 meets 三岁 | 了). Every pair keeps its weight, so a query's
+#   coverage is counted as before. Next to a content character standing alone a split is not sure enough (看 | 牙医
+#   still holds 看牙, 续 | 保险 still 续保): no seam there;
+# - a one-character word is also searched alone, wherever it stands in a fact (猫 in 猫粮, 牙 in 牙医), unless it is a
+#   function character, a negator, a numeral or a unit of the calendar, one of the commonest words (过, 看, 去), or a
+#   character jieba tags as a person name (王, 李, 陈: most surnames). In a query, two such characters side by side are
+#   more likely a name the dictionary lacks (怡 君, 思 琪): their pair stands for them, as before.
+# Folded text is split (Traditional -> Simplified first; the table is folded the same way). Loaded on the first
+# Chinese text: about 0.2 s and 30 MB. Without the data file, Chinese is compared as before (pairs only).
+class _ZhTable(NamedTuple):
+    words: dict  # word -> log probability (its frequency over the total)
+    longest: dict  # first character -> length of the longest word it begins
+    floor: float  # log probability of a character that begins no word
+    log_total: float
+    names: frozenset  # single characters jieba tags as a person name
+
+
+_ZH_WORDS = True
+_ZH_FILE = Path(__file__).with_name("zh_words.txt.gz")
+_ZH_TABLE: _ZhTable | None = None
+_ZH_LOCK = threading.Lock()
+_ZH_DIGITS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"  # round(4 * ln f), one character
+_ZH_HAN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
+_HANGUL = re.compile(r"[\uac00-\ud7af]")
+_ZH_NOT_ALONE = frozenset(_fold_text("零〇一二三四五六七八九十百千万亿两半几年月日号天周点分秒"))
+_ZH_COMMON = 43  # round(4 * ln f) from which a one-character word is too common to search alone (f >= about 45,000)
+_ZH_CHAR_WEIGHT = 1.0  # a one-character word weighs as a pair of content characters
+SEAM = "\x1f"  # between the two characters of a pair read across a seam: "和" SEAM "服" is not 和服
+
+
+def _zh_table() -> _ZhTable:
+    """The dictionary, loaded once (tools/build_zh_words.py: "=" ln of the total, "!" the name characters, then a line
+    per first character: "研 Q 究g 究生U"); empty without the data file."""
+    global _ZH_TABLE
+    if _ZH_TABLE is None:
+        with _ZH_LOCK:
+            if _ZH_TABLE is None:
+                words: dict[str, float] = {}
+                longest: dict[str, int] = {}
+                total, logp, names = 0.0, {}, frozenset()
+                try:
+                    with gzip.open(_ZH_FILE, "rb") as fh:
+                        data = fh.read().decode("utf-8")
+                    for line in io.StringIO(data):
+                        line = line.rstrip("\n")
+                        if not line or line[0] == "#":
+                            continue
+                        if line[0] == "=":
+                            total = float(line[1:])
+                            logp = {d: i / 4 - total for i, d in enumerate(_ZH_DIGITS)}  # one float per step, shared
+                        elif line[0] == "!":
+                            names = frozenset(line[1:])
+                        else:
+                            first, *rests = line.split(" ")
+                            for rest in rests:
+                                words[first + rest[:-1]] = logp[rest[-1]]
+                            longest[first] = max(map(len, rests))
+                except (OSError, EOFError, ValueError, KeyError, IndexError, UnicodeDecodeError):  # no data: no words
+                    words, longest, total, names = {}, {}, 0.0, frozenset()
+                _ZH_TABLE = _ZhTable(words, longest, -total, total, names)
+    return _ZH_TABLE
+
+
+@lru_cache(maxsize=4096)
+def zh_words(run: str) -> tuple[str, ...]:
+    """A folded run of Chinese characters split into words: the split whose words are most probable together (jieba's
+    word graph and route, without its HMM); a character that begins no word of the dictionary stands alone."""
+    table = _zh_table()
+    words, longest = table.words, table.longest
+    if not words:
+        return tuple(run)
+    n = len(run)
+    score, end = [0.0] * (n + 1), list(range(1, n + 2))
+    for i in range(n - 1, -1, -1):
+        alone = words.get(run[i])
+        best = None if alone is None else alone + score[i + 1]
+        for size in range(2, min(longest.get(run[i], 1), n - i) + 1):
+            p = words.get(run[i:i + size])
+            if p is not None and (best is None or p + score[i + size] >= best):  # a tie: the longer word, as jieba
+                best, end[i] = p + score[i + size], i + size
+        score[i] = table.floor + score[i + 1] if best is None else best
+    out, i = [], 0
+    while i < n:
+        out.append(run[i:end[i]])
+        i = end[i]
+    return tuple(out)
+
+
+def _zh_seams(tokens: tuple) -> frozenset:
+    """Offsets in the run where a pair of characters is read across a seam (see above)."""
+    seams, pos = set(), 0
+    for a, b in zip(tokens, tokens[1:]):
+        pos += len(a)
+        if (len(a) > 1 or len(b) > 1) and (len(a) > 1 or a in CJK_FUNCTION) and (len(b) > 1 or b in CJK_FUNCTION):
+            seams.add(pos)
+    return frozenset(seams)
+
+
+def _zh_alone(token: str) -> int:
+    """2: a one-character word searched on its own (猫, 车, 药; see above); 1: a character of a name (王, 轩), which
+    a one-character word next to it may belong to; 0: neither."""
+    if len(token) != 1 or token in CJK_FUNCTION or token in CJK_NEGATORS or token in _ZH_NOT_ALONE:
+        return 0
+    table = _zh_table()
+    if token in table.names:
+        return 1
+    p = table.words.get(token)
+    return 2 if p is not None and p + table.log_total < (_ZH_COMMON - 0.5) / 4 else 0
+
+
+def is_chinese(text: str) -> bool:
+    """Text whose Han characters are Chinese: it has some, and no kana (Japanese) or Hangul (Korean)."""
+    return _ZH_WORDS and _ZH_HAN.search(text) is not None and _KANA.search(text) is None and \
+        _HANGUL.search(text) is None
+
+
+def _zh_run_grams(run: str, query: bool) -> list[tuple[str, float]]:
+    """run_grams of Chinese text with its words: a pair across a seam is written with SEAM between its characters, a
+    one-character word is a gram of its own. *run* may hold other characters too (a word of analyze: "10月23日（周五）
+    下午"); its runs of Han characters are split. *query*: two one-character words side by side are not searched
+    alone (a name the dictionary lacks)."""
+    seams, alone = set(), []
+    for m in _ZH_HAN.finditer(run):
+        tokens = zh_words(m.group())
+        seams |= {m.start() + k for k in _zh_seams(tokens)}
+        kind = [0, *map(_zh_alone, tokens), 0]
+        alone += [t for k, t in enumerate(tokens, 1) if kind[k] == 2 and not (query and (kind[k - 1] or kind[k + 1]))]
+    grams = [(g[0] + SEAM + g[1] if len(run) > 2 and k + 1 in seams else g, w)
+             for k, (g, w) in enumerate(_plain_grams(run))]
+    return grams + [(t, _ZH_CHAR_WEIGHT) for t in dict.fromkeys(alone)]
+
+
+def zh_seamed(text: str) -> str:
+    """Folded Chinese *text* with SEAM at each seam between its words ("研究" SEAM "生命科学"), so that a pair is found in
+    it only as it stands: 究生 inside a word, 究 SEAM 生 across a seam. "" for text that is not Chinese."""
+    if not is_chinese(text):
+        return ""
+    out, done = [], 0
+    for m in _ZH_HAN.finditer(text):
+        if len(m.group()) > 2:
+            for k in sorted(_zh_seams(zh_words(m.group()))):
+                out += (text[done:m.start() + k], SEAM)
+                done = m.start() + k
+    return "".join(out) + text[done:]
+
 
 def _thai_mask(run: str) -> list[bool]:
     """Which characters of a Thai run belong to a function word (greedy, longest word first)."""
@@ -799,10 +1689,19 @@ def is_sea(run: str) -> bool:
     return _SEA.search(run) is not None
 
 
-def run_grams(run: str) -> list[tuple[str, float]]:
-    """(n-gram, weight) of one unsegmented run; a run no longer than n is one gram; a filler run has none."""
+def run_grams(run: str, chinese: bool = False, query: bool = True) -> list[tuple[str, float]]:
+    """(n-gram, weight) of one unsegmented run; a run no longer than n is one gram; a filler run has none. *chinese*:
+    the run is of a Chinese text (is_chinese), so its words are used too: a pair across a seam is written with SEAM,
+    a one-character word is a gram of its own (see "Chinese words"); *query*: the grams are a query's."""
     if run in FILLER_RUNS:
         return []
+    if chinese and _ZH_HAN.search(run) and not is_sea(run):
+        return _zh_run_grams(run, query)
+    return _plain_grams(run)
+
+
+def _plain_grams(run: str) -> list[tuple[str, float]]:
+    """run_grams without words: character pairs (trigrams for Thai), as for every script but Chinese."""
     sea = is_sea(run)
     n = 3 if sea else 2
     function = _thai_mask(run) if sea else [c in CJK_FUNCTION for c in run]
@@ -822,8 +1721,9 @@ def query_grams(text: str) -> list[tuple[str, float]]:
     if not UNSEGMENTED.search(lowered):
         return []
     grams: dict[str, float] = {}
+    chinese = is_chinese(lowered)
     for run in UNSEGMENTED.findall(lowered):
-        for g, weight in run_grams(run):
+        for g, weight in run_grams(run, chinese):
             if weight:
                 grams[g] = max(grams.get(g, 0.0), weight)
     for m in _LATIN_IN_CJK.finditer(UNSEGMENTED.sub(" ", lowered)):
@@ -843,13 +1743,40 @@ def content_chars(text: str) -> list[str]:
     return list(dict.fromkeys(chars))
 
 
-def gram_coverage(grams: list[tuple[str, float]], text: str) -> float:
-    """Weighted share of the grams present in *text* (case-insensitive, folded as the grams are)."""
-    total = sum(w for _, w in grams)
+def gram_coverage(grams: list[tuple[str, float]], text, words: bool = False, total: float | None = None) -> float:
+    """Weighted share of the grams present in *text* (a str: case-insensitive, folded as the grams are; or its
+    Analysis). *words*: the grams are a Chinese query's (is_chinese), so a Chinese text holds a pair only as it
+    stands: 究生 inside a word, 究 SEAM 生 across a seam between two (研究 | 生命 holds no 究生, 我和服务员 no 和服).
+    Otherwise, and in text that is not Chinese, a pair is a substring. *total*: the grams' weight, if known."""
+    total = sum(w for _, w in grams) if total is None else total
     if not total:
         return 0.0
-    lowered = _fold_text((text or "").lower())
-    return sum(w for g, w in grams if g in lowered) / total
+    if not isinstance(text, Analysis):
+        folded = _fold_text((text or "").lower())
+        text = Analysis((), frozenset(), frozenset(), folded, (), seamed=zh_seamed(folded) if words else "")
+    if words and text.seamed:
+        return sum(w for g, w in grams if g in text.seamed) / total
+    return sum(w for g, w in grams if (g.replace(SEAM, "") if SEAM in g else g) in text.text) / total
+
+
+def zh_char_text(grams: list[tuple[str, float]], analysis: Analysis) -> str:
+    """The folded text a Chinese query's characters are looked for in, one by one (see content_chars): without a
+    character it holds only as one half of a pair of the query (*grams*) split there by a seam, and not inside a pair
+    of the query it holds as it stands. 研究 | 生命 holds the 生 of 研究生 only so (its 究 also in 研究, which stays);
+    驾照 still holds 驾 and 照 of 驾驶执照 (no pair of it is split). The text itself when it is not Chinese."""
+    seamed = analysis.seamed
+    splits = [g[0] + SEAM + g[1] for g, _ in grams if len(g) == 2]
+    if not seamed or not any(g in seamed for g in splits):
+        return analysis.text
+    holds = [g for g, _ in grams if len(g) == 2 or (len(g) == 3 and g[1] == SEAM)]  # as they stand, seams included
+    split, held = set(), set()
+    for patterns, marks in ((splits, split), (holds, held)):
+        for pattern in patterns:
+            start = seamed.find(pattern)
+            while start >= 0:
+                marks.update((start, start + len(pattern) - 1))
+                start = seamed.find(pattern, start + 1)
+    return "".join(" " if k in split and k not in held else c for k, c in enumerate(seamed) if c != SEAM)
 
 
 # FTS5 syntax characters (quotes, grouping, prefix, column filter, NOT/required). Never interpolated into a MATCH
@@ -871,6 +1798,34 @@ class Term:
     fts_ok: bool = True
     roots: frozenset = frozenset()  # same-root keys, matched at _DERIV_WEIGHT
     root_lang: str = ""  # the language its roots (and the fact's) are compared in; "": no root matching
+    head: frozenset = frozenset()  # a German compound: keys of its last part (Word.head)
+    mod_parts: tuple = ()  # ... keys of each part before it
+    lemmas: frozenset = frozenset()  # German / Spanish: stems of its lemmas (Word.lemmas)
+    lemma_of: tuple = ()  # ... the lemmas, whose forms its search looks for too
+    form_lang: str = ""  # ... the language they are compared in
+
+    @cached_property
+    def _lemma_keys(self) -> frozenset:
+        return frozenset((self.form_lang, k) for k in self.keys | self.lemmas) if self.form_lang else frozenset()
+
+    @cached_property
+    def lemma_forms(self) -> tuple:
+        """The other forms of its lemmas in the table ("va": fue, iba, vamos …), searched as words."""
+        if not self.lemma_of:
+            return ()
+        lemmas = _forms(self.form_lang)[1]
+        forms = dict.fromkeys(f for lemma in self.lemma_of for f in (lemma, *lemmas.get(lemma, ())))
+        return tuple(f for f in forms if f != self.word and f.translate(FTS_OPERATORS) == f)[:64]
+
+    def compound_match(self, fact: Analysis) -> float:
+        """A German compound of the question in a fact that writes its parts apart ("Zahnarzttermin": "Termin beim
+        Zahnarzt"): 1.0 with the last part and every part before it, _DERIV_WEIGHT with only some of them."""
+        pool = fact.keys | fact.heads
+        head = not self.head.isdisjoint(pool)
+        found = [not keys.isdisjoint(pool) or not keys.isdisjoint(fact.mods) for keys in self.mod_parts]
+        if head and all(found):
+            return 1.0
+        return _DE_QUESTION_HEAD if head else _DERIV_WEIGHT if any(found) else 0.0
 
     @property
     def loose(self) -> str:
@@ -903,6 +1858,7 @@ class Term:
         prefixes = sorted(k for k in (self.keys or {self.stem}) | ({self.loose} if self.loose else set())
                           if len(k) >= _MIN_STEM and k.translate(FTS_OPERATORS) == k and k.split() == [k])
         parts = [f'"{p}"*' for p in prefixes] + ([] if self.word in prefixes else [exact])
+        parts += [f'"{f}"' for f in self.lemma_forms if not any(f.startswith(p) for p in prefixes)]
         return parts[0] if len(parts) == 1 else "(" + " OR ".join(parts) + ")"
 
     def fts_extra(self) -> str:
@@ -933,8 +1889,9 @@ class Term:
 
     @cached_property
     def _head_keys(self) -> tuple:
-        """Latin: keys of four letters or more that may be the last part of a German compound ("katze" in
-        "familienkatze", "laptop" in "arbeitslaptop"). Checked only against facts written in German."""
+        """Latin: keys of four letters or more that may be the last part of a German or Dutch compound ("katze" in
+        "familienkatze", "laptop" in "arbeitslaptop", "arts" in "kinderarts"). Checked only against facts written in
+        German or Dutch."""
         if self.identifier or len(self.tokens) != 1 or word_script(self.word) != "latin":
             return ()
         return tuple(k for k in self.keys if len(k) >= 4)
@@ -951,6 +1908,18 @@ class Term:
             return 1.0
         if self.identifier or len(self.tokens) != 1:
             return 0.0
+        if fact.mods and not self.keys.isdisjoint(fact.mods):  # a part before the last of a German compound
+            return _DERIV_WEIGHT
+        if fact.heads and not self.keys.isdisjoint(fact.heads):  # the last part, of three letters ("Tag" / "Alltag")
+            return _DERIV_WEIGHT
+        if self._lemma_keys and fact.lemma_keys and not self._lemma_keys.isdisjoint(fact.lemma_keys):
+            # a form of the same German or Spanish verb ("ging" / "gehen", "fue" / "va"): like a root, since a form
+            # may belong to several verbs ("fue": ir, ser) and a name may be spelled like one ("Lucía" / lucir)
+            return _DERIV_WEIGHT
+        if self.head:  # a German compound of the question whose parts the fact has only some of
+            strength = self.compound_match(fact)
+            if strength:
+                return strength
         lang = self.root_lang
         if lang and fact.roots | fact.lang_keys:  # only roots and keys of the same, determined language meet
             fact_roots = {r for lng, r in fact.roots if lng == lang}
@@ -975,8 +1944,18 @@ class Term:
                 any(f.startswith(k) for k in self._prefix_keys for f in fact.keys):
             return True
         if fact.german and self._head_keys and any(k in fact.text for k in self._head_keys) and \
-                any(len(f) >= len(k) + 3 and f.endswith(k) for k in self._head_keys for f in fact.bag):
+                any(len(f) >= len(k) + 3 and f.endswith(k) for k in self._head_keys
+                    for f in (fact.bag if fact.suffix_words is None else fact.suffix_words)):
             return True
+        # Dutch the same, also against the compound's stem: "sleutel" ends "reservesleutels" as "reservesleutel"
+        if fact.dutch and self._head_keys and any(k in fact.text for k in self._head_keys) and \
+                any(len(f) >= len(k) + 3 and f.endswith(k) for k in self._head_keys for f in fact.bag | fact.keys):
+            return True
+        if not self.identifier and len(self.tokens) <= 1:
+            if fact.heads and any(len(k) >= 4 for k in self.keys & fact.heads):  # the last part of a compound
+                return True
+            if self.head and self.compound_match(fact) == 1.0:
+                return True
         return self.word in fact.text and self._bounded.search(fact.text) is not None
 
 
@@ -994,5 +1973,9 @@ def query_terms(text: str) -> list[Term]:
         if key not in seen:
             seen.add(key)
             terms.append(Term(w.text, key, w.identifier, tokens, w.keys if single else frozenset({w.text}), w.scan, w.fts,
-                              w.roots if single else frozenset(), w.root_lang if single else ""))
+                              w.roots if single else frozenset(), w.root_lang if single else "",
+                              *((w.head, w.mod_parts, w.lemmas, w.lemma_of, w.form_lang) if single else ())))
     return terms
+
+
+_ja_ready = True  # every word list above is built: Japanese spelling variants may load from here on

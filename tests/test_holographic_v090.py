@@ -78,20 +78,44 @@ def test_suffix_rules_remain_as_an_option(monkeypatch):
         text._ru_roots.cache_clear()
 
 
-@pytest.mark.parametrize("word, root", [
-    ("teacher", "teach"), ("swimmer", "swim"), ("driver", "drive"), ("dentist", "dent"), ("dental", "dent"),
-    ("photography", "photograph"), ("investor", "invest"), ("runner", "run"), ("electrician", "electric"),
+@pytest.mark.parametrize("word, related", [
+    ("teacher", "teaches"), ("swimmer", "swims"), ("driver", "drives"), ("photography", "photograph"),
+    ("investor", "invest"), ("payment", "pay"), ("delivery", "delivered"), ("decision", "decide"),
+    ("explanation", "explain"), ("allergic", "allergy"), ("angry", "anger"), ("contractor", "contract"),
 ])
-def test_english_roots(word, root):
-    assert root in text._en_roots(word, text.stem(word, "en"))
+def test_english_roots_from_the_dictionary(word, related):
+    # 0.11.0: Open English Wordnet's derivation links, as stem pairs; spelling changes too (decis / decid)
+    assert text.stem(related, "en") in text._en_roots(word, text.stem(word, "en"))
 
 
-@pytest.mark.parametrize("word, not_root", [
+@pytest.mark.parametrize("word, not_related", [
     ("mother", "moth"), ("mothers", "moth"), ("corners", "corn"), ("summer", "sum"), ("every", "ever"),
-    ("party", "part"), ("battery", "bat"), ("factory", "fact"), ("general", "gene"), ("general", "gen"),
+    ("party", "part"), ("battery", "bat"), ("factory", "fact"), ("general", "gene"), ("peter", "pet"),
+    ("meters", "met"), ("classic", "class"), ("career", "car"), ("planet", "plan"), ("single", "sing"),
+    ("heart", "hear"), ("passion", "pass"), ("portion", "port"), ("witness", "wit"),
 ])
-def test_english_roots_do_not_reach_another_word(word, not_root):
-    assert not_root not in text._en_roots(word, text.stem(word, "en"))
+def test_english_roots_do_not_reach_another_word(word, not_related):
+    assert text.stem(not_related, "en") not in text._en_roots(word, text.stem(word, "en"))
+
+
+def test_english_suffix_rules_remain_as_an_option(monkeypatch):
+    monkeypatch.setattr(text, "_EN_DERIVATION", "rules")
+    text._en_roots.cache_clear()
+    try:
+        assert "dent" in text._en_roots("dentist", text.stem("dentist", "en"))  # the dictionary has no dentist / dental
+        assert "gen" not in text._en_roots("general", text.stem("general", "en"))
+    finally:
+        text._en_roots.cache_clear()
+
+
+def test_a_copy_without_the_dictionary_files_has_no_roots(monkeypatch):
+    def missing(path, *a, **k):
+        raise FileNotFoundError(path)
+
+    monkeypatch.setattr(text, "_PAIRS", {})
+    monkeypatch.setattr(text.gzip, "open", missing)
+    assert text._related("en", "teach") == frozenset()
+    assert text._related("ru", "ноч") == frozenset()
 
 
 def test_roots_only_in_text_of_a_determined_language():
@@ -110,7 +134,7 @@ def test_roots_only_in_text_of_a_determined_language():
     ("Тимур ходит на плавание", "кто плавает"),
     ("Grace teaches piano on Tuesdays", "who is the teacher"),
     ("Leo swims at the club every Saturday", "where does the swimmer go"),
-    ("Oliver has a dentist appointment in May", "the dental thing"),
+    ("The decision about the new school is final", "what did they decide"),
 ])
 def test_root_only_query_finds_the_fact(store, no_roots, fact, query):
     target = store.add_fact(fact)

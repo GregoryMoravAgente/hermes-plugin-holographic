@@ -16,8 +16,8 @@ from . import holographic as hrr
 from . import text as _text
 from .history import CLOSED, version_state
 from .text import (CJK_NEGATORS, CLAIM_WORDS, CONTRASTIVE, NEGATORS, UNSEGMENTED, analyze, content_chars,
-                   content_keys, content_stems, gram_coverage, is_greeting, is_sea, query_grams, query_terms, run_grams,
-                   soft_jaccard, soft_overlap, words)
+                   content_keys, content_stems, gram_coverage, is_chinese, is_greeting, is_sea, query_grams,
+                   query_terms, run_grams, soft_jaccard, soft_overlap, words, zh_char_text)
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +34,23 @@ _RE_UNSEGMENTED = UNSEGMENTED
 _INDONESIAN_PROBE = '"yang" OR "dengan" OR "untuk" OR "tidak" OR "adalah" OR "sudah" OR "belum"'
 # ... and of German, whose compounds hide their last word from a prefix query ("Katze" in "Familienkatze").
 _GERMAN_PROBE = '"und" OR "nicht" OR "ist" OR "sind" OR "der" OR "das" OR "eine" OR "mit"'
+# ... Dutch (plurals that change the word: "raam" / "ramen"), Turkish (consonant changes: "kitap" / "kitabı") and
+# Polish (ł, and words typed without their marks), with words no other supported language writes as a word of its own.
+_DUTCH_PROBE = '"het" OR "een" OR "niet" OR "zijn" OR "wordt" OR "naar"'
+_TURKISH_PROBE = '"bir" OR "için" OR "değil" OR "gibi" OR "olarak" OR "çok"'
+_POLISH_PROBE = '"się" OR "jest" OR "oraz" OR "który" OR "przez" OR "jak"'
+_SCAN_PROBE = " OR ".join((_INDONESIAN_PROBE, _GERMAN_PROBE, _DUTCH_PROBE, _TURKISH_PROBE, _POLISH_PROBE))
+# A question told to be in one of these languages scans whatever the store holds: the probe words above are a sample,
+# and a store of short facts may have none of them ("Kitabı masada bıraktım." asked as "Kitap nerede?")
+_SCAN_LANGUAGES = frozenset({"id", "de", "tr", "pl", "nl"})
+
+
+def _scan_language(query: str) -> bool:
+    """Is *query* in a language whose other word forms the FTS index cannot reach (told by its function words)?"""
+    if not query:
+        return False
+    analysis = analyze(query)
+    return analysis.determined and not _SCAN_LANGUAGES.isdisjoint(analysis.langs)
 
 
 class _Corpus:
@@ -116,7 +133,7 @@ class FactRetriever:
         for fact in self._ngram_candidates(query, category, min_trust, limit * 3, corpus):
             if fact[key] not in candidates or candidates[fact[key]].get("fts_rank", 0) < fact["fts_rank"]:
                 candidates[fact[key]] = fact
-        for fact in self._scan_candidates(terms, category, min_trust, limit * 3, corpus, exact=not roots):
+        for fact in self._scan_candidates(terms, category, min_trust, limit * 3, corpus, exact=not roots, query=query):
             candidates.setdefault(fact[key], fact)  # fills in what FTS cannot see; FTS ranks what it found
         # BM25 does not see roots: a fact holding "Марина" and "по ночам" ranks with every other fact about Marina for
         # "ночная подработка Марины", and "The walker" matches the prefix "walk"* as fully as a fact with "walk". When
@@ -142,12 +159,12 @@ class FactRetriever:
         # A word no version of the date contains still says what the query is about (as in `relevant`): it counts
         # against coverage, weighted like the commonest present word.
         total = sum(weight.values()) + sum(1 for t in terms if not df[t]) * (min(weight.values()) if weight else 0.0)
-        grams = query_grams(query)
+        grams, zh = query_grams(query), is_chinese(query or "")
         for fact in candidates:
             text = f'{fact.get("content", "")} {fact.get("tags") or ""}'
             analysis = analyze(text)
             share = sum(w * t.match(analysis) for t, w in weight.items()) / total if total else 0.0
-            fact["fts_rank"] = max(share, gram_coverage(grams, text.lower()) if grams else 0.0)
+            fact["fts_rank"] = max(share, gram_coverage(grams, analysis, zh) if grams else 0.0)
 
     def _coverage_rank(self, query: str, terms, candidates: list[dict]) -> None:
         """The same weighted share for the current facts, cheaply: document frequencies from the FTS index (one COUNT
@@ -158,11 +175,11 @@ class FactRetriever:
         if not weight:
             return
         total = sum(weight.values()) + sum(1 for t in terms if not df[t]) * min(weight.values())
-        grams = query_grams(query)
+        grams, zh = query_grams(query), is_chinese(query or "")
         for fact in candidates:
-            text = f'{fact.get("content", "")} {fact.get("tags") or ""}'
-            share = sum(w * t.match(analyze(text)) for t, w in weight.items()) / total
-            fact["fts_rank"] = max(share, gram_coverage(grams, text.lower()) if grams else 0.0)
+            analysis = analyze(f'{fact.get("content", "")} {fact.get("tags") or ""}')
+            share = sum(w * t.match(analysis) for t, w in weight.items()) / total
+            fact["fts_rank"] = max(share, gram_coverage(grams, analysis, zh) if grams else 0.0)
 
     def search_as_of(self, query: str, day: str, category: str | None = None, min_trust: float = 0.3,
                      limit: int = 10) -> dict:
@@ -224,16 +241,15 @@ class FactRetriever:
             cache.clear()
         return out
 
-    def _scan_terms(self, terms, corpus: _Corpus | None = None) -> list:
-        """The terms matched word by word: Arabic and Indic always; Latin ones (Indonesian, German, or a query of
-        undetermined language) only when the store holds Indonesian or German facts, so an English store never pays
-        for a scan."""
+    def _scan_terms(self, terms, corpus: _Corpus | None = None, query: str = "") -> list:
+        """The terms matched word by word: Arabic and Indic always; Latin ones (Indonesian, German, Dutch, Turkish,
+        Polish, or a query of undetermined language) only when the store holds facts in one of those languages, so an
+        English store never pays for a scan."""
         fts = (corpus or self._current).fts
         scan = [t for t in terms if t.scan]
-        if any(t.fts_ok for t in scan):
+        if any(t.fts_ok for t in scan) and not _scan_language(query):
             try:
-                needed = bool(self.store.read(f"SELECT 1 FROM {fts} WHERE {fts} MATCH ? LIMIT 1",
-                                              (f"{_INDONESIAN_PROBE} OR {_GERMAN_PROBE}",)))
+                needed = bool(self.store.read(f"SELECT 1 FROM {fts} WHERE {fts} MATCH ? LIMIT 1", (_SCAN_PROBE,)))
             except Exception:  # a damaged index: the scan does not need it
                 needed = True
             if not needed:
@@ -252,13 +268,13 @@ class FactRetriever:
         return [dict(r) for r in self.store.read(sql, params)]
 
     def _scan_candidates(self, terms, category: str | None, min_trust: float, limit: int,
-                         corpus: _Corpus | None = None, exact: bool = False) -> list[dict]:
+                         corpus: _Corpus | None = None, exact: bool = False, query: str = "") -> list[dict]:
         """Facts containing the query's scan terms (Arabic, Indic, Indonesian: words whose other forms the FTS5
         index cannot find), matched word by word against the text of every fact and ranked by the IDF-weighted share
         of those terms they contain ('fts_rank'). A scan, like the n-gram path: milliseconds at the size this store
         is meant for."""
         corpus = corpus or self._current
-        scan = self._scan_terms(terms, corpus)
+        scan = self._scan_terms(terms, corpus, query)
         if not scan:
             return []
         texts = self._texts(category, min_trust, corpus)
@@ -287,11 +303,14 @@ class FactRetriever:
         if not grams:
             return []
         # Matched against each fact's folded text (content and tags: the agent's keywords are searched like the text),
-        # so Traditional and Simplified characters meet; the analysis is cached per fact, as for the word scan.
-        total = sum(weight for _, weight in grams)
+        # so Traditional and Simplified characters meet; the analysis is cached per fact, as for the word scan. A
+        # Chinese query's pairs are matched as they stand in Chinese facts (gram_coverage, inlined: it runs per fact).
+        zh, total = is_chinese(query or ""), sum(weight for _, weight in grams)
+        plain = [(g.replace(_text.SEAM, ""), w) for g, w in grams]
         texts = self._texts(category, min_trust, corpus)
-        ranked = sorted(((sum(w for g, w in grams if g in a.text) / total, trust, rid) for rid, trust, a in texts),
-                        reverse=True)
+        held = ((sum(w for g, w in grams if g in a.seamed) if zh and a.seamed else
+                 sum(w for g, w in plain if g in a.text), trust, rid) for rid, trust, a in texts)
+        ranked = sorted(((share / total, trust, rid) for share, trust, rid in held), reverse=True)
         rank = {rid: score for score, _, rid in ranked[:limit] if score > 0}
         rows = self._rows(list(rank), category, min_trust, corpus)
         for fact in rows:
@@ -521,18 +540,25 @@ class FactRetriever:
         "да, это так") recalls nothing. Order is preserved."""
         if is_greeting(query):  # "good morning", "доброе утро", "早上好": a courtesy, not a question about mornings
             return []
-        grams = query_grams(query or "")
+        grams, zh = query_grams(query or ""), is_chinese(query or "")
         gram_kept = []
         if grams and candidates:
             # Unsegmented script: weighted coverage of the query's n-grams, or (stricter, since one character says
             # less than a word) IDF-weighted coverage of its meaningful characters: in Chinese a one-character
             # word (猫, cat) or a reordered phrase (名字 / 名叫) shares characters, not bigrams.
             char_weights = self._char_weights(content_chars(query))
+            pairs = [(g, w) for g, w in grams if len(g.replace(_text.SEAM, "")) > 1]  # not the one-character words
             char_total = sum(char_weights.values())
             for f in candidates:
-                text = analyze(f'{f.get("content", "")} {f.get("tags") or ""}').text  # lower-cased and folded
-                char_cov = sum(w for c, w in char_weights.items() if c in text) / char_total if char_total else 0.0
-                if gram_coverage(grams, text) >= min_coverage or char_cov >= max(0.5, min_coverage):
+                analysis = analyze(f'{f.get("content", "")} {f.get("tags") or ""}')  # lower-cased and folded
+                chars = zh_char_text(grams, analysis) if zh else analysis.text  # not the halves of a split pair
+                char_cov = sum(w for c, w in char_weights.items() if c in chars) / char_total if char_total else 0.0
+                # a Chinese one-character word (猫) never recalls alone: a pair of the question is there too, or
+                # (characters one by one) two of its characters ("猫几岁了" / "合同里有猫腻" share 猫 only)
+                paired = not zh or not pairs or gram_coverage(pairs, analysis, zh, 1.0) > 0
+                two = not zh or len(char_weights) < 2 or sum(1 for c in char_weights if c in chars) >= 2
+                if (gram_coverage(grams, analysis, zh) >= min_coverage and paired) or \
+                        (char_cov >= max(0.5, min_coverage) and two):
                     gram_kept.append(f)
         terms = [t for t in query_terms(_RE_UNSEGMENTED.sub(" ", query or "")) if t.word]
         identifiers = [t for t in terms if t.identifier]
@@ -542,7 +568,7 @@ class FactRetriever:
         if not terms or not candidates:
             return gram_kept
         total_facts = max(self.store.count_facts(), 1)
-        scan = self._scan_terms(terms)
+        scan = self._scan_terms(terms, query=query)
         texts = self._texts() if scan else []
         scan_df = {t: sum(1 for _, _, a in texts if t.found_in(a)) for t in scan}
         weights, unknown = {}, []

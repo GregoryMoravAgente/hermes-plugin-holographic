@@ -1,5 +1,165 @@
 # Changelog
 
+## 0.11.0 — 2026-10-13
+
+Dictionaries for more languages: English words of one root from Open English Wordnet, Japanese spelling variants from
+SudachiDict, Chinese words from jieba's dictionary, German compounds and German and Spanish verb forms from Wikidata;
+Italian, Turkish, Polish and Dutch at the level of Spanish and French.
+
+### Added
+
+- **Japanese spelling variants (表記揺れ).** One Japanese word is written in kanji or kana, with more or less okurigana,
+  or as a loanword with or without the long vowel, and character n-grams could not join the spellings. In text that
+  has kana, a variant now compares as its word's representative spelling: `子ども` / `子供`, `引越し` / `引越` /
+  `引っ越し`, `申込` / `申し込み`, `打合せ` / `打ち合わせ`, `コンピュータ` / `コンピューター`, `ウィルス` / `ウイルス`,
+  `ヴァイオリン` / `バイオリン`, `きょう` / `今日`. Chinese text (no kana) is never touched; stored text keeps its spelling.
+  The spellings come from SudachiDict's synonym source (`src/main/text/synonyms.txt`, release v20260723.1, Works
+  Applications, Apache-2.0, `LICENSES/SudachiDict-Apache-2.0.txt`): spellings of one lexeme only (variant and
+  misspelling rows of one group, lexeme, form type and abbreviation form, with the expansion flag of their
+  representative) — no synonyms, abbreviations (`スマホ` stays apart from `スマートフォン`), translations or romaji.
+  `ja_variants.tsv.gz` (47 KB, 5,167 variants of 4,011 words); `tools/build_ja_variants.py` rebuilds it. Left out:
+  single characters, hiragana of two letters (`いす`, `かに`), hiragana verbs and adjectives Sudachi marks as no
+  expansion trigger (homophones: `はなす` is 話す, 離す or 放す), words whose representative is one kanji (`たまご` /
+  `卵`: a lone kanji has no bigram, so two facts that both wrote `たまご` would stop meeting), `いつも` / `いつごろ` /
+  `だいぶ` (`何時`, `大分` are other words), and any variant inside the filler and greeting lists.
+- Japanese has no spaces, so a variant is replaced only where its edges can be word edges, longest first: hiragana
+  not inside other hiragana except next to a particle or a suffix (`たち`, `さん`, `だけ` …), and not right after a kanji
+  (`べんきょう` holds no `きょう`, nor does `きょうだい`; `白い草` holds no `い草`); katakana not inside a longer katakana
+  word (`アイス` holds no `イス`, `カスタマイズ` no `カスタマ`), except variants of six letters or more
+  (`セキュリティポリシー`); a representative written as it is stays (`コンピューター` holds no `コンピュータ`). A variant
+  with a kanji in it may run into its inflection (`引越しします` → `引っ越しします`). The text is folded again until
+  nothing changes, so folded text folds to itself. `_JA_VARIANTS = False` turns it off. Loaded on the first text with
+  kana: 0.03 s, about 2 MB.
+- **Chinese words (jieba's dictionary).** Chinese has no spaces, and character pairs could not tell a word from the
+  halves of two words: `和服` (kimono) was found in `我和服务员` ("me and the waiter"), `研究生` in `研究生命`, `校长` in
+  `学校长期`, `市长` in `南京市长江大桥`. Text whose Han is Chinese (no kana, no Hangul) is now also split into words:
+  the most probable split by word frequency, as jieba cuts without its HMM (its word graph and route, written anew in
+  `text.py`, `zh_words`; a character that begins no word stands alone). The words add to the pairs, they do not
+  replace them. A seam is where two dictionary words of two or more characters meet, or one meets a function
+  character standing alone; a pair across a seam is written with a separator (`和`␟`服`), so a question's pair inside
+  a word is not found where a fact holds it only across a seam, a question's pair across a seam meets only the same
+  seam (`几岁 | 了` / `三岁 | 了`), and a character a fact holds only as the half of a question's split pair does not
+  count for the character coverage (`研究 | 生命` keeps the `究` of `研究`, not the `生` of `研究生`). Every pair keeps
+  its weight, so coverage is counted as in 0.10.0. No seam next to a content character standing alone (`看 | 牙医`
+  still holds `看牙`, `续 | 保险` still `续保`). One-character words are searched alone, wherever they stand in a fact
+  (`猫` in `猫粮`, `牙` in `牙医`), except function characters, negators, numerals, units of the calendar, the commonest
+  (round(4 ln f) ≥ 43 in the dictionary: `过`, `看`, `去`), characters jieba tags as a person name (`王`, `李`, `陈`), and,
+  in a question, two side by side (a name the dictionary lacks: `怡 君`; its pair stands for it, as before). The
+  rerank's word overlap uses the same pairs. Traditional text is split after folding. Japanese and Korean text, and a
+  Japanese question against Chinese facts, are compared exactly as before; `_ZH_WORDS = False` gives 0.10.0's results
+  exactly, question by question.
+- `zh_words.txt.gz` (1.45 MB) from jieba's `jieba/dict.txt` (commit 67fa2e36e72f69d9134b8a1037b83fbb070b9775, MIT,
+  `LICENSES/jieba-MIT.txt`): entries in Han characters only, folded to Simplified with `cjk_fold.py` (entries that fold
+  together add up), frequency kept as round(4 ln f), the part of speech dropped except for the single characters
+  tagged as a person name; all 347,549 words (10,640 of one character), one line per first character.
+  `tools/build_zh_words.py` rebuilds it. Loaded on the first Chinese text: about 0.2 s, 30 MB (41 MB at the peak of
+  loading). A copy without the file compares Chinese as before. jieba is not a dependency. Its author has said the
+  frequencies were counted on the People's Daily 1998 and MSR segmentation corpora, which carry research terms of
+  their own; the dictionary is used as jieba publishes it, under MIT.
+- **German compounds are split** (Wikidata Lexemes, CC0, `de_compounds.tsv.gz`, 212 KB; `LICENSES/Wikidata-CC0.txt`;
+  `tools/build_de_es_lexicon.py` holds the SPARQL queries, run 2026-10-12). In text determined as German: parts of
+  three letters or more with German linking elements, the analysis with the fewest parts, Wikidata's own analysis
+  (P5238) where it has one; two analyses that cut differently leave the word whole unless one is clearly likelier
+  (`Staubecken`, `Wachstube`). Both directions: a fact's compound is found by its last part, at full weight; a
+  question's compound finds a fact that writes its parts apart. Earlier parts, and a last part of three letters
+  (`Tag` in `Alltag`), count 0.6 and never recall alone; a
+  question compound whose last part alone is in a fact counts 0.6. 0.6.0's suffix test applies only to words the
+  dictionary does not know (`Matrose` is no `Rose`, `Ausland` no `Land`). Held-out Wikidata compounds: 94.9 % split,
+  99.9 % of splits as Wikidata cuts them. `_DE_COMPOUNDS`.
+- **German and Spanish verb forms meet their lemma** (`de_es_forms.tsv.gz`, 251 KB): `ging` / `gehen`, `fue` / `ir` and
+  `ser`, `hizo` / `hacer`, at 0.6 of a match and never recalling a fact alone (a form can belong to two verbs, the
+  source has errors, a name can look like a form: `Lucía` / `lucir`), in text of that language only and not in a tie
+  with English; forms spelled like another word (`Macht`, `vino`, `cuenta`), like a regular form of another verb
+  (`fuhren` / `führen`) or listed under more than three verbs (`tuviese`) are left out. The 2,000 German and 4,000 Spanish verbs a stand-in for frequency ranks first. `_LEMMA_FORMS`.
+- **Italian, Turkish, Polish, Dutch.** Snowball stems (each word stemmed as written and folded, so a word typed
+  without its marks still meets one typed with them), function words, greetings and courtesy pieces, negators,
+  "with" / "without" and "but" words. Turkish: `İ`, `I`, `ı` and `i` compare as one (`İstanbul` / `ISTANBUL`, `KIZIM`
+  / `kızım`); a case ending after an apostrophe comes off a name (`Ankara'da`, `Ayşe'nin`, `HR24'ün`, `hr-ovh'de`), so
+  the name is mentioned and an identifier stays required; the noun without the possessive `s` Snowball leaves
+  (`kedisi` / `kedi`). Polish: `ł` compares as `l` and is still searched as written (`szkoła` / `szkole` / `szkola`).
+  Italian: elision after `quest'`, `quell'`, `dov'`, `com'`, `cos'`, `anch'` and the like (not before a lone `s`:
+  English `dev's`). Dutch: `'s` plurals and possessives (`pinda's`), and a `ge-` that Snowball 3.x takes off is put
+  back (`gezin`, family, was `zin`, sense: 6 false joins of 6 on a short list, now 0; `gemaakt` / `maakt` no longer
+  meet). Turkish, Polish and Dutch stores use the word scan (consonant changes, `ł` typed as `l`, `raam` / `ramen`);
+  Italian does not need it. Dutch compound heads as in German are behind `_NL_COMPOUNDS`, off (2 more right facts, 4
+  more wrong ones on a compound set).
+
+### Changed
+
+- **English same-root words: Open English Wordnet.** 0.9.0's suffix rules joined look-alikes the exception list did
+  not cover (`Peter` / `pet`, `meters` / `met`, `classic` / `class`) and missed spelling changes. The pairs now come
+  from Open English Wordnet 2025 (`english-wordnet-2025.xml.gz`, CC BY 4.0, built on Princeton WordNet 3.1;
+  `LICENSES/OEWN-CC-BY-4.0.md`, `LICENSES/OEWN-WNDB-License.txt`): its sense-level `derivation` and `pertainym` links,
+  projected to pairs of single words, both as Snowball stems, kept when the shape is a derivation (the shorter stem
+  begins the longer one, a three-letter stem only by a common suffix; or the two share all but the last two letters
+  of the shorter, and at least three: `decid` / `decis`, `explain` / `explan`, `anger` / `angri`). The filter drops
+  learned links that are not one root (`ocular` / `eye`, `costal` / `rib`); a link is kept only when it is the
+  derived word's commonest sense (not `butter` / `butt`, `tower` / `tow`, `letter` / `let`, `format` / `form`), and
+  when no stem is another, unrelated word (`pearly` stems to `pear`). 5,428 pairs, `en_derivation.tsv.gz` (30 KB); `tools/build_en_derivation.py` rebuilds it. Loaded on the first English word: 0.04 s, 2.4 MB. A root still
+  counts 0.6 of a word and never recalls a fact alone. `_EN_DERIVATION = "rules"` restores 0.9.0's rules, `"both"`
+  joins the two. Missing from the dictionary: `dentist` / `dental`, `anxiety` / `anxious`; `pronunciation` /
+  `pronounce` is in it, but its spelling change is too large for the filter.
+- Russian and English dictionaries share one loader (`_related(lang, stem)`); a copy without a data file has no roots
+  in that language.
+- Turkish `ı` and Polish `ł` fold to `i` and `l` in every text (only text with those letters changes).
+- Latin text of no determined language is stemmed in English, Spanish, French, Portuguese, Indonesian and German as
+  before; in Turkish, Polish or Dutch only when it has their letters, in Italian never (Polish stems joined `army` /
+  `arm`, `apply` / `apple`).
+- A host name stays required in Turkish, Italian, Polish and Dutch text (`hr-ovh'de`): only Spanish, French,
+  Portuguese, Indonesian and German text reads a letters-only hyphenated word as a compound, and only when every tied
+  language does ("De server hr-ovh" ties Dutch with Spanish).
+- A Japanese fact whose spelling the variants changed also keeps it as written, so a question in kanji only (not
+  folded: it has no kana) still meets it (`締切` / `締切は明日`). A hiragana variant starts after other hiragana only
+  when that is a particle after a kanji or katakana word (`かいちょう` holds no `いちょう`).
+- A Chinese one-character word does not recall a fact alone: a pair of the question, or a second of its characters,
+  must be there too (`猫几岁了` / `合同里有猫腻`).
+- A question told to be Indonesian, German, Turkish, Polish or Dutch scans the store whether or not it holds the probe
+  words. Terms of endearment and times of day pad a Turkish courtesy ("Günaydın canlarım!", "Tamam, akşam
+  görüşürüz"). A truncated or damaged data file is treated as missing.
+- Language detection: function words of the new languages that are everyday words, names or abbreviations elsewhere
+  (`come`, `per`, `kim`, `bo`, `door`, `met` …) do not vote for their language and are dropped only where that language
+  alone fits; `mia` is not an Italian function word here (a common name).
+- snowballstemmer stays `>=2.2,<4`; each stemmer is loaded only if the installed version has it. Polish needs 3.1+
+  (current Hermes installs 3.1.1); on 2.x Polish words compare as written and the Polish-stem tests skip.
+
+### Measured
+
+Fresh blind sets, one per language, written by separate agents that never saw the code, run once on the final code
+against 0.10.0; every choice was made before that run.
+
+- English (12 same-root questions, 4 other forms, 4 synonyms, 12 look-alike traps): same-root questions found 100 %
+  both, recalled 75 → 83 %; all questions recalled 65 → 70 %; traps quiet 12 of 12 both. After the review's filters:
+  same-root recalled 75 % (`medical` / `medicine` went with `butter` / `butt`).
+- Japanese (14 questions in another spelling, 6 in the same, 4 synonyms, 8 traps): other-spelling questions found
+  57 → 71 %, recalled 29 → 43 %; all questions first 46 → 54 %, found 71 → 79 %, recalled 46 → 54 %; traps quiet 8 of
+  8 both. After the review's edge fix: other-spelling questions found 64 %, recalled 36 %.
+- Chinese (10 questions by a shared word, 4 paraphrases, 4 by a one-character word, 4 synonyms, 10 traps across a
+  seam or inside another word): first 59 → 73 %, found 64 → 77 %, recalled 41 % both; one-character words found 0 →
+  50 %; traps quiet 6 of 10 both (the traps that still recall share a real word with a fact: `研究` in `研究生` and
+  `研究生命`).
+- Italian, Turkish, Polish, Dutch (10 other-form questions, 6 same-form, 4 synonyms, 5 small talk, 5 traps each):
+  recalled 80 → 85 %, 35 → 85 %, 55 → 75 %, 70 → 85 %; other-form questions recalled 90 → 100 %, 10 → 100 %, 50 →
+  90 %, 60 → 90 %; small talk and traps quiet 50 → 90 %, 70 → 50 %, 60 → 70 %, 70 → 60 %. Turkish recalls more where
+  it should and where it should not ("Günaydın canlarım!" met a boy named Can; "Tamam, akşam görüşürüz" was not
+  read as a sign-off); after the review's fix Turkish small talk and traps are quiet 70 % (not blind).
+- German (6 compound questions, 10 other forms, 6 same, 4 synonyms, 10 small talk and traps): first 62 → 69 %, found
+  73 → 81 %, recalled 65 → 77 %; compounds 67 → 83 %; other forms recalled 70 → 90 %; quiet 8 → 7 of 10 (`Kopfschuppen`,
+  dandruff, is `Kopf` + `Schuppen`, and `Schuppen` is also a shed; after the second review's fixes 8 of 10 again). Spanish: unchanged (73 % recalled both); its
+  irregular-verb questions shared another word with their facts, so the set does not test the forms table.
+- Every earlier set gives the 0.10.0 numbers in every language, except Chinese (the 0.9.0 sets: first 65 → 80 % and
+  75 → 80 %; held-out first 80 → 90 %, third set 88 → 100 %) and one English question ("When is Oliver's dental
+  checkup?" still recalled, no longer first). Development sets written with the code (not blind) are in the README.
+- 5,000 facts, search and recall together: English 0.02 s and Russian 0.04–0.06 s as before; Chinese 0.16 → 0.21 s
+  (first search after start 1.8 → 2.7 s); Turkish 0.01 → 0.25 s (first 1.5 s: Turkish stores now scan, like German).
+- An independent review (Codex CLI) of everything above but German and Spanish found nine faults (the "Changed"
+  entries from "Latin text of no determined language" on, and the English filters); each has a test in
+  `tests/test_holographic_v0110_review.py`. A second review, of German and Spanish and of those fixes, found verb
+  forms and three-letter compound heads recalling facts alone, the host-name rule failing in a Dutch tie, and a
+  malformed compound row raising; fixed with tests (the German set: same numbers, quiet 8 of 10 again). Known and
+  left: a one-word question of no told language against a Turkish, Polish or Dutch store without the probe words, and
+  short facts with no function word and none of their language's letters (no stems of the four newer languages).
+  612 tests pass without a Hermes core, 600 with snowballstemmer 2.2.0.
+
 ## 0.10.0 — 2026-10-13
 
 Russian words of one root come from a dictionary instead of suffix rules.
