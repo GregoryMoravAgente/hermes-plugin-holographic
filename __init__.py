@@ -178,26 +178,43 @@ _RE_EXFILTRATION = re.compile(
     re.IGNORECASE)
 # A credential with its value ("password hunter2", "пароль от wifi: Qwerty!23", "API key sk-…"): never a fact,
 # whoever says it and however it is quoted. The word alone is not enough ("I use a password manager", "the token
-# expires"): the value must look like one (a digit or a symbol in it, or twelve characters and more).
-_RE_CREDENTIAL = re.compile(
+# expires"): the value must look like one — a digit or a symbol in it, or twelve characters and more that are not one
+# lower-case word ("API key authentication"); a decimal number is a price, not a PIN ("the token is 0.125 USD").
+# One pattern per length of the "for the home wifi" part (none, one to three words): a single pattern settles on its
+# first match, and with a longer optional part "от wifi: Qwerty123, не забудь" took "забудь" for the value.
+_RE_CREDENTIALS = tuple(re.compile(
     r"(?:\b(?:pass(?:words?|phrases?|codes?)|pwd|pins?(?:\s+codes?)?|api[\s_-]?keys?|(?:access|auth|bearer|refresh)"
     r"[\s_-]?tokens?|secret[\s_-]?keys?|tokens?|otp|2fa\s+codes?)\b"
     r"|парол[ьяюеи]|пин[\s-]?код\w*|токен\w*|ключ\w*\s+api)"
-    r"(?:\s+(?:for|to|of|on|для|от|к|на)(?:\s+\S+(?=\s|$)){1,2})?\s*(?:\b(?:is|was|are)\b|[:=—–-]|это)?\s*[\"'«“`]?"
-    r"(?<!\S)(?P<value>\S{4,})",
-    re.IGNORECASE)
+    + (r"\s+(?:for|to|of|on|для|от|к|на)" + r"\s+\S+(?=\s|$)" * words if words else "")
+    # the value starts after a space, a separator or a quote ("password:Qwerty123" has no space)
+    + r"\s*(?:\b(?:is|was|are)\b|[:=—–-]|это)?\s*[\"'«“`]?(?<![^\s:=—–\-\"'«“`])(?P<value>\S{4,})",
+    re.IGNORECASE) for words in range(4))
 _VALUE_EDGE = ".,;:!?\"'«»“”`)"
+_RE_DECIMAL = re.compile(r"[$€£¥₽฿]?\d+[.,]\d+[$€£¥₽฿%]?")
+
+
+def _has_credential(text: str) -> bool:
+    return any(_looks_like_a_secret(m.group("value")) for rx in _RE_CREDENTIALS for m in rx.finditer(text))
 
 
 def _looks_like_a_secret(token: str) -> bool:
     value = token.strip(_VALUE_EDGE)
-    return len(value) >= 4 and (len(value) >= 12 or any(c.isdigit() or (not c.isalnum() and c != "'") for c in value))
+    if len(value) < 4 or _RE_DECIMAL.fullmatch(value):
+        return False
+    if any(c.isdigit() or (not c.isalnum() and c != "'") for c in value):
+        return True
+    return len(value) >= 12 and not (value.isalpha() and (value.islower() or value[1:].islower()))
 
 
 # Quoted spans are reported text ("the test case contains 'ignore previous instructions'"), not instructions.
 _RE_QUOTED_SPAN = re.compile(r"\"[^\"\n]*\"|'[^'\n]*'|«[^»\n]*»|“[^”\n]*”")
 _RE_ROLE_MARKUP = re.compile(r"(?im)^\s*(?:system|assistant|user|tool)\s*:|</?(?:tool_call|function_call|system|assistant)\b|<\|")
 _RE_BLOB = re.compile(r"[A-Za-z0-9+/=_-]{200,}")
+# An image, markdown or HTML ("![x](https://host/p?d=…)", "![x][1]", "<img src=…>"): a client that renders it fetches
+# its address by itself, so a fact holding one could leak whatever the model is led to put into the address — in the
+# query or in the path alike. A fact has no use for an image, so none is accepted (review 2026-10-13).
+_RE_IMAGE_EXFIL = re.compile(r"!\[[^\]\n]*\]\s*[(\[]|<\s*img\b", re.IGNORECASE)
 _INVISIBLE = frozenset("​‌‍⁠﻿‪‫‬‭‮⁦⁧⁨⁩")
 
 
@@ -219,12 +236,35 @@ def _fact_problem(content: str) -> str | None:
         return "reads like an instruction to the assistant, not a fact"
     if _RE_EXFILTRATION.search(unquoted):
         return "asks to send credentials somewhere: an instruction, not a fact"
-    if any(_looks_like_a_secret(m.group("value")) for m in _RE_CREDENTIAL.finditer(text)):
+    if _has_credential(text):
         return "contains what looks like a credential (a password, key, token or PIN with its value): never store those"
     if any(c in _INVISIBLE for c in text):
         return "contains invisible formatting characters"
+    if _RE_IMAGE_EXFIL.search(text):
+        return "contains an image (markdown or HTML): a client that renders it fetches its address"
     if _RE_BLOB.search(text):
         return "contains a long encoded blob"
+    return None
+
+
+def _recall_problem(content: str) -> str | None:
+    """Why a stored fact must not be recalled into a prompt, or None: what _fact_problem refuses as an instruction, a
+    credential or hidden markup, checked again on the way out. A fact written before a rule existed (credentials
+    before 0.12.0, images before 0.13.0), by an older release or by another program writing the file, would
+    otherwise be replayed into every turn it matches. Length, JSON and blobs are not checked here: they make a
+    poor fact, not a dangerous one."""
+    text = (content or "").strip()
+    if _RE_ROLE_MARKUP.search(text):
+        return "chat-role or tool-call markup"
+    unquoted = _RE_QUOTED_SPAN.sub(" ", text)
+    if _RE_INJECTION.search(unquoted) or _RE_EXFILTRATION.search(unquoted):
+        return "an instruction to the assistant"
+    if _has_credential(text):
+        return "a credential with its value"
+    if any(c in _INVISIBLE for c in text):
+        return "invisible formatting characters"
+    if _RE_IMAGE_EXFIL.search(text):
+        return "an image (markdown or HTML)"
     return None
 
 
@@ -369,6 +409,7 @@ class HolographicMemoryProvider(MemoryProvider):
         self._pending: dict[str, Counter] = {}  # store key -> buffered recall counts for THAT database
         # session|store -> {(fact_id, content hash): prefetch turn it was last injected}; bounded LRU of sessions.
         self._injected: OrderedDict[str, OrderedDict] = OrderedDict()
+        self._withheld: set = set()  # fact ids recall left out (_recall_problem), logged once each
         self._turns: dict[str, int] = {}
         self._last_recall = 0
         scope = str(self._config.get("scope", "profile")).strip().lower()
@@ -629,13 +670,14 @@ class HolographicMemoryProvider(MemoryProvider):
             key = f"{session_id or self._session_id or ''}|{self._scope_key or ''}"
             turn = self._turns[key] = self._turns.get(key, 0) + 1
             candidates = self._retriever.search(query, min_trust=self._min_trust, limit=_PREFETCH_CANDIDATES)
-            # Recently injected facts are dropped BEFORE the top five are taken, so they leave room for others.
+            # Recently injected facts are dropped BEFORE the top five are taken, so they leave room for others; so are
+            # facts the write filter would refuse today (_recall_problem).
             fresh = [f for f in self._retriever.relevant(query, candidates, self._min_coverage)
-                     if self._not_recent(key, f, turn)][:_PREFETCH_FACTS]
+                     if self._not_recent(key, f, turn) and self._recallable(f)][:_PREFETCH_FACTS]
             have, extra = {f["fact_id"] for f in fresh}, 0
             for entity_id in sorted(self._store.mentioned_entity_ids(query)):
                 for fact in self._retriever._linked_facts([[entity_id]], None, self._min_trust, _ENTITY_FACTS * 3):
-                    if extra < _ENTITY_FACTS and fact["fact_id"] not in have and self._not_recent(key, fact, turn):
+                    if extra < _ENTITY_FACTS and fact["fact_id"] not in have and self._not_recent(key, fact, turn)                             and self._recallable(fact):
                         fresh.append(fact)
                         have.add(fact["fact_id"])
                         extra += 1
@@ -652,6 +694,16 @@ class HolographicMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.debug("Holographic prefetch failed: %s", e)
             return ""
+
+    def _recallable(self, fact: dict) -> bool:
+        """False for a fact recall must not inject (_recall_problem); logged once per fact and process. fact_store
+        search, list and history still show it: there the agent asked, and can change or forget it."""
+        problem = _recall_problem(fact.get("content", ""))
+        if problem and fact.get("fact_id") not in self._withheld:
+            self._withheld.add(fact.get("fact_id"))
+            logger.warning("holographic: fact #%s is not recalled (%s); review it with fact_store", fact.get("fact_id"),
+                           problem)
+        return problem is None
 
     def _recall_suffix(self, src: dict | None) -> str:
         """recall_source: short — " (recorded 2026-10-12 · Anton · this chat)", no ids; "" when the source is unknown."""

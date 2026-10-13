@@ -86,8 +86,11 @@ In `config.yaml` under `plugins.hermes-memory-store`:
   mentioning it in any form link to it), `keywords` (see [Synonyms](#synonyms-and-other-roots-keywords)) and
   `valid_from` (the date it started to hold, when the message says). Its answer lists `similar` facts,
   `possible_conflicts` (same subject, a different claim) and `past_versions`; the agent decides. Text that is not a
-  fact (JSON, tool or chat-role markup, instruction-like phrasing, invisible characters, long blobs, >1000
-  characters) is refused with the reason.
+  fact (JSON, tool or chat-role markup, instruction-like phrasing, a credential with its value, an image (markdown or
+  HTML), invisible characters, long blobs, >1000 characters) is refused with the reason. Recall
+  checks a stored fact again before it goes into a prompt (0.13.0): one an older release, or another program, wrote
+  past today's rules (markup, instructions, credentials, invisible characters, images) is left out of recall
+  and logged once; `search`, `list` and `history` still show it, so it can be changed or forgotten.
 - **stats** (what is stored and how much of it was ever recalled), **export** (Markdown view), **review**
   (clean-up candidates: low trust, never recalled for 60 days, near-duplicates), **enrich** (facts without keywords,
   most recalled first, to give keywords with `update`).

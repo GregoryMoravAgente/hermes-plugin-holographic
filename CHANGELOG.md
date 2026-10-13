@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.13.0 — 2026-10-13
+
+### Added
+
+- **Recall checks a fact again on the way out.** The filter of what a fact must not be ran only when a fact was
+  written, so a fact stored before a rule existed (a credential before 0.12.0), by an older release or by another
+  program writing the file was injected into every turn it matched. Before recall, a fact is checked again for
+  chat-role or tool-call markup, instruction-like phrasing, a credential with its value, invisible characters and
+  images; such a fact is left out of recall and logged once per process. `fact_store`
+  search, list and history still show it — the agent asked, and can change or forget it. Length, JSON and blobs
+  are not checked on the way out: they make a poor fact, not a dangerous one. (hermes-agent#136997 asked for this
+  in another provider.)
+- **An image is not a fact** — markdown (`![x](https://host/p.png?d=…)`, `![x][1]`) or HTML (`<img src=…>`): a
+  client that renders it fetches the address by itself, and data can ride in the path as well as in the query.
+
+### Fixed
+
+- The credential rule of 0.12.0 read at most two words between the credential word and its value
+  ("password for the garden shed is …" passed); up to three now, each length tried on its own so a later word
+  never stands in for the value. The value may follow a colon without a space (`password:Qwerty123`). Fewer false
+  alarms: a decimal number is a price, not a PIN (`the token is 0.125 USD`), and twelve letters of one lower-case
+  word are not a secret (`API key authentication is enabled`). Reviewed by Codex CLI before release.
+
 ## 0.12.0 — 2026-10-13
 
 Fixes from an audit of 0.6.2–0.11.0: a write transaction that could stay open after a failed COMMIT, `forget`
