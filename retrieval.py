@@ -65,6 +65,14 @@ def _inner_names(query: str) -> list[str]:
     return names
 
 
+def _fact_row(row) -> dict:
+    """A fact row as a dict without foreign binary columns: a store migrated from another embedding deployment can
+    carry e.g. a ``facts.embedding`` BLOB, and ``SELECT *`` / ``f.*`` would hand it to the tool result, where JSON
+    serialization fails on every search (reported on a live store, 0.14.1). Our own ``hrr_vector`` stays: scoring
+    reads it and pops it before anything is returned."""
+    return {k: v for k, v in dict(row).items() if k == "hrr_vector" or not isinstance(v, (bytes, bytearray, memoryview))}
+
+
 def _scan_language(query: str) -> bool:
     """Is *query* in a language whose other word forms the FTS index cannot reach (told by its function words)?"""
     if not query:
@@ -288,7 +296,7 @@ class FactRetriever:
         sql = (f"SELECT * FROM {corpus.source} f WHERE f.{corpus.key} IN ({','.join('?' * len(ids))})"
                + (" AND f.trust_score >= ?" if min_trust is not None else "") + (" AND f.category = ?" if category else ""))
         params = [*corpus.params, *ids, *([min_trust] if min_trust is not None else []), *([category] if category else [])]
-        return [dict(r) for r in self.store.read(sql, params)]
+        return [_fact_row(r) for r in self.store.read(sql, params)]
 
     def _scan_candidates(self, terms, category: str | None, min_trust: float, limit: int,
                          corpus: _Corpus | None = None, exact: bool = False, query: str = "") -> list[dict]:
@@ -573,7 +581,7 @@ class FactRetriever:
         sql = (f"SELECT f.*, {fts}.rank as fts_rank_raw FROM {fts} JOIN {corpus.source} f ON f.{corpus.key} = {fts}.rowid "
                f"WHERE {fts} MATCH ? {category_clause}AND f.trust_score >= ? ORDER BY {fts}.rank LIMIT ?")
         try:
-            results = [dict(row) for row in self.store.read(sql, params)]
+            results = [_fact_row(row) for row in self.store.read(sql, params)]
         except Exception as exc:  # a damaged index (expressions are built to be valid)
             # Logged, not raised: recall must not take the turn down; a silent [] hides a broken index.
             logger.warning("holographic: FTS5 search failed (%s: %s)", type(exc).__name__, exc)

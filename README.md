@@ -541,11 +541,17 @@ plugins:
 | A local server with an OpenAI-compatible API (Ollama, Text Embeddings Inference, Infinity) | e.g. `http://127.0.0.1:11434/v1` | the model it serves | none needed |
 
 The first two were measured (below); a local server goes through the same API and was tested against a local test
-server only. Other keys: `embedding_dimensions` (shorter vectors, for models that support it), `embedding_timeout`
+server only. Other keys: `embedding_dimensions` (shorter vectors — only for a model that can shorten them, like
+OpenAI's `text-embedding-3-*`; leave it unset otherwise: a server may answer 400 to the field rather than ignore it,
+as bge-m3 behind an aggregator does, and the plugin's status then says so), `embedding_timeout`
 (3 s, at most 6: the core gives a provider's recall 8 s), `embedding_min_score` (an absolute floor of similarity; off),
 `embedding_prefetch_facts` (1), `embedding_weight` (0.3), `embedding_space` (a label of your own: vectors are kept
 per address, model, dimension and this label, so when a server starts serving another model under the same address
 and name, change it and every vector is made again).
+
+A store that had embeddings from another deployment may carry a column of its own vectors in `facts` (e.g. a
+`facts.embedding` BLOB). Since 0.14.2 it never reaches a tool result; it is not used either, and
+`ALTER TABLE facts DROP COLUMN embedding` (SQLite 3.35+) removes it.
 
 **How it decides**
 

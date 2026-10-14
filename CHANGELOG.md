@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.14.2 — 2026-10-14
+
+### Fixed
+
+- **A foreign binary column in `facts` broke every search.** A store migrated from a hand-rolled embedding
+  deployment kept its own `facts.embedding` BLOB; candidate reads take every column of the source (`f.*`, `SELECT *`),
+  only our `hrr_vector` was dropped before output, and `fact_store search` died on JSON serialization ("Object of
+  type bytes is not JSON serializable"). Rows are now read without foreign binary values; `hrr_vector` still
+  scores. Reported on a live store (issue #3).
+- **A 400 to `embedding_dimensions` was a bare code.** A model that cannot shorten its vectors (bge-m3 behind an
+  OpenAI-compatible aggregator) rejects the `dimensions` field; the status and the log now name the setting.
+  README: set it only for a model that can shorten its vectors.
+
+### Measured by a user
+
+A live Chinese store (73 facts, hosted bge-m3, 12 queries, strict = the fact in the top 3): a hand-rolled patch with
+embeddings 2/10, 0.14.1 5/10; one fact came in on meaning alone in 12 turns, the right one; no wrong fact by
+meaning, none on chit-chat or off-topic questions — on a store where the name rule has nothing to hold on to.
+All 73 facts got vectors in one turn.
+
 ## 0.14.1 — 2026-10-14
 
 ### Fixed

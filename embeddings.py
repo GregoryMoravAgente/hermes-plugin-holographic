@@ -348,7 +348,11 @@ class Embedder:
             if "error" in box:
                 raise box["error"]
         except urllib.error.HTTPError as exc:  # the body may echo the request: not read
-            self._failed(f"HTTP {exc.code}")
+            # A model that cannot shorten its vectors (bge-m3 behind an aggregator, reported on 0.14.1) answers 400 to
+            # the `dimensions` field rather than ignoring it: name the likely cause instead of a bare code.
+            hint = (" — embedding_dimensions is set; a model that cannot shorten its vectors rejects it, leave it unset"
+                    if exc.code == 400 and self.settings.dimensions else "")
+            self._failed(f"HTTP {exc.code}{hint}")
             return None
         except urllib.error.URLError as exc:
             self._failed(f"cannot reach the endpoint ({type(exc.reason).__name__})")
