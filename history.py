@@ -134,6 +134,19 @@ def source_of(row, prefix: str = "src_") -> dict | None:
     return None if not src or src.get("via") == "legacy" else src
 
 
+def _check_after_end(start: str | None, ended) -> None:
+    """A resumed version starts after the ended one it follows: not before its end when that is exact, and never on
+    or before its start (the two would both hold)."""
+    if not start or ended is None:
+        return
+    if ended["valid_to_exact"] and ended["valid_to"] and start < ended["valid_to"]:
+        raise ValueError(f"valid_from {start} is before the fact ended ({ended['valid_to']}); use correct or revert to "
+                         "change how it ended")
+    if ended["valid_from"] and start <= ended["valid_from"]:
+        raise ValueError(f"valid_from {start} is not after the ended version's start ({ended['valid_from']}): both "
+                         "would hold; use correct or revert to change how it ended")
+
+
 class HistoryMixin:
     """The history half of MemoryStore. Expects _conn, _tx, _one, _write, _meta, _entry, default_trust, tz and the
     fact-row helpers of MemoryStore."""
@@ -271,6 +284,16 @@ class HistoryMixin:
         self._fix_predecessor(new)
         return int(self._one("SELECT seq FROM fact_versions WHERE version_id = ?", (new,))[0])
 
+    def _ended_before(self, version) -> dict | None:
+        """The ended version *version* resumed (corrected ones skipped), or None when it did not resume one."""
+        link = version
+        while link is not None and link["supersedes"]:
+            prev = self._version(link["supersedes"])
+            if prev is None or prev["status"] != "corrected":
+                return prev if prev is not None and prev["status"] == "ended" else None
+            link = prev
+        return None
+
     def _fix_predecessor(self, version_id: int) -> None:
         """Keep the end of the version that *version_id* (now current) replaced in step with its start: the version
         it replaced, skipping corrected ones, ends where it begins (exactly), or at the day the change was recorded
@@ -343,9 +366,7 @@ class HistoryMixin:
         last = self._head_version(fact_id)
         if last is None or last["status"] != "ended":
             raise KeyError(f"fact_id {fact_id} not found")
-        if start and start < last["valid_to"] and last["valid_to_exact"]:
-            raise ValueError(f"valid_from {start} is before the fact ended ({last['valid_to']}); use correct or revert "
-                             "to change how it ended")
+        _check_after_end(start, last)
         other = self._one("SELECT fact_id FROM facts WHERE content = ?", (content,))
         if other is not None:  # what it holds as again is already a fact of its own
             return {"fact_id": int(other["fact_id"]), "status": "exists"}
@@ -399,6 +420,8 @@ class HistoryMixin:
                     raise ValueError(f"fact #{fact_id} has ended; revert the end first, then correct it")
                 raise KeyError(f"fact_id {fact_id} not found")
             cur = self._current_version(fact_id)
+            if start is not None and start != cur["valid_from"]:  # a resume's start may not reach into its end
+                _check_after_end(start, self._ended_before(cur))
             new_text = text if text is not None else fact["content"]
             new_start = start if start is not None else cur["valid_from"]
             if new_text == fact["content"] and new_start == cur["valid_from"]:
@@ -426,7 +449,7 @@ class HistoryMixin:
                 if self._one("SELECT 1 FROM facts WHERE content = ?", (last["content"],)):
                     raise ValueError("another current fact already says this; forget one of them instead")
                 self._write("UPDATE fact_versions SET status = 'current', valid_to = NULL, valid_to_exact = 1, "
-                            "closed_at = NULL WHERE version_id = ?", (last["version_id"],))
+                            "closed_at = NULL, superseded_by = NULL WHERE version_id = ?", (last["version_id"],))
                 self._insert_fact_row(fact_id, self._version(last["version_id"]),
                                       trust=last["trust_score"] if last["trust_score"] is not None else self.default_trust)
                 return {"fact_id": fact_id, "status": "reverted", "current_version": int(last["seq"])}
@@ -480,10 +503,19 @@ class HistoryMixin:
         """Delete the fact, its versions and links, rebuild both indexes, write the tombstone (in a transaction)."""
         texts = [r[0] for r in self._conn.execute("SELECT content FROM fact_versions WHERE fact_id = ?", (fact_id,))]
         row = self._one("SELECT content, category FROM facts WHERE fact_id = ?", (fact_id,))
+        named = [r[0] for r in self._conn.execute("SELECT entity_id FROM fact_entities WHERE fact_id = ?", (fact_id,))]
         if row is not None:
             texts.append(row["content"])
             self._delete_fact_row(fact_id, row["category"])
+        # A name only the forgotten fact gave goes even if it has aliases (_drop_orphan_entities keeps those).
+        for entity_id in named:
+            if not self._one("SELECT 1 FROM fact_entities WHERE entity_id = ?", (entity_id,)):
+                if self._entry.get("migrated"):
+                    self._write("DELETE FROM entity_aliases WHERE entity_id = ?", (entity_id,))
+                self._write("DELETE FROM entities WHERE entity_id = ?", (entity_id,))
         versions = self._write("DELETE FROM fact_versions WHERE fact_id = ?", (fact_id,)).rowcount
+        if self._entry.get("migrated"):  # the row may be gone already (another writer): its vector goes regardless
+            self._write("DELETE FROM fact_embeddings WHERE fact_id = ?", (fact_id,))
         digests = sorted({self.digest(t) for t in texts})
         old = self._one("SELECT digests FROM forgotten WHERE fact_id = ?", (fact_id,))
         if old is not None:
@@ -549,6 +581,13 @@ class HistoryMixin:
             gone = self.read("SELECT forgotten_at FROM forgotten WHERE fact_id = ?", (fact_id,))
             if gone:
                 return {"fact_id": fact_id, "forgotten": True, "forgotten_at": gone[0][0], "versions": []}
+            fact = self.read("SELECT content, COALESCE(updated_at, created_at) FROM facts WHERE fact_id = ?",
+                             (fact_id,))
+            if fact:  # written by another program or an older release: no version yet (the next write adds it)
+                return {"fact_id": fact_id, "current": True, "versions": [
+                    {"version": 1, "content": fact[0][0], "status": "current", "valid_from": "unknown",
+                     "valid_to": None, "recorded_at": fact[0][1], "source": "legacy (written outside this version; "
+                     "its history starts with the next change)"}]}
             raise KeyError(f"fact_id {fact_id} not found")
         seqs = {r["version_id"]: r["seq"] for r in rows}
         versions = []

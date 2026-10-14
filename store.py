@@ -886,8 +886,13 @@ class MemoryStore(HistoryMixin):
             return int(self._write("INSERT INTO entities (name) VALUES (?)", (name,)).lastrowid)  # type: ignore[arg-type]
         return int(self._write("INSERT INTO entities (name, name_key) VALUES (?, ?)", (name, entity_key(name))).lastrowid)  # type: ignore[arg-type]
 
-    def _drop_orphan_entities(self) -> None:
-        if self._write("DELETE FROM entities WHERE entity_id NOT IN (SELECT entity_id FROM fact_entities)").rowcount:
+    def _drop_orphan_entities(self, keep_aliased: bool = True) -> None:
+        """Entities no fact links to go — but not one the user gave an alias (alias may come before any fact names
+        it; an unrelated rewrite used to wipe it with its aliases). Forget drops the names its fact gave itself."""
+        keep = (" AND entity_id NOT IN (SELECT entity_id FROM entity_aliases)"
+                if keep_aliased and self._entry.get("migrated") else "")
+        if self._write("DELETE FROM entities WHERE entity_id NOT IN (SELECT entity_id FROM fact_entities)"
+                       + keep).rowcount:
             self._bump()
         if self._entry.get("migrated"):
             self._write("DELETE FROM entity_aliases WHERE entity_id NOT IN (SELECT entity_id FROM entities)")

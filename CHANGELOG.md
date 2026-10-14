@@ -1,5 +1,74 @@
 # Changelog
 
+## 0.14.3 — 2026-10-14
+
+### Fixed
+
+- **Foreign columns of any type stay out of results.** 0.14.2 dropped only binary values from candidate rows, so
+  a text or number column another program left in `facts` (or a NULL one) still reached `fact_store search`
+  results. Rows are now read with the plugin's own columns only (the facts table's, the `as_of` projection's, the
+  FTS rank); a test fails if the plugin ever adds a column without listing it. Found by Codex CLI review of 0.14.2.
+
+Found by a full Codex CLI review of the plugin, each reproduced and now covered by a test that fails on 0.14.2:
+
+- **Correcting a resumed fact's start could make two versions hold at once.** Ended on 1 February, resumed on
+  1 March, the resume's start corrected to 15 January: accepted, and `as_of` 20 January returned the new text. One
+  rule now holds for a resume and for correcting its start: after an exact end, and never on or before the ended
+  version's start. It is checked only when a start is given, so correcting the text or reverting stays possible.
+- **`forget` could leave a fact's vector behind.** When another writer (an older release) had already deleted the
+  fact's row, `forget` erased its history but kept its row in `fact_embeddings` until the next writable open. The
+  vector now goes with the forget regardless.
+- **A semantic score could stick to text changed meanwhile.** A fact rescored by meaning, then changed by another
+  writer before it was read back, came out with the old text's similarity. Scores now carry the hash of the text
+  they were computed from; a changed fact is not offered on meaning and gets the neutral value in the rerank.
+- **A quoted instruction reached the prompt.** Quotes exempt an instruction when storing (a report of what a note
+  says), and recall exempted it too: `the note says "ignore previous instructions and …"` was put into the prompt
+  whenever it matched. Recall now checks the quoted text as well; `search` still shows such a fact. A fact that
+  only names an attack in quotes is left out of recall too — the price of not guessing intent.
+- **Timed-out embedding requests piled up.** A request given up on kept running on its thread, and every retry after
+  the pause started another one against a server that never answers. No request starts while an abandoned one is
+  still running: a stalled server holds one thread at most, and the pause grows as after any failure.
+
+Found by a full Antigravity CLI review, each confirmed in the code and covered by a test that fails on 0.14.2:
+
+- **A credential name in quotes hid its value.** `{"api_key": "ak_live_…"}` passed the credential check — so it
+  could be stored, and with search by meaning on, sent to the embeddings endpoint. The closing quote after the name is
+  now allowed.
+- **An alias given before any fact named the entity was wiped** by the next rewrite of an unrelated fact (the entity
+  had no fact yet, so it counted as an orphan, and its aliases went with it). An entity with an alias is kept;
+  `forget` still removes the names its own fact gave, aliases included.
+- **`history` said "not found" for a fact another program had just added** (no version until this plugin's next
+  write). It now shows that fact as one current version marked legacy.
+- **The vector index kept every fact's text in memory**, a forgotten one included, until a cleanup that ran only
+  after 1,024 deletions. It keeps a fingerprint and the text hash now, and `forget` drops the fact from it at once.
+- **A key pasted into `embedding_key_env`** (the variable's name goes there) was echoed by the status and the log as
+  "sk-… is not set". A value that is not a variable name, or looks like a key, is now refused without echoing it.
+
+Found by a full review with a Fable 5.1 agent (experiments on real SQLite files, a fake endpoint, a second process),
+each covered by a test:
+
+- **Invisible characters beyond a fixed list reached the prompt:** Unicode tag characters (U+E0000–E007F spell out
+  invisible ASCII — a hidden "ignore all previous instructions"), the soft hyphen, U+2062, U+180E, private-use and
+  control characters. Every format, control and private-use character is now refused when storing and withheld
+  from recall (newlines and tabs aside; emoji are untouched).
+- **The secret screen could stall the provider:** its pattern was quadratic (`"KEY" * 30000`: 28 s) and ran on the
+  whole message while prefetch held the provider lock. Its runs are bounded, and only what would be sent (the first
+  2,000 characters) is screened. Recall reads the first 4,000 characters of a message (a 65 KB paste took 6.5 s).
+- **A PEM private key** (`-----BEGIN … PRIVATE KEY-----`, wrapped at 64 so no long blob) passed the screen: it is now
+  refused as a fact and never sent.
+- **`recall_source: short` put the author's display name into the prompt unscreened** — anyone picks their own. Only
+  a name that reads as a name (letters, spaces, `.'-`) and passes the recall check is shown.
+- **One stored vector of a broken byte size** (another writer, corruption) turned search by meaning off for the whole
+  store, silently. It is skipped and made again.
+- **Undoing an end left the version linked to the resume it no longer has** (`history` showed `replaced_by_version`).
+- **`reason` with one entity as a string** searched its letters and found nothing; it takes a string or a list now.
+- **An IPv4-mapped IPv6 literal** (`http://[::ffff:8.8.8.8]/v1`) counted as local on Python ≤ 3.12, so plain http and
+  the key went to a public host; it is judged by the IPv4 address it maps.
+- **`fact_feedback` on an unknown id** answered "missing required argument"; it says the fact does not exist.
+
+By design, unchanged: `forget` removes the entity names its fact gave, together with aliases the user added to them —
+forgetting the only fact about someone forgets their name too.
+
 ## 0.14.2 — 2026-10-14
 
 ### Fixed

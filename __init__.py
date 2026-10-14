@@ -18,6 +18,7 @@ import logging
 import re
 import threading
 import time
+import unicodedata
 from collections import Counter, OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List
@@ -192,6 +193,7 @@ _RE_CREDENTIALS = tuple(re.compile(
     r"[\s_-]?tokens?|secret[\s_-]?keys?|tokens?|otp|2fa\s+codes?)\b"
     r"|парол[ьяюеи]|пин[\s-]?код\w*|токен\w*|ключ\w*\s+api)"
     + (r"\s+(?:for|to|of|on|для|от|к|на)" + r"\s+\S+(?=\s|$)" * words if words else "")
+    + r"[\"'»”`]?"  # the name's closing quote, as JSON writes it: {"api_key": "…"} (review 2026-10-14)
     # the value starts after a space, a separator or a quote ("password:Qwerty123" has no space)
     + r"\s*(?:\b(?:is|was|are)\b|[:=—–-]|это)?\s*[\"'«“`]?(?<![^\s:=—–\-\"'«“`])(?P<value>\S{4,})",
     re.IGNORECASE) for words in range(4))
@@ -220,6 +222,16 @@ _RE_BLOB = re.compile(r"[A-Za-z0-9+/=_-]{200,}")
 # its address by itself, so a fact holding one could leak whatever the model is led to put into the address — in the
 # query or in the path alike. A fact has no use for an image, so none is accepted (review 2026-10-13).
 _RE_IMAGE_EXFIL = re.compile(r"!\[[^\]\n]*\]\s*[(\[]|<\s*img\b", re.IGNORECASE)
+_ALLOWED_CONTROLS = frozenset("\n\t\r")
+
+
+def _hidden_char(text: str) -> bool:
+    """A character that renders as nothing but a model reads: format (Cf: zero-width, bidi, Unicode tag characters
+    that smuggle invisible ASCII), control and private use; the fixed _INVISIBLE list missed most (review 2026-10-14)."""
+    return any(c in _INVISIBLE or (unicodedata.category(c) in ("Cf", "Cc", "Co") and c not in _ALLOWED_CONTROLS)
+               for c in text)
+
+
 _INVISIBLE = frozenset("​‌‍⁠﻿‪‫‬‭‮⁦⁧⁨⁩")
 
 
@@ -241,9 +253,9 @@ def _fact_problem(content: str) -> str | None:
         return "reads like an instruction to the assistant, not a fact"
     if _RE_EXFILTRATION.search(unquoted):
         return "asks to send credentials somewhere: an instruction, not a fact"
-    if _has_credential(text):
+    if _has_credential(text) or _RE_PRIVATE_KEY.search(text):
         return "contains what looks like a credential (a password, key, token or PIN with its value): never store those"
-    if any(c in _INVISIBLE for c in text):
+    if _hidden_char(text):
         return "contains invisible formatting characters"
     if _RE_IMAGE_EXFIL.search(text):
         return "contains an image (markdown or HTML): a client that renders it fetches its address"
@@ -257,16 +269,17 @@ def _recall_problem(content: str) -> str | None:
     credential or hidden markup, checked again on the way out. A fact written before a rule existed (credentials
     before 0.12.0, images before 0.13.0), by an older release or by another program writing the file, would
     otherwise be replayed into every turn it matches. Length, JSON and blobs are not checked here: they make a
-    poor fact, not a dangerous one."""
+    poor fact, not a dangerous one. Quotes do not exempt an instruction here (they do when storing): a quoted
+    instruction is fine to keep and to show on request, but recall would put it into the prompt by itself, and
+    'the note says "ignore previous instructions and …"' reads the same to a model as the bare instruction."""
     text = (content or "").strip()
     if _RE_ROLE_MARKUP.search(text):
         return "chat-role or tool-call markup"
-    unquoted = _RE_QUOTED_SPAN.sub(" ", text)
-    if _RE_INJECTION.search(unquoted) or _RE_EXFILTRATION.search(unquoted):
-        return "an instruction to the assistant"
+    if _RE_INJECTION.search(text) or _RE_EXFILTRATION.search(text):
+        return "an instruction to the assistant (quoted or not)"
     if _has_credential(text):
         return "a credential with its value"
-    if any(c in _INVISIBLE for c in text):
+    if _hidden_char(text):
         return "invisible formatting characters"
     if _RE_IMAGE_EXFIL.search(text):
         return "an image (markdown or HTML)"
@@ -278,10 +291,14 @@ def _recall_problem(content: str) -> str | None:
 # keys and tokens — and a long encoded blob keep a message or a fact at home. Best effort, by pattern (review
 # 2026-10-14).
 _RE_SECRET_SHAPE = re.compile(
-    r"\b[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD)[A-Z0-9_]*\s*[:=]\s*\S{6,}"
+    r"\b[A-Z][A-Z0-9_]{0,63}(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD)[A-Z0-9_]{0,63}\s*[:=]\s*\S{6,}"
     r"|\b(?i:bearer|basic)\s+(?=[A-Za-z._~-]*[0-9+/=])[A-Za-z0-9._~+/=-]{12,}"  # a token has a digit, + / ="
     r"|\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
-    r"|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|glpat-[A-Za-z0-9_-]{20,})")
+    r"|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|glpat-[A-Za-z0-9_-]{20,})"
+    r"|-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----")
+
+
+_RE_PRIVATE_KEY = re.compile(r"-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----")
 
 
 def _secret_in(text: str) -> bool:
@@ -384,6 +401,12 @@ def _serialized(method):
 def _revision(fact: dict) -> tuple:
     """(fact_id, content hash): a reworded fact is a new revision even within the same second."""
     return fact["fact_id"], hashlib.sha1((fact.get("content") or "").encode()).hexdigest()[:12]
+
+
+_PREFETCH_QUERY_CHARS = 4000  # recall reads this much of a message: what it is about is said by then
+
+
+_RE_DISPLAY_NAME = re.compile(r"[^\W\d_][\w .'’-]{0,39}")
 
 
 def _one_line(text: str, limit: int = _PREFETCH_LINE_CHARS) -> str:
@@ -730,6 +753,7 @@ class HolographicMemoryProvider(MemoryProvider):
         self._last_recall = 0
         if not self._retriever or not query:
             return ""
+        query = query[:_PREFETCH_QUERY_CHARS]  # a pasted log of 60 KB took seconds under the provider lock
         try:
             key = f"{session_id or self._session_id or ''}|{self._scope_key or ''}"
             turn = self._turns[key] = self._turns.get(key, 0) + 1
@@ -782,7 +806,7 @@ class HolographicMemoryProvider(MemoryProvider):
         """Closeness in meaning of every fact of the active store to *query* (embeddings.Meaning), or None: the feature
         off or unusable, a message not worth a call (embeddings.worth_asking) or holding a credential, or no fact
         with a vector yet. One call to the endpoint at most; any failure is None."""
-        if self._embedder is None or not self._retriever or _secret_in(query or "") \
+        if self._embedder is None or not self._retriever or _secret_in((query or "")[:embeddings.TEXT_MAX_CHARS]) \
                 or not embeddings.worth_asking(query, before_turn=before_turn):
             return None
         try:
@@ -864,8 +888,10 @@ class HolographicMemoryProvider(MemoryProvider):
             return ""
         chat = src.get("chat_id")
         here = "this chat" if chat and chat == self._ident.get("chat_id") else "another chat" if chat else ""
-        parts = [f"recorded {src['recorded_on']}" if src.get("recorded_on") else "", _one_line(src.get("user_name", ""), 40),
-                 here]
+        name = _one_line(src.get("user_name", ""), 40)
+        if name and (not _RE_DISPLAY_NAME.fullmatch(name) or _recall_problem(name)):
+            name = ""  # the platform lets anyone pick it: only a plain name goes into the prompt
+        parts = [f"recorded {src['recorded_on']}" if src.get("recorded_on") else "", name, here]
         parts = [p for p in parts if p]
         return f" ({' · '.join(parts)})" if parts else ""
 
@@ -1182,6 +1208,8 @@ class HolographicMemoryProvider(MemoryProvider):
         if self._retriever is not None:
             self._retriever._current.cache.pop(fact_id, None)
             self._retriever._version_cache.clear()
+            if self._retriever._vectors is not None:
+                self._retriever._vectors.drop(fact_id)
         for facts in self._injected.values():
             for key in [k for k in facts if k[0] == fact_id]:
                 facts.pop(key, None)
@@ -1260,7 +1288,8 @@ class HolographicMemoryProvider(MemoryProvider):
     def _feedback(self, a: dict) -> str:
         if a["action"] not in ("helpful", "unhelpful"):
             return tool_error("action must be 'helpful' or 'unhelpful'")
-        return json.dumps(self._store.record_feedback(int(a["fact_id"]), helpful=a["action"] == "helpful"))
+        return self._fact_call(a, lambda fact_id: json.dumps(
+            self._store.record_feedback(fact_id, helpful=a["action"] == "helpful")))
 
     def _stats(self, a: dict) -> str:
         """What is in the store and whether recall works: counts, categories, how many facts were ever recalled."""
@@ -1310,7 +1339,7 @@ class HolographicMemoryProvider(MemoryProvider):
             "probe": lambda self, a: self._no_as_of(a, lambda: self._entity_query("probe", a)),
             "related": lambda self, a: self._no_as_of(a, lambda: self._entity_query("related", a)),
             "reason": lambda self, a: self._no_as_of(a, lambda: _results(self._counted(
-                self._retriever.reason(a["entities"], category=a.get("category"), limit=_limit(a), min_trust=self._trust_floor(a))))
+                self._retriever.reason(self._entities(a), category=a.get("category"), limit=_limit(a), min_trust=self._trust_floor(a))))
                 if a.get("entities") else tool_error("reason requires 'entities' list")),
             "contradict": lambda self, a: _results(self._retriever.contradict(
                 category=a.get("category"), limit=_limit(a), min_trust=float(a.get("min_trust", 0.0)))),

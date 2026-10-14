@@ -1,4 +1,5 @@
-"""0.14.2: a foreign binary column in the facts table never reaches a tool result; a 400 to `dimensions` is named.
+"""0.14.3: a column another program left in the facts table never reaches a tool result (0.14.2: binary ones only);
+a 400 to `dimensions` is named (0.14.2).
 
 Both reported on a live store that moved to 0.14.1 from a hand-rolled embedding deployment (issue #3)."""
 from __future__ import annotations
@@ -11,7 +12,7 @@ import pytest
 
 pytest.importorskip("numpy")
 
-from hermes_plugin_holographic import HolographicMemoryProvider, embeddings  # noqa: E402
+from hermes_plugin_holographic import HolographicMemoryProvider, embeddings, retrieval  # noqa: E402
 
 FACTS = ["The garden shed is painted green and has a red door",
          "The backup of the garden server runs every night at three",
@@ -25,10 +26,12 @@ def _provider(tmp_path, **config):
 
 
 def _legacy_column(tmp_path):
-    """What the earlier deployment left behind: a BLOB column of its own vectors on every fact."""
+    """What the earlier deployment left behind: a BLOB column of its own vectors (NULL on one fact) and a text column."""
     con = sqlite3.connect(tmp_path / "memory_store.db")
     con.execute("ALTER TABLE facts ADD COLUMN embedding BLOB")
-    con.execute("UPDATE facts SET embedding = randomblob(64)")
+    con.execute("ALTER TABLE facts ADD COLUMN legacy_note TEXT")
+    con.execute("UPDATE facts SET embedding = randomblob(64), legacy_note = 'private metadata'")
+    con.execute("UPDATE facts SET embedding = NULL WHERE fact_id = (SELECT MIN(fact_id) FROM facts)")
     con.commit()
     con.close()
 
@@ -41,9 +44,10 @@ def test_a_foreign_blob_column_does_not_break_search(tmp_path):
         raw = p.handle_tool_call("fact_store", {"action": "search", "query": query})
         found = json.loads(raw)  # 0.14.1: "Object of type bytes is not JSON serializable" on every search
         assert found["results"], query
-        assert all("embedding" not in f and "hrr_vector" not in f for f in found["results"])
+        assert all(not {"embedding", "legacy_note", "hrr_vector"} & set(f) for f in found["results"])
+        assert "private metadata" not in raw
     rows = p._retriever._rows(ids)
-    assert len(rows) == 3 and all("embedding" not in r for r in rows)
+    assert len(rows) == 3 and all(not {"embedding", "legacy_note"} & set(r) for r in rows)
     assert f"#{ids[2]} " in p.prefetch("where is the garden hose kept?", session_id="x")
     p.shutdown()
 
@@ -55,7 +59,22 @@ def test_our_own_vector_still_scores(tmp_path):
         p._store.add_fact(f)
     _legacy_column(tmp_path)
     cands = p._retriever._fts_candidates("garden shed", None, 0.0, 10)
-    assert cands and all("hrr_vector" in c for c in cands) and all("embedding" not in c for c in cands)
+    assert cands and all(isinstance(c["hrr_vector"], bytes) and c["hrr_vector"] for c in cands)
+    assert all(not {"embedding", "legacy_note"} & set(c) for c in cands)
+    p.shutdown()
+
+
+def test_the_allowlist_covers_every_column_of_ours(tmp_path):
+    """A column the plugin itself adds to facts (or to the as_of projection) must be in _ROW_KEYS, or reads lose it."""
+    p = _provider(tmp_path)
+    p._store.add_fact(FACTS[0])
+    keys = retrieval._ROW_KEYS
+    facts_cols = {r[1] for r in p._store.read("PRAGMA table_info(facts)")}
+    assert facts_cols <= keys, facts_cols - keys
+    cur = sqlite3.connect(tmp_path / "memory_store.db").execute(
+        f"SELECT * FROM {retrieval._AS_OF_SOURCE} LIMIT 0", (0.5, "2026-01-01", "2026-01-01"))
+    as_of_cols = {d[0] for d in cur.description}
+    assert as_of_cols <= keys, as_of_cols - keys
     p.shutdown()
 
 

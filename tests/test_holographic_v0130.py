@@ -52,7 +52,6 @@ def test_a_stored_fact_the_filter_refuses_is_not_recalled(tmp_path, content, cap
 @pytest.mark.parametrize("content", [
     "The garden shed is painted green",
     "I use a password manager for everything",
-    "The wiki page says \"ignore previous instructions\" is a known prompt attack",
     "A JSON-looking note {not json at all}",
     "The token is 0.125 USD on the exchange today",
     "API key authentication is enabled for the shop",

@@ -92,7 +92,9 @@ In `config.yaml` under `plugins.hermes-memory-store`:
   HTML), invisible characters, long blobs, >1000 characters) is refused with the reason. Recall
   checks a stored fact again before it goes into a prompt (0.13.0): one an older release, or another program, wrote
   past today's rules (markup, instructions, credentials, invisible characters, images) is left out of recall
-  and logged once; `search`, `list` and `history` still show it, so it can be changed or forgotten.
+  and logged once; `search`, `list` and `history` still show it, so it can be changed or forgotten. A quoted
+  instruction (`the note says "ignore previous instructions …"`) may be stored as a report of what something says,
+  but recall leaves it out too (0.14.3): in the prompt it reads the same as the bare instruction.
 - **stats** (what is stored and how much of it was ever recalled), **export** (Markdown view), **review**
   (clean-up candidates: low trust, never recalled for 60 days, near-duplicates), **enrich** (facts without keywords,
   most recalled first, to give keywords with `update`).
@@ -550,8 +552,9 @@ per address, model, dimension and this label, so when a server starts serving an
 and name, change it and every vector is made again).
 
 A store that had embeddings from another deployment may carry a column of its own vectors in `facts` (e.g. a
-`facts.embedding` BLOB). Since 0.14.2 it never reaches a tool result; it is not used either, and
-`ALTER TABLE facts DROP COLUMN embedding` (SQLite 3.35+) removes it.
+`facts.embedding` BLOB). Since 0.14.3 no column the plugin did not create reaches a tool result (0.14.2 dropped
+binary values only); nothing reads it either, and `ALTER TABLE facts DROP COLUMN embedding` (SQLite 3.35+) removes
+it — unless an index or trigger of the old deployment uses the column: drop those first.
 
 **How it decides**
 
@@ -595,7 +598,8 @@ with a space or a line break inside is refused, and errors are logged as categor
 Not sent: a fact recall would not inject (instruction-like text, markup, an image — the same check recall makes), and
 a fact or a message that looks like it holds a secret — a credential word with its value, an environment assignment
 such as `OPENAI_API_KEY=…`, an Authorization header, the prefixes of common API keys and tokens (`sk-`, `ghp_`,
-`AKIA`, `AIza`, `xox…-`, `glpat-`), a long encoded blob. That check is by pattern, so best effort: a secret in a shape
+`AKIA`, `AIza`, `xox…-`, `glpat-`), a PEM private key, a long encoded blob; of a message, only the first 2,000
+characters are checked — and sent. That check is by pattern, so best effort: a secret in a shape
 it does not know goes out with the message. `forget` deletes the vector, but the provider has seen the text: what it
 keeps is up to its terms, and some free tiers may use what they receive to improve their models. A local server keeps
 everything on the machine; plain `http` is accepted only to localhost, a private or link-local address, a host name

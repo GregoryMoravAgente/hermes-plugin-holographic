@@ -66,11 +66,11 @@ def _inner_names(query: str) -> list[str]:
 
 
 def _fact_row(row) -> dict:
-    """A fact row as a dict without foreign binary columns: a store migrated from another embedding deployment can
-    carry e.g. a ``facts.embedding`` BLOB, and ``SELECT *`` / ``f.*`` would hand it to the tool result, where JSON
-    serialization fails on every search (reported on a live store, 0.14.1). Our own ``hrr_vector`` stays: scoring
-    reads it and pops it before anything is returned."""
-    return {k: v for k, v in dict(row).items() if k == "hrr_vector" or not isinstance(v, (bytes, bytearray, memoryview))}
+    """A fact row as a dict with our own columns only: a store migrated from another embedding deployment can carry
+    e.g. a ``facts.embedding`` BLOB, and ``SELECT *`` / ``f.*`` would hand it to the tool result, where JSON
+    serialization fails on every search (reported on a live store, 0.14.1) — and a foreign text column would leak
+    whatever it holds. ``hrr_vector`` stays: scoring reads it and pops it before anything is returned."""
+    return {k: v for k, v in dict(row).items() if k in _ROW_KEYS}
 
 
 def _scan_language(query: str) -> bool:
@@ -99,6 +99,10 @@ _AS_OF_SOURCE = (
     "COALESCE(c.trust_score, v.trust_score, ?) AS trust_score, 0 AS retrieval_count, NULL AS hrr_vector "
     "FROM fact_versions v LEFT JOIN facts c ON c.fact_id = v.fact_id AND v.status = 'current' "
     "WHERE v.status != 'corrected' AND (v.valid_from IS NULL OR v.valid_from <= ?) AND (v.valid_to IS NULL OR v.valid_to > ?))")
+# Every column a candidate read may return: the facts table's, the as_of source's extras and the FTS rank. Anything
+# else in a row (a column left by another program) is not ours and never reaches a result (_fact_row).
+_AS_OF_EXTRA = ("version_id", "seq", "status", "valid_from", "valid_to", "valid_to_exact", "recorded_on")
+_ROW_KEYS = frozenset([c.strip() for c in _FACT_COLUMNS.split(",")] + ["hrr_vector", "fts_rank_raw", *_AS_OF_EXTRA])
 
 
 def _shift(sim: float) -> float:
@@ -363,7 +367,8 @@ class FactRetriever:
                 hrr_sim = _shift(hrr.similarity(query_vec, fact_vec))
             relevance = self.fts_weight * fact.get("fts_rank", 0.0) + self.jaccard_weight * jaccard + self.hrr_weight * hrr_sim
             if meaning is not None:  # the words keep (1 - weight) of the say; off, the score is 0.13.0's to the bit
-                relevance = (1.0 - meaning.weight) * relevance + meaning.weight * meaning.cos(fact["fact_id"])
+                cos = meaning.cos(fact["fact_id"]) if meaning.fits(fact["fact_id"], fact["content"]) else meaning.neutral
+                relevance = (1.0 - meaning.weight) * relevance + meaning.weight * cos
             fact["score"] = relevance * fact["trust_score"]
             if self.half_life > 0:
                 fact["score"] *= self._temporal_decay(fact.get("updated_at") or fact.get("created_at"))
@@ -383,8 +388,8 @@ class FactRetriever:
     def meaning(self, vector, tag: str, weight: float) -> Meaning | None:
         """Closeness of every current fact with a vector of *tag* to a message whose vector is *vector*; None when no
         fact has one of that size yet."""
-        ids, matrix = self.vector_index(tag).matrix(int(vector.shape[0]))
-        return Meaning(ids, matrix @ vector, weight) if ids else None
+        ids, matrix, hashes = self.vector_index(tag).matrix_with_hashes(int(vector.shape[0]))
+        return Meaning(ids, matrix @ vector, weight, hashes) if ids else None
 
     def names_fit(self, query: str, fact: dict) -> bool:
         """Does a fact offered on meaning alone mention whoever the message names: every capitalized word inside a
@@ -424,7 +429,7 @@ class FactRetriever:
         out = []
         for fact_id in picked:
             fact = rows.get(fact_id)
-            if fact is not None:
+            if fact is not None and meaning.fits(fact_id, fact["content"]):  # changed meanwhile: not its score
                 fact.pop("hrr_vector", None)
                 fact["similarity"] = round(meaning.sims[fact_id], 4)
                 fact["score"] = meaning.sims[fact_id] * fact["trust_score"]

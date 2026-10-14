@@ -21,6 +21,7 @@ import ipaddress
 import json
 import logging
 import math
+import re
 import sqlite3
 import threading
 import time
@@ -65,6 +66,10 @@ def z_bar(count: int, margin: float) -> float:
 
 def _now() -> float:
     return time.monotonic()
+
+
+_RE_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
+_RE_KEY_PREFIX = re.compile(r"(?:sk|pk|rk)[-_]|AIza|gh[pousr]_|github_pat_|xox[abprs]-|glpat-|AKIA[0-9A-Z]{8}")
 
 
 def text_hash(text: str) -> str:
@@ -138,6 +143,7 @@ def _local(host: str) -> bool:
     except ValueError:
         return (host == "localhost" or "." not in host  # a container or LAN name
                 or host.endswith((".localhost", ".local", ".lan", ".internal", ".home.arpa")))
+    ip = getattr(ip, "ipv4_mapped", None) or ip  # ::ffff:8.8.8.8 is 8.8.8.8 (private on Python <= 3.12)
     return ip.is_loopback or ip.is_private or ip.is_link_local
 
 
@@ -237,6 +243,9 @@ class Embedder:
         self._pause = self._paused_until = 0.0
         self._last_error = ""
         self._queries: OrderedDict = OrderedDict()
+        # Requests given up on that may still be running (a stalled server): while one is, no new request starts,
+        # so a server that never answers holds one thread and connection at most, not one per retry.
+        self._abandoned: list[threading.Thread] = []
         self.calls = 0  # requests sent (stats, tests)
 
     def _key(self) -> str:
@@ -249,6 +258,10 @@ class Embedder:
             return "numpy is not installed"
         if self._refused:
             return self._refused
+        name = self.settings.key_env
+        if name and (not _RE_ENV_NAME.fullmatch(name) or _RE_KEY_PREFIX.match(name)):
+            # a key pasted where its variable's name goes: never echoed (status and log would show it)
+            return "embedding_key_env must be the name of an environment variable, not the key itself"
         key = self._key()
         if not key and not self._local:
             return f"{self.settings.key_env} is not set"
@@ -309,6 +322,12 @@ class Embedder:
         waits for and come in batches of 32 — and no longer: urllib's timeout bounds each socket operation, so a server that sends its headers or its
         chunks a byte at a time could otherwise hold the caller — and the provider lock prefetch holds — far longer
         (review 2026-10-14). A request given up on finishes or fails on its own thread; the endpoint is paused."""
+        with self._lock:
+            self._abandoned = [t for t in self._abandoned if t.is_alive()]
+            stalled = bool(self._abandoned)
+        if stalled:
+            self._failed("no answer (an earlier request is still waiting)")
+            return None
         timeout = self.settings.timeout if budget is None else max(0.1, budget)
         body = {"model": self.settings.model, "input": batch}
         if self.settings.dimensions:
@@ -340,6 +359,8 @@ class Embedder:
         worker.start()
         worker.join(timeout)
         if worker.is_alive():
+            with self._lock:
+                self._abandoned.append(worker)
             self._failed("no answer (timeout)")
             return None
         # What is logged and shown in stats is a category, never the text of an exception raised while sending: it
@@ -405,10 +426,13 @@ class Meaning:
     """How close each current fact is to one message (cosine of unit vectors), and how unusual that closeness is for
     this message over the whole store."""
 
-    __slots__ = ("sims", "neutral", "mean", "std", "weight")
+    __slots__ = ("sims", "neutral", "mean", "std", "weight", "hashes")
 
-    def __init__(self, ids: list[int], sims, weight: float):
+    def __init__(self, ids: list[int], sims, weight: float, hashes: list[str] | None = None):
         self.sims = {fact_id: float(s) for fact_id, s in zip(ids, sims)}
+        # The text hash each vector was made from: a fact read again later (another writer may have changed it
+        # meanwhile) keeps its score only while its text is still that one (fits).
+        self.hashes = dict(zip(ids, hashes)) if hashes is not None else None
         self.neutral = float(np.median(sims)) if len(ids) else 0.0  # a fact without a vector neither gains nor loses
         self.mean = float(np.mean(sims)) if len(ids) else 0.0
         self.std = float(np.std(sims)) if len(ids) else 0.0
@@ -416,6 +440,10 @@ class Meaning:
 
     def cos(self, fact_id: int) -> float:
         return self.sims.get(fact_id, self.neutral)
+
+    def fits(self, fact_id: int, content: str) -> bool:
+        """Is *content* still the text this fact's score was computed from (always, when no hashes were kept)?"""
+        return self.hashes is None or self.hashes.get(fact_id) == text_hash(content)
 
     def z(self, fact_id: int) -> float:
         s = self.sims.get(fact_id)
@@ -443,7 +471,9 @@ class VectorIndex:
     def __init__(self, store, tag: str):
         self.store, self.tag = store, tag
         self._lock = threading.Lock()
-        self._hashes: dict[int, tuple[str, str]] = {}  # fact_id -> (content, its hash)
+        # fact_id -> (cheap fingerprint of the content, its hash): no plaintext kept in memory (a forgotten fact's
+        # text must not outlive it in the process either; forget also calls drop)
+        self._hashes: dict[int, tuple[tuple[int, int], str]] = {}
         self._vectors: dict[int, tuple[tuple, object]] = {}  # fact_id -> ((text hash, size, revision), vector)
         self._matrix: tuple | None = None  # (fresh set, dimension, ids, matrix)
         # The size of the last message's vector: a fact vector of another size (the endpoint changed what it returns
@@ -462,14 +492,21 @@ class VectorIndex:
             return []
         out = []
         for fact_id, content, made_from, size, revision in rows:
-            hit = self._hashes.get(fact_id)
-            if hit is None or hit[0] != content:
-                hit = self._hashes[fact_id] = (content, text_hash(content))
+            hit, seen = self._hashes.get(fact_id), (len(content or ""), hash(content or ""))
+            if hit is None or hit[0] != seen:
+                hit = self._hashes[fact_id] = (seen, text_hash(content))
             out.append((fact_id, content, hit[1], made_from, size or 0, revision or ""))
         if len(self._hashes) > len(out) + 1024:  # deleted facts
             alive = {row[0] for row in out}
             self._hashes = {k: v for k, v in self._hashes.items() if k in alive}
         return out
+
+    def drop(self, fact_id: int) -> None:
+        """Forget what this index holds of a fact (forget)."""
+        with self._lock:
+            self._hashes.pop(fact_id, None)
+            self._vectors.pop(fact_id, None)
+            self._matrix = None
 
     def ready(self) -> bool:
         """Does any current fact have a vector of this model (worth a call for the message)?"""
@@ -482,9 +519,14 @@ class VectorIndex:
     def matrix(self, dim: int) -> tuple[list[int], object]:
         """(fact ids, their unit vectors as rows) of the current facts whose vector was made from their present text
         and has *dim* dimensions (the message's)."""
+        ids, matrix, _ = self.matrix_with_hashes(dim)
+        return ids, matrix
+
+    def matrix_with_hashes(self, dim: int) -> tuple[list[int], object, list[str]]:
+        """matrix() plus, for each row, the hash of the text its vector was made from."""
         with self._lock:
             fresh = tuple((fact_id, (digest, size, revision)) for fact_id, _, digest, made_from, size, revision
-                          in self._state() if made_from == digest)
+                          in self._state() if made_from == digest and size > 0 and size % 4 == 0)
             need = [fact_id for fact_id, made in fresh if self._vectors.get(fact_id, ((),))[0] != made]
             for start in range(0, len(need), 500):
                 ids = need[start:start + 500]
@@ -500,13 +542,15 @@ class VectorIndex:
                         if self._vectors.get(fact_id, ((),))[0] == key]
                 rows = [(fact_id, v) for fact_id, v in made if v.shape[0] == dim]
                 matrix = np.vstack([v for _, v in rows]) if rows else np.zeros((0, dim), dtype=np.float32)
-                self._matrix = (fresh, dim, [fact_id for fact_id, _ in rows], matrix)
+                made_from = dict((fact_id, key[0]) for fact_id, key in fresh)
+                self._matrix = (fresh, dim, [fact_id for fact_id, _ in rows], matrix,
+                                [made_from[fact_id] for fact_id, _ in rows])
             self._dim = dim
-            return self._matrix[2], self._matrix[3]
+            return self._matrix[2], self._matrix[3], self._matrix[4]
 
     def _usable(self, digest: str, made_from: str | None, size: int) -> bool:
         """Was this fact's vector made from its present text, and (once a message has been compared) of its size?"""
-        return made_from == digest and (self._dim is None or size == 4 * self._dim)
+        return made_from == digest and size > 0 and size % 4 == 0 and (self._dim is None or size == 4 * self._dim)
 
     def pending(self, limit: int, allowed) -> list[tuple[int, str, str]]:
         """Up to *limit* (fact_id, content, hash) of current facts with no usable vector of this model — none, one
