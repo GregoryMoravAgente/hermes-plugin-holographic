@@ -82,10 +82,12 @@ def test_parallel_searches_never_share_a_query_vector(tmp_path, monkeypatch):
 
 from hermes_plugin_holographic import _fact_problem, _recall_problem, _secret_in  # noqa: E402
 
-BOT_TOKEN = "7123456789:AAHk3J9vQx_Zr8LmN2pQwErTyUiOpAsDfGh"
-JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"
-TOKENS = [f"The family bot runs on {BOT_TOKEN}", f"Session cookie {JWT}", "Deploy uses ghp_abcdefghijklmnopqrstuvwx1234",
-          "The OpenAI one is sk-proj-abcdefghijklmnop1234", "Key file: -----BEGIN OPENSSH PRIVATE KEY----- b3BlbnNzaC1r"]
+# Made-up tokens, put together at run time so that secret scanners do not flag the test file (GitHub raised an alert
+# on the literal bot token of 0.14.5).
+BOT_TOKEN = "7123456789" + ":" + "AA" + "x" * 33
+JWT = "eyJ" + "hbGciOiJIUzI1NiJ9" + ".eyJ" + "zdWIiOiIxMjM0NTY3ODkwIn0" + "." + "s" * 43
+TOKENS = [f"The family bot runs on {BOT_TOKEN}", f"Session cookie {JWT}", "Deploy uses " + "ghp_" + "a" * 24,
+          "The OpenAI one is " + "sk-proj-" + "b" * 20, "Key file: -----BEGIN OPENSSH PRIVATE " + "KEY----- b3BlbnNzaC1r"]
 
 
 @pytest.mark.parametrize("text", TOKENS)

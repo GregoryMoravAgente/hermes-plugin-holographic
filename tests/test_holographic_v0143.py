@@ -165,7 +165,7 @@ def test_the_vector_index_keeps_no_plaintext_and_forget_clears_it(provider):
     assert fid not in index._hashes
 
 
-@pytest.mark.parametrize("pasted", ["sk-proj-abcdef1234567890", "AIzaSyD-abcdefghijklmnopqrstuvwxyz12345",
+@pytest.mark.parametrize("pasted", ["sk-proj-" + "abcdef1234567890", "AIza" + "SyD-abcdefghijklmnopqrstuvwxyz12345",
                                     "my key with spaces"])
 def test_settings_key_env_with_secret_value_does_not_leak(pasted):
     e = embeddings.Embedder(embeddings.Settings({
