@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.14.5 — 2026-10-15
+
+### Security
+
+- **A token whose shape alone says what it is is never a fact.** A credential was refused only with its word before
+  it ("password …", "API key …"); a bare token — `sk-…`, `ghp_…`, `AKIA…`, a private key — could be stored and
+  recalled, and only search by meaning kept it from the endpoint. A Telegram bot token (`7123456789:AA…`) and a JWT
+  (`eyJ….eyJ….…`) were not screened anywhere. All of them are now refused by `add`, left out of recall if an older
+  release or another program stored one, and never sent. Configuration shapes (`MAX_TOKENS=128000`, an
+  Authorization header) still only stay home from the endpoint: a setting is a fact. Found while comparing the plugin
+  with a session-memory kit that masks these two shapes in its archive.
+
+### Added
+
+- **One word in Latin and Cyrillic.** Russian text writes a borrowed word either way, and without search by meaning
+  `бэкап` never found `backup`, nor `телеграме` `Telegram`. 56 such words now meet as the same word (see
+  Languages). A word belongs to its group by its exact form — the spelling, an English plural, a Russian case ending —
+  not by its stem, which Snowball cuts too short for this (`токен` → `ток`, current; `виза` → `виз`, as in `визит`).
+  On the family store, 41 of 58 facts hold such a word; its search results did not change on the 58 natural
+  questions (the words there were written as the facts write them).
+
+### Checked
+
+- **Parallel searches do not share a query vector.** A user saw one of six `fact_store search` calls sent at once
+  return a fact by meaning with the similarity it has to another of the six (issue #3). Each call runs under the
+  provider lock and the vector cache is keyed by the query's text; six searches run three times each from parallel
+  threads against an endpoint answering after random pauses never mixed them. The test stays as a guard.
+- **When the words find nothing, the fill keeps its bar.** The same user's search with no word in common lost its only
+  fact by meaning to the store's growth (z 3.44 against a bar of 3.46). Lowering the bar, or taking the closest fact
+  by rank above a z floor, for such searches only (limit 3): on the synthetic set, 26 of the 45 questions that must find
+  nothing are such searches, and every variant answered more of them than it gained — margin 0.25 found 1 more
+  paraphrase of 67 for 3 more noisy answers (text-embedding-3-small) and none for 2 more (gemini-embedding-001); the
+  closest fact above z 1.5 found 1 more for 17 more. Unchanged.
+
 ## 0.14.4 — 2026-10-14
 
 ### Changed

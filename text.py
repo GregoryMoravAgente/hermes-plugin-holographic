@@ -654,7 +654,70 @@ def _keys(word: str, langs: tuple[str, ...], written: str = "", determined: bool
         keys.add(stem(word[:-3] + "ao", "pt"))
     if "es" in langs and word.endswith("ces") and len(word) > 4:  # lápiz / lápices, vez / veces
         keys.add(stem(word[:-3] + "z", "es"))
-    return frozenset(keys)
+    return frozenset(keys | _loan_keys(word))
+
+
+# -- one word in Latin and Cyrillic --------------------------------------------------------------------------------
+# Russian text writes a borrowed word either way: "бэкап" and "backup", "телеграм" and "Telegram", "впн" and "VPN".
+# Without search by meaning the two spellings never met (0.14.5). Each group below is one word; a word of a group gets
+# the group's mark (a key with ":", which never reaches an FTS5 query) and the prefixes that find the other spellings
+# in the index. A word belongs to a group by its exact form — the spelling, an English plural, a Russian case ending —
+# never by its stem: Snowball cuts "токен" to "ток" (electric current) and "виза" to "виз" (as in "визит").
+_LOANWORDS = """
+telegram телеграм телеграмм | whatsapp вотсап вотсапп ватсап ватсапп вацап | youtube ютуб
+instagram инстаграм инстаграмм | facebook фейсбук | google гугл | gmail гмейл | iphone айфон | ipad айпад
+android андроид | windows виндовс | linux линукс | macbook макбук | backup бэкап бекап | server сервер | vpn впн
+wifi вайфай | bluetooth блютуз | email имейл емейл эмейл | zoom зум | skype скайп | excel эксель | notion ношн
+github гитхаб | docker докер | python питон | deploy деплой | commit коммит | token токен | prompt промпт
+chatgpt чатгпт | dashboard дашборд | bitcoin биткоин биткойн | hotel отель | condo кондо | visa виза
+netflix нетфликс | spotify спотифай | tiktok тикток | twitter твиттер | uber убер | samsung самсунг | xiaomi сяоми
+booking букинг | laptop лэптоп ноутбук | smartphone смартфон | router роутер | chat чат | online онлайн | site сайт
+bot бот | marketplace маркетплейс | startup стартап | meetup митап | coworking коворкинг | freelance фриланс
+"""
+# Russian noun endings after the stem a spelling leaves: "сервер" -> "сервера", "серверов"; "виза" -> "визы", "визой";
+# "отель" -> "отеля", "отелей". A spelling ending in о, и, у, э or ю is a word Russian does not decline ("кондо").
+_RU_ENDINGS = ("а", "я", "у", "ю", "е", "и", "ы", "ой", "ей", "ою", "ею", "ом", "ем", "ам", "ям", "ами", "ями", "ах",
+               "ях", "ов", "ев")
+_LOAN: dict | None = None
+_LOAN_LOCK = threading.Lock()
+
+
+def _loan_forms(spelling: str) -> tuple[frozenset, frozenset]:
+    """(the forms of a spelling that make a word one of its group, the FTS5 prefixes that find those forms)."""
+    if word_script(spelling) != "cyrillic":
+        return frozenset({spelling, spelling + "s", spelling + "es"}), frozenset({spelling})
+    if spelling[-1] in "оиуэю":
+        return frozenset({spelling}), frozenset({spelling})
+    base = spelling[:-1] if spelling[-1] in "аяьй" else spelling
+    forms = frozenset({spelling} | {base + e for e in _RU_ENDINGS})
+    # the base as a prefix when it is long enough to say little else ("отел", "сервер"); each form when it is not
+    # ("виз" would bring in every "визит")
+    return forms, (frozenset({base}) if len(base) >= 4 else forms)
+
+
+def _loan_table() -> dict:
+    global _LOAN
+    if _LOAN is None:
+        with _LOAN_LOCK:
+            if _LOAN is None:
+                table = {}
+                for group in _LOANWORDS.replace("\n", " | ").split("|"):
+                    spellings = [fold(w) for w in group.split()]
+                    if not spellings:
+                        continue
+                    parts = [_loan_forms(s) for s in spellings]
+                    keys = frozenset({"loan:" + spellings[0]}).union(*(prefixes for _, prefixes in parts))
+                    for forms, _ in parts:
+                        for form in forms:
+                            table[form] = keys
+                _LOAN = table
+    return _LOAN
+
+
+@lru_cache(maxsize=65536)
+def _loan_keys(word: str) -> frozenset:
+    """The group keys of a borrowed word written in Latin or Cyrillic (_LOANWORDS), or nothing."""
+    return _loan_table().get(word, frozenset())
 
 
 # -- same-root words ---------------------------------------------------------------------------------------------

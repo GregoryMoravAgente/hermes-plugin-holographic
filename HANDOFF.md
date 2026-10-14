@@ -64,6 +64,12 @@ obtained; keep it that way.
   split (`Erdnussallergie`); keywords cover that today.
 - Keywords for old facts: wired — hermes-dreaming's nightly job asks for them (`keywords_needed`, its cooldown and
   cap, main store only) and when it adds a fact; running on the maintainer's store.
+- Search with no word in common (issue #3, finding 1 of the 0.14.4 reply): the fill keeps its bar; the measured
+  variants (lower margin, top-1 above a z floor) answered more no-answer questions than they gained (CHANGELOG 0.14.5).
+  Revisit with the user's dedicated negative set. Parallel searches mixing query vectors (finding 2) did not
+  reproduce; `test_parallel_searches_never_share_a_query_vector` guards it.
+- Loanwords (`_LOANWORDS` in `text.py`, 0.14.5): extend the list by exact spellings only; check every new Cyrillic
+  spelling's forms (`_RU_ENDINGS`) against common words, never match by stem.
 - Upstream PRs to the bundled copy that were never merged and are worth reviewing here: hermes-agent#133389
   (retrieval contract tests), #123599 (setup offers saved config).
 

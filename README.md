@@ -88,7 +88,8 @@ In `config.yaml` under `plugins.hermes-memory-store`:
   mentioning it in any form link to it), `keywords` (see [Synonyms](#synonyms-and-other-roots-keywords)) and
   `valid_from` (the date it started to hold, when the message says). Its answer lists `similar` facts,
   `possible_conflicts` (same subject, a different claim) and `past_versions`; the agent decides. Text that is not a
-  fact (JSON, tool or chat-role markup, instruction-like phrasing, a credential with its value, an image (markdown or
+  fact (JSON, tool or chat-role markup, instruction-like phrasing, a credential with its value or a token whose shape
+  alone says it is one — an API key prefix, a Telegram bot token, a JWT, a private key (0.14.5) —, an image (markdown or
   HTML), invisible characters, long blobs, >1000 characters) is refused with the reason. Recall
   checks a stored fact again before it goes into a prompt (0.13.0): one an older release, or another program, wrote
   past today's rules (markup, instructions, credentials, invisible characters, images) is left out of recall
@@ -190,6 +191,13 @@ A word matches another when they share its plain form or its stem in the languag
   only an accent tells apart (Spanish `año` / `ano`), as the FTS5 index already did. Turkish `ı` and Polish `ł` compare
   as `i` and `l` (`İstanbul`, `ISTANBUL` and `istanbul` meet, `KIZIM` meets `kızım`, `szkola` meets `szkoła`); since the
   FTS5 index keeps those two letters, such a word is also searched as written.
+- **One word, two scripts** (0.14.5): Russian text writes a borrowed word either way, and `бэкап` finds `backup`,
+  `телеграме` finds `Telegram`, `впн` finds `VPN`, `визы` finds `visa`, and the other way round — as the same word,
+  without search by meaning. 56 such words are listed (apps and services, devices, `server`, `backup`, `token`,
+  `hotel`, `visa`, `chat`, `site`, `bot`…; `_LOANWORDS` in `text.py`). A word belongs to its group by its exact form
+  — the spelling, an English plural, a Russian case ending — never by its stem: Snowball cuts `токен` to `ток`
+  (electric current) and `виза` to `виз`, as in `визит`, and neither meets `token` or `visa`. Words two languages
+  share by meaning, not spelling (`password` / `пароль`), are not listed: that is what keywords are for.
 - **Hyphens**: French elision and inversion (`d'Eva`, `prend-il`, `est-ce`) and Portuguese enclisis (`chama-se`) are
   taken apart in text of that language, reduplication (`anak-anak`) in any; a hyphen between scripts splits
   (`hr-ovh-এর`). A letters-only hyphenated token is an identifier in English text or text of no determined language
@@ -605,7 +613,7 @@ with a space or a line break inside is refused, and errors are logged as categor
 Not sent: a fact recall would not inject (instruction-like text, markup, an image — the same check recall makes), and
 a fact or a message that looks like it holds a secret — a credential word with its value, an environment assignment
 such as `OPENAI_API_KEY=…`, an Authorization header, the prefixes of common API keys and tokens (`sk-`, `ghp_`,
-`AKIA`, `AIza`, `xox…-`, `glpat-`), a PEM private key, a long encoded blob; of a message, only the first 2,000
+`AKIA`, `AIza`, `xox…-`, `glpat-`), a Telegram bot token, a JWT, a PEM private key, a long encoded blob; of a message, only the first 2,000
 characters are checked — and sent. That check is by pattern, so best effort: a secret in a shape
 it does not know goes out with the message. `forget` deletes the vector, but the provider has seen the text: what it
 keeps is up to its terms, and some free tiers may use what they receive to improve their models. A local server keeps

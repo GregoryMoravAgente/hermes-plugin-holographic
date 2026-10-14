@@ -201,8 +201,22 @@ _VALUE_EDGE = ".,;:!?\"'«»“”`)"
 _RE_DECIMAL = re.compile(r"[$€£¥₽฿]?\d+[.,]\d+[$€£¥₽฿%]?")
 
 
+# A token whose shape alone says what it is — a common API key prefix, a Telegram bot token (the bot id, a colon, 35
+# characters), a JWT (two base64 JSON parts, each "eyJ…"), a private key — is a credential with no word before it:
+# never stored, recalled or sent (0.14.5). Before, only search by meaning screened most of these, so a bare token
+# could be stored as a fact and recalled; a bot token and a JWT were not screened at all.
+_RE_TOKEN_SHAPE = re.compile(
+    r"\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+    r"|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|glpat-[A-Za-z0-9_-]{20,})"
+    r"|(?<![\w:])\d{6,12}:[A-Za-z0-9_-]{35}(?![\w-])"
+    r"|\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*"
+    r"|-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----")
+
+
 def _has_credential(text: str) -> bool:
-    return any(_looks_like_a_secret(m.group("value")) for rx in _RE_CREDENTIALS for m in rx.finditer(text))
+    """A credential word with its value, or a token whose shape alone says it is one (_RE_TOKEN_SHAPE)."""
+    return bool(_RE_TOKEN_SHAPE.search(text)) \
+        or any(_looks_like_a_secret(m.group("value")) for rx in _RE_CREDENTIALS for m in rx.finditer(text))
 
 
 def _looks_like_a_secret(token: str) -> bool:
@@ -253,7 +267,7 @@ def _fact_problem(content: str) -> str | None:
         return "reads like an instruction to the assistant, not a fact"
     if _RE_EXFILTRATION.search(unquoted):
         return "asks to send credentials somewhere: an instruction, not a fact"
-    if _has_credential(text) or _RE_PRIVATE_KEY.search(text):
+    if _has_credential(text):
         return "contains what looks like a credential (a password, key, token or PIN with its value): never store those"
     if _hidden_char(text):
         return "contains invisible formatting characters"
@@ -286,23 +300,17 @@ def _recall_problem(content: str) -> str | None:
     return None
 
 
-# Search by meaning sends text out: besides a credential word with its value (_has_credential), the shapes a secret
-# takes without one — an environment assignment (OPENAI_API_KEY=…), an Authorization header, the prefixes of common API
-# keys and tokens — and a long encoded blob keep a message or a fact at home. Best effort, by pattern (review
-# 2026-10-14).
+# Search by meaning sends text out: besides a credential (_has_credential: a credential word with its value, or a
+# token's own shape), the shapes a secret takes in configuration — an environment assignment (OPENAI_API_KEY=…), an
+# Authorization header — and a long encoded blob keep a message or a fact at home. Best effort, by pattern (review
+# 2026-10-14). These are not refused as facts: "MAX_TOKENS=128000" is a setting, not a secret.
 _RE_SECRET_SHAPE = re.compile(
     r"\b[A-Z][A-Z0-9_]{0,63}(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD)[A-Z0-9_]{0,63}\s*[:=]\s*\S{6,}"
-    r"|\b(?i:bearer|basic)\s+(?=[A-Za-z._~-]*[0-9+/=])[A-Za-z0-9._~+/=-]{12,}"  # a token has a digit, + / ="
-    r"|\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
-    r"|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|glpat-[A-Za-z0-9_-]{20,})"
-    r"|-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----")
-
-
-_RE_PRIVATE_KEY = re.compile(r"-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----")
+    r"|\b(?i:bearer|basic)\s+(?=[A-Za-z._~-]*[0-9+/=])[A-Za-z0-9._~+/=-]{12,}")  # a token has a digit, + / ="
 
 
 def _secret_in(text: str) -> bool:
-    """Does *text* look like it holds a secret? A credential with its value, a secret's shape, or an encoded blob."""
+    """Does *text* look like it holds a secret? A credential, a secret's shape, or an encoded blob."""
     return _has_credential(text) or bool(_RE_SECRET_SHAPE.search(text)) or bool(_RE_BLOB.search(text))
 
 
