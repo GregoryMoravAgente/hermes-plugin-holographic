@@ -22,7 +22,7 @@ Found by a full Codex CLI review of the plugin, each reproduced and now covered 
   writer before it was read back, came out with the old text's similarity. Scores now carry the hash of the text
   they were computed from; a changed fact is not offered on meaning and gets the neutral value in the rerank.
 - **A quoted instruction reached the prompt.** Quotes exempt an instruction when storing (a report of what a note
-  says), and recall exempted it too: `the note says "ignore previous instructions and …"` was put into the prompt
+  says), and recall exempted it too: a note quoted as telling the assistant to drop its rules went into the prompt
   whenever it matched. Recall now checks the quoted text as well; `search` still shows such a fact. A fact that
   only names an attack in quotes is left out of recall too — the price of not guessing intent.
 - **Timed-out embedding requests piled up.** A request given up on kept running on its thread, and every retry after
@@ -48,7 +48,7 @@ Found by a full review with a Fable 5.1 agent (experiments on real SQLite files,
 each covered by a test:
 
 - **Invisible characters beyond a fixed list reached the prompt:** Unicode tag characters (U+E0000–E007F spell out
-  invisible ASCII — a hidden "ignore all previous instructions"), the soft hyphen, U+2062, U+180E, private-use and
+  invisible ASCII — a hidden instruction to the model), the soft hyphen, U+2062, U+180E, private-use and
   control characters. Every format, control and private-use character is now refused when storing and withheld
   from recall (newlines and tabs aside; emoji are untouched).
 - **The secret screen could stall the provider:** its pattern was quadratic (`"KEY" * 30000`: 28 s) and ran on the

@@ -93,8 +93,8 @@ In `config.yaml` under `plugins.hermes-memory-store`:
   checks a stored fact again before it goes into a prompt (0.13.0): one an older release, or another program, wrote
   past today's rules (markup, instructions, credentials, invisible characters, images) is left out of recall
   and logged once; `search`, `list` and `history` still show it, so it can be changed or forgotten. A quoted
-  instruction (`the note says "ignore previous instructions …"`) may be stored as a report of what something says,
-  but recall leaves it out too (0.14.3): in the prompt it reads the same as the bare instruction.
+  instruction to the assistant (a note quoted as telling it to drop its rules) may be stored as a report of what
+  something says, but recall leaves it out too (0.14.3): in the prompt it reads the same as the bare instruction.
 - **stats** (what is stored and how much of it was ever recalled), **export** (Markdown view), **review**
   (clean-up candidates: low trust, never recalled for 60 days, near-duplicates), **enrich** (facts without keywords,
   most recalled first, to give keywords with `update`).

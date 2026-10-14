@@ -232,7 +232,7 @@ def _hidden_char(text: str) -> bool:
                for c in text)
 
 
-_INVISIBLE = frozenset("​‌‍⁠﻿‪‫‬‭‮⁦⁧⁨⁩")
+_INVISIBLE = frozenset("\u200b\u200c\u200d\u2060\ufeff\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")  # zero-width, word joiner, BOM, bidi controls
 
 
 def _fact_problem(content: str) -> str | None:
@@ -271,7 +271,7 @@ def _recall_problem(content: str) -> str | None:
     otherwise be replayed into every turn it matches. Length, JSON and blobs are not checked here: they make a
     poor fact, not a dangerous one. Quotes do not exempt an instruction here (they do when storing): a quoted
     instruction is fine to keep and to show on request, but recall would put it into the prompt by itself, and
-    'the note says "ignore previous instructions and …"' reads the same to a model as the bare instruction."""
+    a note quoted as telling the assistant to drop its rules reads the same to a model as the bare instruction."""
     text = (content or "").strip()
     if _RE_ROLE_MARKUP.search(text):
         return "chat-role or tool-call markup"
