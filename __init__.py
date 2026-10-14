@@ -189,7 +189,7 @@ _RE_EXFILTRATION = re.compile(
 # One pattern per length of the "for the home wifi" part (none, one to three words): a single pattern settles on its
 # first match, and with a longer optional part "от wifi: Qwerty123, не забудь" took "забудь" for the value.
 _RE_CREDENTIALS = tuple(re.compile(
-    r"(?:\b(?:pass(?:words?|phrases?|codes?)|pwd|pins?(?:\s+codes?)?|api[\s_-]?keys?|(?:access|auth|bearer|refresh)"
+    r"(?P<word>\b(?:pass(?:words?|phrases?|codes?)|pwd|pins?(?:\s+codes?)?|api[\s_-]?keys?|(?:access|auth|bearer|refresh)"
     r"[\s_-]?tokens?|secret[\s_-]?keys?|tokens?|otp|2fa\s+codes?)\b"
     r"|парол[ьяюеи]|пин[\s-]?код\w*|токен\w*|ключ\w*\s+api)"
     + (r"\s+(?:for|to|of|on|для|от|к|на)" + r"\s+\S+(?=\s|$)" * words if words else "")
@@ -199,6 +199,9 @@ _RE_CREDENTIALS = tuple(re.compile(
     re.IGNORECASE) for words in range(4))
 _VALUE_EDGE = ".,;:!?\"'«»“”`)"
 _RE_DECIMAL = re.compile(r"[$€£¥₽฿]?\d+[.,]\d+[$€£¥₽฿%]?")
+# After "token" a whole number is a count ("max tokens for this model is 8192"), not a secret; a PIN or a password of
+# digits stays one (0.14.6).
+_RE_COUNTED = re.compile(r"(?:[a-z]+[\s_-]?)?tokens?|токен\w*", re.IGNORECASE)
 
 
 # A token whose shape alone says what it is — a common API key prefix, a Telegram bot token (the bot id, a colon, 35
@@ -207,8 +210,9 @@ _RE_DECIMAL = re.compile(r"[$€£¥₽฿]?\d+[.,]\d+[$€£¥₽฿%]?")
 # could be stored as a fact and recalled; a bot token and a JWT were not screened at all.
 _RE_TOKEN_SHAPE = re.compile(
     r"\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
-    r"|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|glpat-[A-Za-z0-9_-]{20,})"
-    r"|(?<![\w:])\d{6,12}:[A-Za-z0-9_-]{35}(?![\w-])"
+    r"|xox[abprs]-[A-Za-z0-9-]{10,}|A[KS]IA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|glpat-[A-Za-z0-9_-]{20,})"
+    # a bot token alone or inside a Bot API address (".../bot<id>:<secret>/sendMessage", 0.14.6)
+    r"|(?:(?<=bot)|(?<![\w:]))\d{6,12}:[A-Za-z0-9_-]{35}(?![\w-])"
     r"|\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*"
     r"|-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----")
 
@@ -216,7 +220,14 @@ _RE_TOKEN_SHAPE = re.compile(
 def _has_credential(text: str) -> bool:
     """A credential word with its value, or a token whose shape alone says it is one (_RE_TOKEN_SHAPE)."""
     return bool(_RE_TOKEN_SHAPE.search(text)) \
-        or any(_looks_like_a_secret(m.group("value")) for rx in _RE_CREDENTIALS for m in rx.finditer(text))
+        or any(_looks_like_a_secret(m.group("value")) and not _a_count(m) for rx in _RE_CREDENTIALS
+               for m in rx.finditer(text))
+
+
+def _a_count(match: re.Match) -> bool:
+    """A whole number after "token(s)": how many, not which (_RE_COUNTED)."""
+    return bool(_RE_COUNTED.fullmatch(match.group("word").strip())) \
+        and match.group("value").strip(_VALUE_EDGE).replace(",", "").replace("_", "").isdigit()
 
 
 def _looks_like_a_secret(token: str) -> bool:

@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.14.6 — 2026-10-15
+
+Fixes from a full review of 0.14.5 by Antigravity CLI; each is covered by a test.
+
+### Security
+
+- **A bot token inside a Bot API address** (`https://api.telegram.org/bot<id>:<secret>/sendMessage`) passed the token
+  screen added in 0.14.5: the `bot` glued to the id kept the shape from matching. It is now refused, left out of
+  recall and never sent, as a bare one is.
+- **A temporary AWS key** (`ASIA…`) is screened like a permanent one (`AKIA…`).
+
+### Fixed
+
+- **A token count is not a credential.** "The maximum tokens for this model is 8192" was refused as a credential with
+  its value, as any digits after the word "token" were. After "token(s)" or "токен…" a whole number is now a count;
+  digits after "PIN", "password" or "OTP" are still a secret.
+- **Borrowed words (0.14.5) no longer meet look-alikes.** The Latin spelling of a group now joins it only in English or
+  in text of no known language: a French fact about a `chat` (a cat), a German one saying `über` (folded to `uber`)
+  or a Spanish one about `botes` (boats) was returned for `чат`, `убер` or `бот`. Uber is out of the table: the
+  Russian forms of `убер` include `уберу`, `убери`, `уберем` of `убрать` (to tidy up). The plural `-es` is added only
+  after s, x, z, ch and sh. A short spelling is searched by its forms as whole words, not as a prefix, so `bot` no
+  longer brings in `ботинки`, nor `бот` every `bottle`. And the other spellings of a group are no longer compared
+  as keys, only searched: a query's `chat` met the French cat through them, and the prefix `отел` would have met
+  `отелиться`. On the family store the search results did not change.
+
+### Not changed
+
+- Forgetting a fact on a store opened without migration skips the vector and alias tables. The provider opens a store
+  that way only in read-only contexts, which cannot forget.
+- A capitalized word at the start of a question is not taken for a name (`_inner_names`): sentence case says nothing
+  there. This is by design.
+- Parallel searches: the review found no shared state that could give one search another's query vector, as the
+  0.14.5 test found.
+
 ## 0.14.5 — 2026-10-15
 
 ### Security

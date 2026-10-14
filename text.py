@@ -654,7 +654,10 @@ def _keys(word: str, langs: tuple[str, ...], written: str = "", determined: bool
         keys.add(stem(word[:-3] + "ao", "pt"))
     if "es" in langs and word.endswith("ces") and len(word) > 4:  # lápiz / lápices, vez / veces
         keys.add(stem(word[:-3] + "z", "es"))
-    return frozenset(keys | _loan_keys(word))
+    # A Latin spelling joins its group only in English or in text of no known language: German "über" folds to
+    # "uber", French "chat" is a cat, Spanish "botes" are boats (review 2026-10-15).
+    loan = _loan_keys(word) if word_script(word) != "latin" or "en" in langs else frozenset()
+    return frozenset(keys | loan)
 
 
 # -- one word in Latin and Cyrillic --------------------------------------------------------------------------------
@@ -670,32 +673,42 @@ android андроид | windows виндовс | linux линукс | macbook �
 wifi вайфай | bluetooth блютуз | email имейл емейл эмейл | zoom зум | skype скайп | excel эксель | notion ношн
 github гитхаб | docker докер | python питон | deploy деплой | commit коммит | token токен | prompt промпт
 chatgpt чатгпт | dashboard дашборд | bitcoin биткоин биткойн | hotel отель | condo кондо | visa виза
-netflix нетфликс | spotify спотифай | tiktok тикток | twitter твиттер | uber убер | samsung самсунг | xiaomi сяоми
+netflix нетфликс | spotify спотифай | tiktok тикток | twitter твиттер | samsung самсунг | xiaomi сяоми
 booking букинг | laptop лэптоп ноутбук | smartphone смартфон | router роутер | chat чат | online онлайн | site сайт
 bot бот | marketplace маркетплейс | startup стартап | meetup митап | coworking коворкинг | freelance фриланс
 """
 # Russian noun endings after the stem a spelling leaves: "сервер" -> "сервера", "серверов"; "виза" -> "визы", "визой";
 # "отель" -> "отеля", "отелей". A spelling ending in о, и, у, э or ю is a word Russian does not decline ("кондо").
+# A spelling whose forms are also a common Russian word is not listed: "убер" gives "уберу", "убери", "уберем" of
+# "убрать" (to tidy up), so Uber is out (review 2026-10-15).
 _RU_ENDINGS = ("а", "я", "у", "ю", "е", "и", "ы", "ой", "ей", "ою", "ею", "ом", "ем", "ам", "ям", "ами", "ями", "ах",
                "ях", "ов", "ев")
 _LOAN: dict | None = None
 _LOAN_LOCK = threading.Lock()
 
 
-def _loan_forms(spelling: str) -> tuple[frozenset, frozenset]:
-    """(the forms of a spelling that make a word one of its group, the FTS5 prefixes that find those forms)."""
+def _loan_forms(spelling: str) -> tuple[frozenset, frozenset, bool]:
+    """(the forms of a spelling that make a word one of its group, the FTS5 terms that find those forms, whether those
+    terms are whole words rather than prefixes). A short spelling is searched by its forms as whole words: "бот"* would
+    bring in "ботинки" and "ботаника", "bot"* every "bottle" (review 2026-10-15)."""
     if word_script(spelling) != "cyrillic":
-        return frozenset({spelling, spelling + "s", spelling + "es"}), frozenset({spelling})
+        plural = spelling + ("es" if spelling.endswith(("s", "x", "z", "ch", "sh")) else "s")  # not "botes"
+        forms = frozenset({spelling, plural})
+        return (forms, forms, True) if len(spelling) < 5 else (forms, frozenset({spelling}), False)
     if spelling[-1] in "оиуэю":
-        return frozenset({spelling}), frozenset({spelling})
+        return frozenset({spelling}), frozenset({spelling}), len(spelling) < 4
     base = spelling[:-1] if spelling[-1] in "аяьй" else spelling
     forms = frozenset({spelling} | {base + e for e in _RU_ENDINGS})
     # the base as a prefix when it is long enough to say little else ("отел", "сервер"); each form when it is not
     # ("виз" would bring in every "визит")
-    return forms, (frozenset({base}) if len(base) >= 4 else forms)
+    return (forms, frozenset({base}), False) if len(base) >= 4 else (forms, forms, True)
 
 
 def _loan_table() -> dict:
+    """form -> the group's keys: its mark "loan:<first spelling>", which is all a comparison may meet (two words of a
+    group share it), and its FTS5 terms as "fts=:<word>" (a whole word) or "fts*:<prefix>", which only Term.fts reads.
+    The spellings themselves are not keys: a query's "chat" would meet a French fact's "chat" (a cat) that the
+    language check kept out of the group, and the prefix "отел" a fact's stem of "отелиться" (review 2026-10-15)."""
     global _LOAN
     if _LOAN is None:
         with _LOAN_LOCK:
@@ -706,8 +719,9 @@ def _loan_table() -> dict:
                     if not spellings:
                         continue
                     parts = [_loan_forms(s) for s in spellings]
-                    keys = frozenset({"loan:" + spellings[0]}).union(*(prefixes for _, prefixes in parts))
-                    for forms, _ in parts:
+                    keys = frozenset({"loan:" + spellings[0]} | {("fts=:" if whole else "fts*:") + t
+                                                                 for _, terms, whole in parts for t in terms})
+                    for forms, _, _ in parts:
                         for form in forms:
                             table[form] = keys
                 _LOAN = table
@@ -1971,6 +1985,9 @@ class Term:
         prefixes = sorted(k for k in (self.keys or {self.stem}) | ({self.loose} if self.loose else set())
                           if len(k) >= _MIN_STEM and k.translate(FTS_OPERATORS) == k and k.split() == [k])
         parts = [f'"{p}"*' for p in prefixes] + ([] if self.word in prefixes else [exact])
+        # a borrowed word's other spellings (_loan_table): its short forms as whole words ("бота", not every "ботаника")
+        parts += sorted({f'"{k[5:]}"' + ("*" if k[3] == "*" else "") for k in self.keys
+                         if k[:5] in ("fts=:", "fts*:") and f'"{k[5:]}"*' not in parts})
         parts += [f'"{f}"' for f in self.lemma_forms if not any(f.startswith(p) for p in prefixes)]
         return parts[0] if len(parts) == 1 else "(" + " OR ".join(parts) + ")"
 
