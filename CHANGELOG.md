@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.14.4 — 2026-10-14
+
+### Changed
+
+- **`fact_store search` shows a fact closer in meaning than anything its words found.** Meaning only filled free
+  places: when the words returned `limit` facts, it was never asked. A user's per-query table of five misses on a
+  Chinese store (issue #3: 78 facts, hosted bge-m3, limit 3) showed it — every search returned three word matches,
+  while the fact asked for ranked 1st, 1st and 3rd of 78 by meaning in three of them (cosine 0.534 against 0.441
+  for the best word match; 0.553 against 0.428; 0.633 against 0.626). Now, of the 3 facts closest in meaning, those
+  closer than the best word match by more than 0.06 of cosine, at least 1 standard deviation above the store's
+  mean and mentioning whoever the query names (the name check recall uses), follow the word matches, marked `"match": "meaning"` (so a search can return up to
+  `limit` + 3). Recall before a turn is unchanged: there a fact arrives unasked.
+
+  Measured (limit 3):
+
+  | | Before | 0.14.4 | Top 3 by rank, as proposed |
+  |---|---|---|---|
+  | Family store, 58 facts: no shared word but a name | 13 / 27 | 18 / 27 | 14 / 27 (into the pool) – 22 / 27 (added) |
+  | Family store: no shared word at all | 3 / 12 | 6 / 12 | 4 – 7 / 12 |
+  | Family store: 30 questions that must find nothing, answered by meaning | 1 | 1 | 20 – 24 |
+  | Synthetic, 67 paraphrases, gemini-embedding-001 | 63 | 66 | 63 – 67 |
+  | Synthetic, 45 questions that must find nothing, gemini-embedding-001 | 7 | 8 | 34 – 37 |
+
+  On text-embedding-3-small the synthetic set went 59 → 60 of 67 with the same 4 of 45. The user's two rank-1
+  misses clear the new bar; the rank-3 one (0.633 against 0.626) does not, nor do the two whose fact ranked 8th
+  and 13th — a closeness the words' own matches share is not enough to tell the fact apart.
+
 ## 0.14.3 — 2026-10-14
 
 ### Fixed

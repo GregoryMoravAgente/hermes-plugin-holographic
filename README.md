@@ -583,7 +583,14 @@ it — unless an index or trigger of the old deployment uses the column: drop th
   of the 45 questions that must recall nothing got past the bar alone, against 8), so the mean and standard
   deviation stay.
 - `fact_store search` adds the closest facts by meaning after every word match when there are fewer than `limit`,
-  with `"match": "meaning"` and `"similarity"` (bar `sqrt(2 ln N) + 0.5`: the agent asked, and judges).
+  with `"match": "meaning"` and `"similarity"` (bar `sqrt(2 ln N) + 0.5`: the agent asked, and judges). And
+  even when the words fill the limit (0.14.4), it shows those of the 3 facts closest in meaning that are closer than
+  the best fact the words found by more than 0.06 of cosine, stand at least 1 standard deviation above the store's
+  mean for the query, and mention whoever the query names (the name check recall uses): words can fill the list
+  while the fact asked for is the store's closest in meaning.
+  Measured on a family store (58 facts): questions sharing no word with their fact but a name, 13 → 18 of 27; no
+  word at all, 3 → 6 of 12; questions that must find nothing still got a fact by meaning in 1 of 30. Taking the 3
+  closest by rank alone found as many but answered 20 of those 30 with one. Recall before a turn does not do this.
 - Any failure — network, HTTP status, a timeout (`embedding_timeout` for the whole request before a turn; fact
   vectors after a turn share an 8-second budget with every wait for the provider lock, as nobody waits for them;
   either way the request, decoding included, runs on a thread of its own and the caller stops waiting then, however

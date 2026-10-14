@@ -56,12 +56,14 @@ obtained; keep it that way.
 - Unsegmented scripts use a substring scan of character n-grams; an FTS5 trigram index would scale further but needs
   a sync story for older versions writing the file (no triggers: they would fail on SQLite builds without trigram).
   Not needed at this store's size; revisit if stores grow past ~50k facts.
-- Paraphrase recall (no shared words) needs embeddings; deliberately out of scope (no network, no model).
+- Paraphrase recall (no shared words): the optional online search by meaning (0.14.0; `fact_store search` beyond
+  the words since 0.14.4). Offline, keywords stay the path (below).
 - The word scan reads every row on each scan; past ~20k facts a persisted key index (with a reconciliation story for
   older versions writing the file) would be the next step. Host names in Spanish/French/Portuguese/Indonesian/German
   questions are not enforced as identifiers (compound words win there). German compounds in the question are not
   split (`Erdnussallergie`); keywords cover that today.
-- The nightly dreaming skill could run `enrich` and fill keywords for old facts; not wired yet.
+- Keywords for old facts: wired — hermes-dreaming's nightly job asks for them (`keywords_needed`, its cooldown and
+  cap, main store only) and when it adds a fact; running on the maintainer's store.
 - Upstream PRs to the bundled copy that were never merged and are worth reviewing here: hermes-agent#133389
   (retrieval contract tests), #123599 (setup offers saved config).
 

@@ -438,6 +438,31 @@ class FactRetriever:
                     break
         return out
 
+    def beyond_words(self, meaning: Meaning, query: str, words: list[dict], *, exclude=(), category: str | None = None,
+                     min_trust: float = 0.3, k: int, beat: float, z_min: float, min_score: float | None = None) -> list[dict]:
+        """fact_store search: of the *k* facts closest in meaning, those closer than the best fact the words found (by
+        *beat*), standing out a little (z >= *z_min*) and naming whoever the query names. The words' results can fill
+        the limit while the fact asked for is the store's closest in meaning — then by_meaning is never asked (issue
+        #3: semantic rank 1 of 78, twice). Not before a turn: there a fact arrives unasked and by_meaning's bar stays."""
+        if not words:
+            return []
+        have = {f["fact_id"] for f in words} | set(exclude)
+        bar = max(meaning.cos(f["fact_id"]) if meaning.fits(f["fact_id"], f["content"]) else meaning.neutral
+                  for f in words) + beat
+        top = [fact_id for fact_id, s in meaning.ranked()[:k]
+               if fact_id not in have and s > bar and meaning.z(fact_id) >= z_min and (min_score is None or s >= min_score)]
+        rows = {f["fact_id"]: f for f in self._rows(top, category, min_trust)} if top else {}
+        out = []
+        for fact_id in top:
+            fact = rows.get(fact_id)
+            if fact is None or not meaning.fits(fact_id, fact["content"]) or not self.names_fit(query, fact):
+                continue
+            fact.pop("hrr_vector", None)
+            fact["similarity"] = round(meaning.sims[fact_id], 4)
+            fact["score"] = meaning.sims[fact_id] * fact["trust_score"]
+            out.append(fact)
+        return out
+
     def _linked_facts(self, entity_groups: list[list[int]], category: str | None, min_trust: float, limit: int) -> list[dict]:
         """Facts linked to at least one entity of EVERY group (each group = the ids one name resolves to)."""
         joins = " INTERSECT ".join(

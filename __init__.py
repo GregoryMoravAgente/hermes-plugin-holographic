@@ -1229,11 +1229,20 @@ class HolographicMemoryProvider(MemoryProvider):
         limit, meaning = _limit(a), self._meaning_of(a["query"], before_turn=False)
         results = self._retriever.search(a["query"], category=a.get("category"), min_trust=self._trust_floor(a),
                                          limit=limit, meaning=meaning)
+        words = list(results)
+        min_score = self._embedding.min_score if self._embedding is not None else None
         if meaning is not None and len(results) < limit:  # by meaning: after every fact that holds the words
             for fact in self._retriever.by_meaning(meaning, exclude={f["fact_id"] for f in results},
                                                    category=a.get("category"), min_trust=self._trust_floor(a),
                                                    limit=limit - len(results), margin=embeddings.SEARCH_MARGIN,
-                                                   min_score=self._embedding.min_score):
+                                                   min_score=min_score):
+                fact["match"] = "meaning"
+                results.append(fact)
+        if meaning is not None and words:  # closer in meaning than anything the words found: shown too (0.14.4)
+            for fact in self._retriever.beyond_words(meaning, a["query"], words, exclude={f["fact_id"] for f in results},
+                                                     category=a.get("category"), min_trust=self._trust_floor(a),
+                                                     k=embeddings.SEARCH_TOP_K, beat=embeddings.SEARCH_BEAT_WORDS,
+                                                     z_min=embeddings.SEARCH_Z_FLOOR, min_score=min_score):
                 fact["match"] = "meaning"
                 results.append(fact)
         return _results(self._counted(results))
