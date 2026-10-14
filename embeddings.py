@@ -271,7 +271,8 @@ class Embedder:
 
     def embed(self, texts: list[str], budget: float | None = None) -> list | None:
         """Vectors of *texts* (each cut to TEXT_MAX_CHARS), or None: unusable, or a request failed (logged; paused).
-        *budget*: seconds the caller can still wait, for every request together."""
+        *budget*: seconds the caller can still wait, for every request together (each may use all that is left);
+        None: embedding_timeout for each."""
         if not texts or not self.usable():
             return None
         out: list = []
@@ -303,11 +304,12 @@ class Embedder:
         return got[0]
 
     def _request(self, batch: list[str], budget: float | None = None) -> list | None:
-        """One request. It runs on a daemon thread and the caller waits *budget* seconds (embedding_timeout at most)
-        and no longer: urllib's timeout bounds each socket operation, so a server that sends its headers or its
+        """One request. It runs on a daemon thread and the caller waits *budget* seconds — embedding_timeout when none
+        is given (a message's vector before a turn), the remaining after-turn budget for fact vectors, which nobody
+        waits for and come in batches of 32 — and no longer: urllib's timeout bounds each socket operation, so a server that sends its headers or its
         chunks a byte at a time could otherwise hold the caller — and the provider lock prefetch holds — far longer
         (review 2026-10-14). A request given up on finishes or fails on its own thread; the endpoint is paused."""
-        timeout = self.settings.timeout if budget is None else max(0.1, min(self.settings.timeout, budget))
+        timeout = self.settings.timeout if budget is None else max(0.1, budget)
         body = {"model": self.settings.model, "input": batch}
         if self.settings.dimensions:
             body["dimensions"] = self.settings.dimensions
@@ -322,12 +324,17 @@ class Embedder:
         deadline = _now() + timeout
         box: dict = {}
 
-        def send():
+        def send():  # decoding too, so the caller's wait covers the whole of it
             try:
                 with _OPENER.open(request, timeout=timeout) as response:
-                    box["raw"] = _read_until(response, deadline)
+                    raw = _read_until(response, deadline)
             except BaseException as exc:  # handed to the caller below
                 box["error"] = exc
+                return
+            try:
+                box["vectors"] = _vectors(json.loads(raw), len(batch), self.settings.dimensions)
+            except ValueError as exc:  # our own wording, or the JSON parser's position
+                box["malformed"] = str(exc)[:120]
 
         worker = threading.Thread(target=send, name="holographic-embeddings", daemon=True)
         worker.start()
@@ -340,7 +347,6 @@ class Embedder:
         try:
             if "error" in box:
                 raise box["error"]
-            raw = box["raw"]
         except urllib.error.HTTPError as exc:  # the body may echo the request: not read
             self._failed(f"HTTP {exc.code}")
             return None
@@ -353,11 +359,10 @@ class Embedder:
         except Exception as exc:  # anything else raised while sending: a category, never its text
             self._failed(f"no answer ({type(exc).__name__})")
             return None
-        try:
-            vectors = _vectors(json.loads(raw), len(batch), self.settings.dimensions)
-        except ValueError as exc:  # our own wording, or the JSON parser's position
-            self._failed(f"malformed answer: {str(exc)[:120]}")
+        if "malformed" in box:
+            self._failed(f"malformed answer: {box['malformed']}")
             return None
+        vectors = box["vectors"]
         self._recovered()
         return vectors
 

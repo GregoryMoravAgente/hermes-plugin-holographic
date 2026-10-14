@@ -837,3 +837,42 @@ def test_a_query_string_and_the_space_label_are_part_of_the_identity():
                                     "embedding_model": "m", "embedding_space": "2026-10"})
     assert len({a.tag, b.tag, labelled.tag}) == 3
     assert "secret" not in a.tag and "deployment" not in a.tag
+
+
+# -- 0.14.1 ---------------------------------------------------------------------------------------------------------
+
+def test_fact_vectors_get_the_after_turn_budget_not_the_message_timeout(tmp_path, endpoint):
+    """A batch of 32 facts may take longer than embedding_timeout, which is set for the one message a turn waits for;
+    0.14.0 gave each after-turn request that timeout and Mia's first batch never finished (2026-10-14)."""
+    p = _provider(tmp_path, **{**ON, "embedding_timeout": 0.5})
+    _fill(p, BACKUP)
+    endpoint.during = lambda: time.sleep(0.8)  # slower than embedding_timeout, well within the after-turn budget
+    p.sync_turn("hello", "hi")
+    assert len(_vectors(p)) == len(FILLERS) + 1
+    p._embedder._queries.clear()
+    assert p._meaning_of("which machine copies our data while we sleep?", before_turn=True) is None  # 0.5 s here
+    assert p._embedder.status().startswith("paused after an error (no answer (timeout))")
+    p.shutdown()
+
+
+def test_the_catch_up_gives_up_on_a_lock_held_past_its_budget(tmp_path, endpoint, monkeypatch):
+    import hermes_plugin_holographic as plugin
+    p = _provider(tmp_path, **ON)
+    _fill(p, BACKUP)
+    monkeypatch.setattr(plugin, "_CATCH_UP_SECONDS", 0.5)
+    taken, release = threading.Event(), threading.Event()
+
+    def hold():
+        with p._op_lock:
+            taken.set()
+            release.wait(5)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    assert taken.wait(5)
+    t = time.monotonic()
+    p._catch_up_vectors()
+    assert time.monotonic() - t < 1.0 and endpoint.requests == []  # gave up at its deadline, sent nothing
+    release.set()
+    holder.join(5)
+    p.shutdown()

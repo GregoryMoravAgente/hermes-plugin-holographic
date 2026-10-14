@@ -575,9 +575,10 @@ and name, change it and every vector is made again).
   deviation stay.
 - `fact_store search` adds the closest facts by meaning after every word match when there are fewer than `limit`,
   with `"match": "meaning"` and `"similarity"` (bar `sqrt(2 ln N) + 0.5`: the agent asked, and judges).
-- Any failure — network, HTTP status, a timeout (`embedding_timeout` for the whole request: it runs on a thread of
-  its own and the caller stops waiting then, however slowly the server sends), a malformed answer — falls back to
-  words without a word to the user;
+- Any failure — network, HTTP status, a timeout (`embedding_timeout` for the whole request before a turn; fact
+  vectors after a turn share an 8-second budget with every wait for the provider lock, as nobody waits for them;
+  either way the request, decoding included, runs on a thread of its own and the caller stops waiting then, however
+  slowly the server sends), a malformed answer — falls back to words without a word to the user;
   the endpoint is then left alone for 60 s, doubling up to 15 min, with one warning in the log. A redirect is a
   failure too (it would carry the key elsewhere). `fact_store stats` shows `search_by_meaning`: the status, the model,
   and how many facts have a vector, wait for one, or are never sent.
@@ -619,6 +620,17 @@ The off-topic ones sit next to a stored topic ("Сделай план трени
 capitalizes every noun, so the rule is off there — and a related thing in another language ("Какой пароль от роутера?"
 → "Der Router steht im Flur."). With 50 facts text-embedding-3-small recalls 25 of 35 against 12 by words. Keywords
 (above) stay worth having: they are local, free, and work with this off.
+
+**On a real store** (2026-10-14, 0.14.1): a family assistant's 58 facts, mostly Russian, each with keywords from
+[hermes-dreaming](https://github.com/itpartypattaya/hermes-dreaming)'s nightly job; a copy of the store, questions
+written by a model from the facts, only numbers kept, and a run counted only if no request to the endpoint failed.
+Natural questions: 57 of 58 recalled, with words alone and with meaning alike. Questions sharing no word with their
+fact but the name of the person they ask about: 7 of 27 by words, 8 with meaning. Questions sharing no word at all:
+0 of 12 either way. No wrong fact, and nothing from chit-chat, off-topic questions or questions about people not
+stored (0 of 30), came in by meaning. On this store keywords and names do most of the work and the default bar added
+one recall in these questions; a lower bar on the same questions: margin 0.5 added two with nothing wrong, 0 added
+four but brought two wrong facts and three of the 30 other questions. The synthetic table above, whose facts carry no
+keywords, is a separate benchmark; one store does not show what another will do.
 
 ## Data and privacy
 

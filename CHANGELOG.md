@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.14.1 — 2026-10-14
+
+### Fixed
+
+- **Fact vectors were held to the message's timeout.** 0.14.0 gave every request `embedding_timeout` (3 s), the bound
+  meant for the one message a turn waits for; a batch of 32 facts may take longer (on its first call, a real store's
+  did), and then no fact got a vector and search by meaning never started. Fact vectors, made after the turn where
+  nobody waits, now share the 8-second after-turn budget — with every wait for the provider lock, taken with a timeout
+  and a second kept for storing — and the message keeps `embedding_timeout`. Decoding the answer runs inside the
+  request's own wait, so it is bounded too. Reviewed by Codex CLI.
+
+### Measured on a real store
+
+A family assistant's store (58 facts, mostly Russian, every fact with keywords from hermes-dreaming's nightly job), on
+a copy; questions written by a model from the facts; numbers only; the run counted only with no failed request:
+
+| | Words only | + meaning (text-embedding-3-small) |
+|---|---|---|
+| Natural questions: the fact recalled before the turn | 57 / 58 | 57 / 58 |
+| Sharing no word with their fact but the person's name | 7 / 27 | 8 / 27 |
+| Sharing no word at all | 0 / 12 | 0 / 12 |
+| A wrong fact recalled by meaning | — | 0 |
+| Chit-chat, off-topic, someone not stored: a fact by meaning | — | 0 / 30 |
+
+On this store meaning added one recall in these questions, with nothing wrong observed; keywords and names already
+found most. The synthetic benchmark in the README (facts without keywords: 22 → 54 of 67) is a separate measurement.
+
 ## 0.14.0 — 2026-10-14
 
 ### Added

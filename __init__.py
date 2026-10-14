@@ -353,8 +353,9 @@ _PREFETCH_LINE_CHARS = 300
 _COUNT_FLUSH_AT = 25  # buffered recall counts are written in one go at this many, and at session boundaries
 _MAX_TRACKED_SESSIONS, _MAX_TRACKED_FACTS = 16, 512
 _MAX_OPEN_STORES = 16  # per-user stores kept open; the least recently used one is closed beyond this
-# Vectors made after a turn (search by meaning): at most this many requests and seconds, on the core's background worker.
-_CATCH_UP_REQUESTS, _CATCH_UP_SECONDS = 4, 8.0
+# Vectors made after a turn (search by meaning): at most this many requests and seconds, on the core's background worker;
+# the last second is kept for taking the provider lock and storing what came back.
+_CATCH_UP_REQUESTS, _CATCH_UP_SECONDS, _CATCH_UP_RESERVE = 4, 8.0, 1.0
 
 
 def _limit(args: dict) -> int:
@@ -800,34 +801,48 @@ class HolographicMemoryProvider(MemoryProvider):
         request runs outside the provider lock (the next turn's prefetch must not wait on the network); reading what
         is missing and storing the vectors run under it, after checking that the store is still open here (a shutdown
         or an LRU eviction may close it while the request is out), and the store skips a fact whose text changed in
-        between. Facts that recall would not inject or that look secret are never sent (_sendable)."""
-        with self._op_lock:
-            if self._embedder is None or not self._tool_writable or not self._store or not self._retriever:
+        between. Facts that recall would not inject or that look secret are never sent (_sendable). Every wait — the
+        lock, the request — comes out of the one budget: the lock is taken with a timeout, and a request gets what is
+        left after _CATCH_UP_RESERVE for storing its answer."""
+        deadline = time.monotonic() + _CATCH_UP_SECONDS
+        if self._embedder is None or not self._locked_until(deadline):
+            return
+        try:
+            if not self._tool_writable or not self._store or not self._retriever:
                 return
             store, tag = self._store, self._embedding.tag
             index = self._retriever.vector_index(tag)
-        deadline = time.monotonic() + _CATCH_UP_SECONDS
+        finally:
+            self._op_lock.release()
         try:
             for _ in range(_CATCH_UP_REQUESTS):
-                if not self._embedder.usable():
+                if not self._embedder.usable() or not self._locked_until(deadline):
                     return
-                with self._op_lock:  # may wait for a prefetch: the budget is checked after it
+                try:  # may wait for a prefetch: the budget is checked after it
                     if not self._open_here(store):
                         return
                     todo = index.pending(embeddings.BATCH, allowed=_sendable)
-                left = deadline - time.monotonic()
+                finally:
+                    self._op_lock.release()
+                left = deadline - time.monotonic() - _CATCH_UP_RESERVE
                 if not todo or left < embeddings.MIN_REQUEST_SECONDS:
                     return
                 vectors = self._embedder.embed([content for _, content, _ in todo], budget=left)
-                if vectors is None:
+                if vectors is None or not self._locked_until(deadline):
                     return
-                with self._op_lock:
+                try:
                     if not self._open_here(store):
                         return
                     store.put_vectors(tag, [(fact_id, digest, embeddings.to_blob(vector))
                                             for (fact_id, _, digest), vector in zip(todo, vectors)])
+                finally:
+                    self._op_lock.release()
         except Exception as exc:  # a busy file, a broken connection: the next turn goes on
             logger.debug("holographic: making fact vectors stopped (%s)", exc)
+
+    def _locked_until(self, deadline: float) -> bool:
+        """Take the provider lock, waiting no later than *deadline*; the caller releases it."""
+        return self._op_lock.acquire(timeout=max(0.0, deadline - time.monotonic()))
 
     def _open_here(self, store) -> bool:
         """Is *store* still one this provider holds open (not shut down, not evicted)? Under the provider lock."""
