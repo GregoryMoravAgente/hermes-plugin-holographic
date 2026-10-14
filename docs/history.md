@@ -114,7 +114,8 @@ Chat names are not stored (they change and they leak). Facts from before 0.8.0 s
 ## Forget means gone
 
 `forget` runs in one transaction: the fact row, every version, both FTS entries, entity links, entities and aliases
-left without facts, the category banks. Then, to remove copies the database itself keeps:
+left without facts, the category banks, and the fact's vector of search by meaning (0.14.0; an embeddings provider
+that made it has seen the text, which no forget reaches). Then, to remove copies the database itself keeps:
 
 1. both FTS indexes are rebuilt from their content tables (an FTS5 delete only adds a marker; the words stay in old
    segments until a rebuild);

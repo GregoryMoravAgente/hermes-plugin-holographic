@@ -14,6 +14,7 @@ if TYPE_CHECKING:
 
 from . import holographic as hrr
 from . import text as _text
+from .embeddings import Meaning, VectorIndex
 from .history import CLOSED, version_state
 from .text import (CJK_NEGATORS, CLAIM_WORDS, CONTRASTIVE, NEGATORS, UNSEGMENTED, analyze, content_chars,
                    content_keys, content_stems, gram_coverage, is_chinese, is_greeting, is_sea, query_grams,
@@ -43,6 +44,25 @@ _SCAN_PROBE = " OR ".join((_INDONESIAN_PROBE, _GERMAN_PROBE, _DUTCH_PROBE, _TURK
 # A question told to be in one of these languages scans whatever the store holds: the probe words above are a sample,
 # and a store of short facts may have none of them ("Kitabı masada bıraktım." asked as "Kitap nerede?")
 _SCAN_LANGUAGES = frozenset({"id", "de", "tr", "pl", "nl"})
+
+
+# Search by meaning: what a message names (_inner_names).
+_RE_NAME_WORD = re.compile(r"[^\W\d_]+")
+_RE_SENTENCE_END = re.compile(r"[.!?…。！？]+(?:\s+|$)")
+
+
+def _inner_names(query: str) -> list[str]:
+    """Capitalized words inside a sentence ("When is Peter's birthday?" -> Peter): what a message names. Not a
+    sentence's first word, and nothing in German, where every noun is capitalized."""
+    if not query or analyze(query).german:
+        return []
+    names = []
+    for sentence in _RE_SENTENCE_END.split(query):
+        for i, m in enumerate(_RE_NAME_WORD.finditer(sentence)):
+            word = m.group(0)
+            if i and len(word) > 1 and word[0].isupper() and word[1:].islower():
+                names.append(word)
+    return names
 
 
 def _scan_language(query: str) -> bool:
@@ -97,6 +117,7 @@ class FactRetriever:
         # row id -> (text, Analysis), for word-level scans: one cache for the current facts, one for versions
         self._current = _Corpus("facts", (), "facts_fts", "fact_id", {})
         self._version_cache: dict[int, tuple[str, object]] = {}
+        self._vectors: VectorIndex | None = None  # search by meaning, built on first use
 
     def _as_of(self, day: str) -> _Corpus:
         return _Corpus(_AS_OF_SOURCE, (self.store.default_trust, day, day), "fact_versions_fts", "version_id",
@@ -114,11 +135,13 @@ class FactRetriever:
             return None
 
     def search(self, query: str, category: str | None = None, min_trust: float = 0.3, limit: int = 10,
-               corpus: _Corpus | None = None, roots: bool = True) -> list[dict]:
+               corpus: _Corpus | None = None, roots: bool = True, meaning: Meaning | None = None) -> list[dict]:
         """FTS5 candidates (limit*3) → Jaccard + HRR rerank → trust weighting → optional temporal decay
         0.5^(age_days / half_life). Returns fact dicts with 'score', sorted desc. *corpus*: the current facts by
         default; search_as_of passes the versions of a date. *roots*=False matches words exactly, as 0.8.0 did (the
-        candidates of write_check: a word of the same root must not crowd a conflict out)."""
+        candidates of write_check: a word of the same root must not crowd a conflict out). *meaning* (search by
+        meaning on: prefetch and fact_store search only) adds closeness in meaning to the rerank; the candidates are
+        still the words' (by_meaning offers the rest)."""
         corpus = corpus or self._current
         key = corpus.key
         terms = query_terms(query or "")
@@ -144,7 +167,7 @@ class FactRetriever:
         elif roots and any(0.0 < t.match(analyze(f'{f.get("content", "")} {f.get("tags") or ""}')) < 1.0
                            for f in candidates.values() for t in terms):
             self._coverage_rank(query, terms, list(candidates.values()))
-        return self._rerank(query, list(candidates.values()), limit)
+        return self._rerank(query, list(candidates.values()), limit, meaning if corpus is self._current else None)
 
     def _corpus_rank(self, query: str, terms, candidates: list[dict], category, min_trust, corpus: _Corpus) -> None:
         """FTS5's BM25 counts every row of its index; the versions index holds corrected versions and every other
@@ -317,7 +340,7 @@ class FactRetriever:
             fact["fts_rank"] = rank[fact[corpus.key]]
         return sorted(rows, key=lambda f: f["fts_rank"], reverse=True)
 
-    def _rerank(self, query: str, candidates: list[dict], limit: int) -> list[dict]:
+    def _rerank(self, query: str, candidates: list[dict], limit: int, meaning: Meaning | None = None) -> list[dict]:
         query_tokens = content_stems(query)
         # Query vector is loop-invariant; encode lazily on the first candidate that carries an HRR vector
         # so stores whose hrr_vector was never backfilled don't pay for it.
@@ -331,6 +354,8 @@ class FactRetriever:
                     query_vec = hrr.bind(hrr.encode_text(query, self.hrr_dim), self._atom(_ROLE_CONTENT))
                 hrr_sim = _shift(hrr.similarity(query_vec, fact_vec))
             relevance = self.fts_weight * fact.get("fts_rank", 0.0) + self.jaccard_weight * jaccard + self.hrr_weight * hrr_sim
+            if meaning is not None:  # the words keep (1 - weight) of the say; off, the score is 0.13.0's to the bit
+                relevance = (1.0 - meaning.weight) * relevance + meaning.weight * meaning.cos(fact["fact_id"])
             fact["score"] = relevance * fact["trust_score"]
             if self.half_life > 0:
                 fact["score"] *= self._temporal_decay(fact.get("updated_at") or fact.get("created_at"))
@@ -338,6 +363,67 @@ class FactRetriever:
         for fact in results:
             fact.pop("hrr_vector", None)  # callers expect JSON-serializable dicts
         return results
+
+    # -- search by meaning (embeddings.py; optional, online) -----------------------------------------------------
+
+    def vector_index(self, tag: str) -> VectorIndex:
+        """This store's vectors of model *tag* (one index, kept between queries)."""
+        if self._vectors is None or self._vectors.tag != tag:
+            self._vectors = VectorIndex(self.store, tag)
+        return self._vectors
+
+    def meaning(self, vector, tag: str, weight: float) -> Meaning | None:
+        """Closeness of every current fact with a vector of *tag* to a message whose vector is *vector*; None when no
+        fact has one of that size yet."""
+        ids, matrix = self.vector_index(tag).matrix(int(vector.shape[0]))
+        return Meaning(ids, matrix @ vector, weight) if ids else None
+
+    def names_fit(self, query: str, fact: dict) -> bool:
+        """Does a fact offered on meaning alone mention whoever the message names: every capitalized word inside a
+        sentence, in any word form (or among the fact's keywords), and every known entity the message mentions? In
+        meaning "When is Peter's birthday?" is as close to "Lena's birthday is on June 3" as a paraphrase is to its
+        fact (calibration 2026-10-14); only the name tells them apart."""
+        analysis = analyze(f'{fact.get("content", "")} {fact.get("tags") or ""}')
+        for name in _inner_names(query):
+            terms = query_terms(name)
+            if terms and not any(t.found_in(analysis) for t in terms):
+                return False
+        known = self.store.mentioned_entity_ids(query)
+        if known:
+            linked = {r[0] for r in self.store.read("SELECT entity_id FROM fact_entities WHERE fact_id = ?",
+                                                    (fact["fact_id"],))}
+            if not known <= linked:
+                return False
+        return True
+
+    def by_meaning(self, meaning: Meaning, *, exclude=(), category: str | None = None, min_trust: float = 0.3,
+                   limit: int = 1, margin: float, min_score: float | None = None) -> list[dict]:
+        """The current facts closest in meaning that stand out from the rest of the store for this message
+        (Meaning.standout), closest first, filters applied: 'similarity' is the cosine, 'score' similarity x trust."""
+        # The filters first, so facts of another category or below the trust floor never use up the places.
+        eligible = {r[0] for r in self.store.read(
+            "SELECT fact_id FROM facts WHERE trust_score >= ?" + (" AND category = ?" if category else ""),
+            [min_trust] + ([category] if category else []))}
+        picked = []
+        for fact_id, _ in meaning.ranked():  # standout falls with similarity: the first miss ends the list
+            if not meaning.standout(fact_id, margin, min_score):
+                break
+            if fact_id not in exclude and fact_id in eligible:
+                picked.append(fact_id)
+                if len(picked) >= limit * 3 + 10:  # room for a row changed meanwhile
+                    break
+        rows = {f["fact_id"]: f for f in self._rows(picked, category, min_trust)}
+        out = []
+        for fact_id in picked:
+            fact = rows.get(fact_id)
+            if fact is not None:
+                fact.pop("hrr_vector", None)
+                fact["similarity"] = round(meaning.sims[fact_id], 4)
+                fact["score"] = meaning.sims[fact_id] * fact["trust_score"]
+                out.append(fact)
+                if len(out) >= limit:
+                    break
+        return out
 
     def _linked_facts(self, entity_groups: list[list[int]], category: str | None, min_trust: float, limit: int) -> list[dict]:
         """Facts linked to at least one entity of EVERY group (each group = the ids one name resolves to)."""

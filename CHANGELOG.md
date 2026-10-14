@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.14.0 — 2026-10-14
+
+### Added
+
+- **Search by meaning — optional, online, off by default** (`embeddings: on`). An OpenAI-compatible embeddings API you
+  name (OpenAI, Gemini, or a local server such as Ollama) finds facts a question words differently: "Which machine
+  copies our data while we sleep?" recalls "The nightly backup runs from the OES box at 2 am." Words keep the
+  recall: meaning reorders the facts that share words with the message and may add one more, after them and marked
+  `(by meaning)`, only when it stands far out from the rest of the store for that message and, by a heuristic,
+  mentions whoever the message names (capitalized words inside a sentence, known entities); `fact_store search` adds the closest facts by meaning after the word matches. Fact vectors are made
+  after the turn on the core's background worker, never inside a write; every failure falls back to words and leaves
+  the endpoint alone for a while. Facts recall would not inject, and facts and messages that look like they hold a
+  secret (a credential with its value, `OPENAI_API_KEY=…`, an Authorization header, common key prefixes, an encoded
+  blob — by pattern, best effort), are not sent; `forget` deletes the vector; after switching off, the next writable
+  session deletes them all. A separate module (`embeddings.py`) with no new dependency. Measured on a synthetic set of 100 facts in five languages: paraphrases recalled before the turn went
+  from 22 of 67 to 54 (text-embedding-3-small) and 59 (gemini-embedding-001), chit-chat recalled nothing. See the
+  README for what is sent, to whom, the cost and the limits. Design after
+  [#3](https://github.com/itpartypattaya/hermes-plugin-holographic/issues/3) by njwangfeng; our differences: vectors in
+  their own table keyed by a hash of their text and by model, address and an optional label of your own (older
+  versions, edits and another server or deployment never meet a stale vector; a server that swaps the model behind
+  the same address and name is caught only by changing the label), no network call inside a database write (fact vectors are requested outside the
+  provider lock; a message's vector, before the turn, within it), a bar that rises with the store, and the name rule.
+  Two reviews by Codex CLI before release found, and this release fixes: a message holding a key in a shape the
+  credential check did not know; a key with a line break that could reach the log; a vector written after its store
+  was closed; two servers sharing a model name, or two paths differing in case; answers with wrong indexes, sizes or
+  values whose squares overflow; a category filter applied after the cut; a public IPv6 address taken for a local
+  one; a replaced vector kept from a cache; vectors of facts an older version deleted left while another process held
+  the file; a timeout that bounded each read but not the request (a server sending its headers or chunks a byte at
+  a time held the caller far longer — the request now runs on a thread of its own); a catch-up that could start a
+  request after its budget was spent; deployments chosen by the query string sharing vectors. With it off, scores and recall are pinned to
+  0.13.0's by a test.
+
+### Changed
+
+- **The system-prompt block holds no live number.** "Active: N facts in a local store." changed with every stored
+  fact, and a prompt cache that reuses the longest identical prefix re-read everything after it at each new session
+  (about 21K tokens in one deployment). It now says "Active: facts are kept in a local store."; empty / not empty
+  still flips once per store. After [adurham's fork](https://github.com/adurham/hermes-plugin-holographic) (220292a).
+
 ## 0.13.0 — 2026-10-13
 
 ### Added

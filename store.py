@@ -10,6 +10,7 @@ import unicodedata
 from pathlib import Path
 
 from . import holographic as hrr
+from .embeddings import text_hash
 from .history import HISTORY_SCHEMA, HistoryMixin, parse_day
 from .text import UNSEGMENTED, analyze, name_keys
 
@@ -89,6 +90,20 @@ CREATE TABLE IF NOT EXISTS memory_banks (
 );
 """
 # 0.8.0 history tables (history.py) are created by a writer in _migrate(): a read-only context creates nothing.
+
+# 0.14.0 search by meaning (embeddings.py): at most one vector per current fact, made by *model* from the text whose
+# hash is *text_hash*. Created by every writer, whether or not the feature is on, so that deleting a fact always deletes
+# its vector; older versions never read it.
+_EMBEDDINGS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS fact_embeddings (
+    fact_id    INTEGER PRIMARY KEY,
+    model      TEXT NOT NULL,
+    text_hash  TEXT NOT NULL,
+    vector     BLOB NOT NULL,
+    revision   TEXT NOT NULL DEFAULT '',  -- random, new with every write: a vector made again is read again
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
 
 SCHEMA_VERSION = 2  # 1 = 0.1.x-0.3.x layout, 2 = + meta, entities.name_key, entity_aliases
 _HELPFUL_DELTA, _UNHELPFUL_DELTA = 0.05, -0.10
@@ -260,6 +275,7 @@ class MemoryStore(HistoryMixin):
                     self.scrub()  # a forget whose file rewrite was blocked last time
                 elif migrate:
                     self._check_vectors()
+                    self._drop_orphan_vectors()  # facts an older version deleted while this process held the file
                     self.scrub()  # a forget whose file rewrite another process blocked: retried by every writer open
             except BaseException:
                 self.close()  # drop our reference; a broken connection must not stay registered
@@ -289,9 +305,11 @@ class MemoryStore(HistoryMixin):
         - aliases it may have stored in the legacy ``entities.aliases`` column are copied into ``entity_aliases``;
         - HRR vectors are re-encoded when ``hrr_dim`` differs from the dimension they were written with (recorded in
           ``meta``; before 0.4.0, inferred from the stored blobs), so a changed setting no longer breaks queries.
-        0.8.0 adds the history tables (executescript commits, so before the transaction) and versions every fact."""
-        self._conn.executescript(HISTORY_SCHEMA)
+        0.8.0 adds the history tables (executescript commits, so before the transaction) and versions every fact; 0.14.0
+        the vectors of search by meaning, whose rows for facts an older version deleted are dropped here."""
+        self._conn.executescript(HISTORY_SCHEMA + _EMBEDDINGS_SCHEMA)
         with self._tx():
+            self._conn.execute("DELETE FROM fact_embeddings WHERE fact_id NOT IN (SELECT fact_id FROM facts)")
             if "name_key" not in {r[1] for r in self._conn.execute("PRAGMA table_info(entities)")}:
                 self._conn.execute("ALTER TABLE entities ADD COLUMN name_key TEXT")
             # Aliases an older version deleted the entity of, or that point nowhere: drop before anything resolves them.
@@ -563,6 +581,8 @@ class MemoryStore(HistoryMixin):
     # -- rows of the current projection (inside a transaction) ---------------------------------------------------
 
     def _delete_fact_row(self, fact_id: int, category: str | None) -> None:
+        if self._entry.get("migrated"):  # the vector goes with the fact (forget, end, remove)
+            self._write("DELETE FROM fact_embeddings WHERE fact_id = ?", (fact_id,))
         self._write("DELETE FROM fact_entities WHERE fact_id = ?", (fact_id,))
         self._write("DELETE FROM facts WHERE fact_id = ?", (fact_id,))
         self._drop_orphan_entities()
@@ -609,6 +629,38 @@ class MemoryStore(HistoryMixin):
         self._link_entities(fact_id, version["content"], entities)
         self._compute_hrr_vector(fact_id, version["content"])
         self._invalidate_bank(version["category"])
+
+    # -- vectors of search by meaning (embeddings.py) -------------------------------------------------------------
+
+    def put_vectors(self, model: str, rows) -> int:
+        """Store vectors made by *model* from (fact_id, text hash, blob); a fact that is gone, or whose text changed
+        while its vector was being made, is skipped. Returns how many were stored."""
+        stored = 0
+        with self._tx():
+            for fact_id, digest, blob in rows:
+                row = self._one("SELECT content FROM facts WHERE fact_id = ?", (fact_id,))
+                if row is None or text_hash(row["content"]) != digest:
+                    continue
+                self._write("INSERT INTO fact_embeddings (fact_id, model, text_hash, vector, revision) "
+                            "VALUES (?, ?, ?, ?, ?) ON CONFLICT(fact_id) DO UPDATE SET model = excluded.model, "
+                            "text_hash = excluded.text_hash, vector = excluded.vector, revision = excluded.revision, "
+                            "created_at = CURRENT_TIMESTAMP", (fact_id, model, digest, blob, os.urandom(8).hex()))
+                stored += 1
+        return stored
+
+    def _drop_orphan_vectors(self) -> None:
+        """Vectors of facts that are gone (an older version deleted them: it knows no vector table)."""
+        with self._tx():
+            self._write("DELETE FROM fact_embeddings WHERE fact_id NOT IN (SELECT fact_id FROM facts)")
+
+    def drop_vectors(self) -> int:
+        """Delete every vector (search by meaning is off: nothing derived from the facts by an outside model stays in
+        the file). Returns how many there were."""
+        with self._lock:
+            if not self._entry.get("migrated") or not self._one("SELECT 1 FROM fact_embeddings LIMIT 1"):
+                return 0
+            with self._tx():
+                return max(self._write("DELETE FROM fact_embeddings").rowcount, 0)
 
     def list_facts(self, category: str | None = None, min_trust: float = 0.0, limit: int = 50) -> list[dict]:
         """Browse facts ordered by trust_score descending, optionally filtered by category / min trust."""

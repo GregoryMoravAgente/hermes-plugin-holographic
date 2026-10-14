@@ -1,8 +1,9 @@
 # Holographic Memory Provider
 
 Local memory provider for [Hermes Agent](https://github.com/NousResearch/hermes-agent): a SQLite fact store with
-FTS5 search, trust scoring, entity resolution and HRR (holographic reduced representation) retrieval. Everything
-stays on your machine: no API key, no network, no model calls.
+FTS5 search, trust scoring, entity resolution and HRR (holographic reduced representation) retrieval. By default
+everything stays on your machine: no API key, no network, no model calls. [Search by
+meaning](#search-by-meaning-optional-online) is an optional online add-on, off unless you turn it on.
 
 **Maintained by [itpartypattaya](https://github.com/itpartypattaya)** since October 2026. This is the provider that
 shipped inside Hermes core as `plugins/memory/holographic/`; Nous Research
@@ -65,8 +66,9 @@ In `config.yaml` under `plugins.hermes-memory-store`:
 | `prefetch_min_coverage` | `0.3` | Share of a message's informative words (rarer words weigh more) a fact must match to be recalled before the turn |
 | `prefetch_repeat_turns` | `6` | A fact recalled before a turn is not injected again for this many turns of the session |
 | `recall_source` | `off` | `short`: each fact recalled before a turn also says where it was written (`recorded 2026-10-12 · Anton · this chat`; no ids). Off by default: it costs tokens and tells the room which chat a fact came from. `list`, `history` and `export` always show the source in full |
-| `cron_writes` | `true` | A cron job's explicit `fact_store` / `fact_feedback` calls may write (nightly memory jobs such as hermes-dreaming's extraction and keywords exist to make them). Automatic writes (auto-extraction, mirroring, recall counts) stay off in cron, subagents and flush contexts; `false` makes cron read-only too |
+| `cron_writes` | `true` | A cron job's explicit `fact_store` / `fact_feedback` calls may write (nightly memory jobs such as hermes-dreaming's extraction and keywords exist to make them). Automatic writes (auto-extraction, mirroring, recall counts) stay off in cron, subagents and flush contexts; with `embeddings` on, a cron job that may write also makes missing fact vectors; `false` makes cron read-only too |
 | `recall_indicator` | `true` | Report recalled facts to the core's recall indicator ("🧠 Holographic — recalled 2 memories"). On Telegram and other messaging platforms that line arrives as a separate message before the reply; `false` turns it off, recall itself is unchanged. Like every key here it is read when the gateway starts: a change takes effect after a restart |
+| `embeddings` | `off` | `on`: search by meaning through an embeddings API you name (`embedding_url`, `embedding_model`, `embedding_key_env`, …) — ONLINE: fact texts and messages are sent there. See [Search by meaning](#search-by-meaning-optional-online) |
 | `scope` | `profile` | `user`: a separate database per user (`holographic-users/<platform>-<user id>.db` next to `db_path`); in a shared chat the store follows the author of each turn, and with no user identity nothing is recalled or written. `chat`: a separate database per chat (`holographic-chats/<platform>-<chat id>.db`) — for one bot serving many unrelated groups; `thread`: per forum topic / thread (`…-t<thread id>.db`), the chat's own database outside threads. Without a chat (CLI, cron, subagents) nothing is recalled or written. File names: an id made only of `A-Z a-z 0-9 _ . -` is used as is (Telegram's `-1001234567890`); any other character becomes `_`, the name is cut to 60 characters, and `-<first 10 hex of sha256(the original "platform-id")>` is appended, so distinct ids never share a file |
 
 ## Tools
@@ -512,12 +514,121 @@ negation counts for the whole clause up to a "but" ("likes cats but not dogs" is
 single word. `auto_extract` recognises English, Russian and Chinese phrasing, the refusal of instruction-like text English and Russian only. The
 main sets of all fourteen languages run in CI (`tests/test_holographic_languages.py`).
 
+## Search by meaning (optional, online)
+
+Off by default, and the one part of the plugin that goes online. Words, keywords and HRR stay the recall; this adds
+an embedding model you choose for the questions that share no word with their fact ("Which machine copies our data
+while we sleep?" against "The nightly backup runs from the OES box at 2 am."). It lives in its own module
+(`embeddings.py`) and needs no new dependency (the standard library's HTTP client, numpy as for HRR). With it off
+there are no calls and no vectors, and search scores (to six decimal places) and recall are 0.13.0's — a test pins
+them on a store of twenty facts in five languages; what
+else 0.14.0 changes is the prompt line (see the CHANGELOG), a `search_by_meaning` field in `stats`, and the empty
+`fact_embeddings` table a writable session creates.
+
+```yaml
+plugins:
+  hermes-memory-store:
+    embeddings: on
+    embedding_url: https://api.openai.com/v1   # any OpenAI-compatible embeddings API
+    embedding_model: text-embedding-3-small
+    embedding_key_env: OPENAI_API_KEY           # the NAME of a variable (e.g. in ~/.hermes/.env), never the key
+```
+
+| Endpoint | `embedding_url` | `embedding_model` | Key |
+|---|---|---|---|
+| OpenAI | `https://api.openai.com/v1` | `text-embedding-3-small` | `OPENAI_API_KEY` |
+| Gemini | `https://generativelanguage.googleapis.com/v1beta/openai` | `gemini-embedding-001` | `GEMINI_API_KEY` |
+| A local server with an OpenAI-compatible API (Ollama, Text Embeddings Inference, Infinity) | e.g. `http://127.0.0.1:11434/v1` | the model it serves | none needed |
+
+The first two were measured (below); a local server goes through the same API and was tested against a local test
+server only. Other keys: `embedding_dimensions` (shorter vectors, for models that support it), `embedding_timeout`
+(3 s, at most 6: the core gives a provider's recall 8 s), `embedding_min_score` (an absolute floor of similarity; off),
+`embedding_prefetch_facts` (1), `embedding_weight` (0.3), `embedding_space` (a label of your own: vectors are kept
+per address, model, dimension and this label, so when a server starts serving another model under the same address
+and name, change it and every vector is made again).
+
+**How it decides**
+
+- *Fact vectors* are made after a turn, on the core's background worker, by a session that may write (the main
+  agent, and a cron job unless `cron_writes: false`; never a subagent): up to 4 requests of 32 facts each, so a store
+  catches up within a few turns (100 facts: 4 requests) and no reply waits for it. A vector is stored in its own
+  table, `fact_embeddings`, with the model, the address (a query string by a short hash of it) and a hash of the
+  text it was made from: a changed text, another model, address or `embedding_space` gets a new one, and `forget`, `end` and `remove` delete it with the fact.
+- *Before a turn* one request embeds the message — unless it is a greeting or a thank-you, has fewer than two words
+  that carry meaning (five characters of Chinese, Japanese, Korean or Thai), looks like it holds a secret (below), or
+  no fact has a vector yet. Meaning then reorders the facts that share words with the message (`embedding_weight` of the score),
+  and may add **one** fact that shares none (`embedding_prefetch_facts`), after the words' facts and marked
+  `(by meaning)`, when it stands far out: its similarity is at least `sqrt(2 ln N) + 1` standard deviations above this
+  message's mean over the N facts with a vector (the closest of N unrelated facts reaches about `sqrt(2 ln N)` by
+  chance, so the bar rises with the store; it needs 20 vectors, below that only `embedding_min_score` admits a fact),
+  and it mentions whoever the message names — by a heuristic: every capitalized word inside a sentence and every
+  known entity the message mentions. In meaning "When is Peter's birthday?" is as close to "Lena's birthday is on
+  June 3" as a paraphrase is to its fact; only the name tells them apart. The heuristic is off in German (every noun
+  is capitalized), sees no names in Chinese, Japanese, Korean or Thai, nor a name that opens a sentence or is written
+  in lower case, and turns away a paraphrase that names a place its fact words differently ("Japan" for a fact about
+  Tokyo).
+- The bar is a heuristic too, not a guarantee. Similarities in one store are not independent: when many facts are
+  about as close to a message as each other (a cluster — twenty facts about one child), the spread grows and fewer of
+  them clear the bar. Measured: 20 more facts about two people of the set cost 6 of the 52 paraphrases that
+  cleared the bar on text-embedding-3-small. A median-based spread let more paraphrases through but also more noise (13
+  of the 45 questions that must recall nothing got past the bar alone, against 8), so the mean and standard
+  deviation stay.
+- `fact_store search` adds the closest facts by meaning after every word match when there are fewer than `limit`,
+  with `"match": "meaning"` and `"similarity"` (bar `sqrt(2 ln N) + 0.5`: the agent asked, and judges).
+- Any failure — network, HTTP status, a timeout (`embedding_timeout` for the whole request: it runs on a thread of
+  its own and the caller stops waiting then, however slowly the server sends), a malformed answer — falls back to
+  words without a word to the user;
+  the endpoint is then left alone for 60 s, doubling up to 15 min, with one warning in the log. A redirect is a
+  failure too (it would carry the key elsewhere). `fact_store stats` shows `search_by_meaning`: the status, the model,
+  and how many facts have a vector, wait for one, or are never sent.
+
+**What leaves the machine.** To the endpoint you name: the text of every fact (once, again when it changes) and of
+every message and `fact_store search` query that passes the checks above; the key from the variable you name, in an Authorization header (a key
+with a space or a line break inside is refused, and errors are logged as categories, never with the request in them).
+Not sent: a fact recall would not inject (instruction-like text, markup, an image — the same check recall makes), and
+a fact or a message that looks like it holds a secret — a credential word with its value, an environment assignment
+such as `OPENAI_API_KEY=…`, an Authorization header, the prefixes of common API keys and tokens (`sk-`, `ghp_`,
+`AKIA`, `AIza`, `xox…-`, `glpat-`), a long encoded blob. That check is by pattern, so best effort: a secret in a shape
+it does not know goes out with the message. `forget` deletes the vector, but the provider has seen the text: what it
+keeps is up to its terms, and some free tiers may use what they receive to improve their models. A local server keeps
+everything on the machine; plain `http` is accepted only to localhost, a private or link-local address, a host name
+without a dot or one ending in `.local`, `.lan`, `.internal` or `.home.arpa` (judged by the name; the address it
+resolves to is not checked), and needs no key. A redirect is refused. With `scope: user`, `chat` or `thread` every
+database has its own vectors. `embeddings: off` again: the next writable session deletes every stored vector.
+
+**Cost.** One request per turn for the message, one per 32 facts written; at OpenAI's price for
+text-embedding-3-small ($0.02 per million tokens) a thousand facts cost well under a cent. One request adds about
+0.2 s (OpenAI) to 0.3 s (Gemini) before the reply (median of 12 requests from a VPS). Vectors are kept in
+memory: 4 bytes per dimension per fact, 6 KB at 1536 dimensions (60 MB at 10,000 facts); `embedding_dimensions`
+shrinks them.
+
+**Measured** (2026-10-14; synthetic, nothing real: 100 facts in English, Russian, Chinese, German and Spanish; 67
+questions that share no word with their fact but a name; 45 that must recall nothing; default settings):
+
+| | Words only (off) | + meaning: text-embedding-3-small | + meaning: gemini-embedding-001 |
+|---|---|---|---|
+| Paraphrases recalled before the turn | 22 / 67 | 54 / 67 | 59 / 67 |
+| A wrong fact recalled by meaning | — | 0 | 2 |
+| Chit-chat that recalls a fact by meaning | — | 0 / 13 | 0 / 13 |
+| Off-topic questions that do | — | 1 / 22 | 2 / 22 |
+| Questions about someone or something not stored | — | 2 / 10 | 2 / 10 |
+| Facts recalled on meaning alone that were the right ones | — | 29 of 32 (91 %) | 35 of 41 (85 %) |
+
+The off-topic ones sit next to a stored topic ("Сделай план тренировки на неделю" → "Антон занимается в спортзале
+три раза в неделю"). The others are names the rule cannot see — Chinese has no capitals (小王 / 小李), German
+capitalizes every noun, so the rule is off there — and a related thing in another language ("Какой пароль от роутера?"
+→ "Der Router steht im Flur."). With 50 facts text-embedding-3-small recalls 25 of 35 against 12 by words. Keywords
+(above) stay worth having: they are local, free, and work with this off.
+
 ## Data and privacy
 
 - Facts live in one SQLite file (`db_path`), in the Hermes home of the profile, readable by its owner only (POSIX
-  `0600`). Nothing is sent anywhere. A `db_path` outside the Hermes home is listed for `hermes backup`.
+  `0600`). Nothing is sent anywhere unless `embeddings` is on (see [Search by
+  meaning](#search-by-meaning-optional-online) for what is sent, and to whom). A `db_path` outside the Hermes home is
+  listed for `hermes backup`.
 - Subagents and flush contexts read the store but never write to it (facts, feedback, counters, extraction). A cron
-  job writes only through its explicit tool calls (`cron_writes`, on by default); nothing automatic.
+  job writes facts only through its explicit tool calls (`cron_writes`, on by default); the one automatic write it
+  makes is a fact's vector when search by meaning is on.
 - With `auto_extract` on, user messages matching the preference/decision patterns are stored at session end.
 - `retrieval_count` counts how often a fact was handed to the model; nothing else is tracked.
 - Each version keeps its source: platform, chat type, chat / thread / session id and the author of the turn (id and
@@ -549,6 +660,11 @@ aliases made after 0.4.0 are visible to 0.1.1 only through the legacy `entities.
 `scope: user`, `chat` or `thread`, an older version knows nothing of per-user or per-chat files (0.6.x and older do not
 know `chat` / `thread` at all and fall back to `profile`), so it reads and writes the shared `db_path` again. Those
 files stay untouched (no leak), but new facts would land in the shared store.
+
+0.14.0 adds `fact_embeddings` (search by meaning): created by every writer, empty unless `embeddings` is on, never
+read by older versions. A fact an older version deletes leaves its vector until this version next opens the file for
+writing (a subagent or another read-only context does not drop it); a text an older version changes no longer matches its vector's hash and is never compared until a
+new vector is made.
 
 ## Development
 

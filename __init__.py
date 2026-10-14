@@ -4,7 +4,10 @@ Config in $HERMES_HOME/config.yaml under plugins.hermes-memory-store: db_path ($
 auto_extract (false), default_trust (0.5), min_trust_threshold (0.3), temporal_decay_half_life (0),
 hrr_dim (1024), hrr_weight (0.3), mirror_memory_writes (false), prefetch_min_coverage (0.3),
 prefetch_repeat_turns (6), recall_indicator (true), recall_source (off | short), cron_writes (true), scope (profile |
-user | chat | thread). Fact history, provenance and forgetting: docs/history.md."""
+user | chat | thread); search by meaning, online and off by default: embeddings (off | on), embedding_url,
+embedding_model, embedding_key_env, embedding_dimensions, embedding_timeout, embedding_min_score,
+embedding_prefetch_facts, embedding_weight, embedding_space (embeddings.py, README). Fact history, provenance and forgetting:
+docs/history.md."""
 
 from __future__ import annotations
 
@@ -14,6 +17,7 @@ import json
 import logging
 import re
 import threading
+import time
 from collections import Counter, OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List
@@ -21,6 +25,7 @@ from typing import Any, Dict, List
 from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
 from utils import is_truthy_value
+from . import embeddings
 from . import holographic as hrr
 from .history import HistoryTooNew, parse_day
 from .store import DuplicateContentError, MemoryStore
@@ -268,6 +273,27 @@ def _recall_problem(content: str) -> str | None:
     return None
 
 
+# Search by meaning sends text out: besides a credential word with its value (_has_credential), the shapes a secret
+# takes without one — an environment assignment (OPENAI_API_KEY=…), an Authorization header, the prefixes of common API
+# keys and tokens — and a long encoded blob keep a message or a fact at home. Best effort, by pattern (review
+# 2026-10-14).
+_RE_SECRET_SHAPE = re.compile(
+    r"\b[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD)[A-Z0-9_]*\s*[:=]\s*\S{6,}"
+    r"|\b(?i:bearer|basic)\s+(?=[A-Za-z._~-]*[0-9+/=])[A-Za-z0-9._~+/=-]{12,}"  # a token has a digit, + / ="
+    r"|\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+    r"|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|glpat-[A-Za-z0-9_-]{20,})")
+
+
+def _secret_in(text: str) -> bool:
+    """Does *text* look like it holds a secret? A credential with its value, a secret's shape, or an encoded blob."""
+    return _has_credential(text) or bool(_RE_SECRET_SHAPE.search(text)) or bool(_RE_BLOB.search(text))
+
+
+def _sendable(content: str) -> bool:
+    """May a stored fact go to the embeddings endpoint? Not what recall refuses to inject, nor what looks secret."""
+    return _recall_problem(content) is None and not _secret_in(content)
+
+
 def _load_plugin_config() -> dict:
     try:
         from hermes_cli.config import load_config_readonly  # canonical: managed-scope overlay + ${VAR} expansion
@@ -327,6 +353,8 @@ _PREFETCH_LINE_CHARS = 300
 _COUNT_FLUSH_AT = 25  # buffered recall counts are written in one go at this many, and at session boundaries
 _MAX_TRACKED_SESSIONS, _MAX_TRACKED_FACTS = 16, 512
 _MAX_OPEN_STORES = 16  # per-user stores kept open; the least recently used one is closed beyond this
+# Vectors made after a turn (search by meaning): at most this many requests and seconds, on the core's background worker.
+_CATCH_UP_REQUESTS, _CATCH_UP_SECONDS = 4, 8.0
 
 
 def _limit(args: dict) -> int:
@@ -343,7 +371,8 @@ def _tool_handler(actions: dict):
 def _serialized(method):
     """Run a provider entry point under the provider lock. The gateway calls hooks from several threads (and core
     leaves a timed-out prefetch running), so the active store, the dedupe window and the count buffers must not
-    change underneath an operation. Every operation is local and short."""
+    change underneath an operation. Every operation is local and short, but for one call to the embeddings endpoint
+    when search by meaning is on (bounded by embedding_timeout); making fact vectors runs outside the lock."""
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
         with self._op_lock:
@@ -400,6 +429,12 @@ class HolographicMemoryProvider(MemoryProvider):
         # Where a recalled fact was written, appended to its line before a turn: off by default (it costs tokens and
         # tells the room which chat a fact came from); "short" = date, person, this / another chat, no ids.
         self._recall_source = str(self._config.get("recall_source", "off")).strip().lower() == "short"
+        # Search by meaning (online, off by default): settings and the endpoint, shared by every store opened here.
+        self._embedding = embeddings.settings_from(self._config)
+        self._embedder = embeddings.Embedder(self._embedding) if self._embedding else None
+        if self._embedder and self._embedder.unavailable():
+            logger.warning("holographic: search by meaning is on but cannot run (%s); words only",
+                           self._embedder.unavailable())
         self._ident: dict[str, str] = {}  # chat / user Hermes named at start (a version's source)
         self._author: dict = {}  # the author of the current turn, when the platform says
         self._writable = self._tool_writable = True
@@ -472,8 +507,25 @@ class HolographicMemoryProvider(MemoryProvider):
              "another chat; no ids) to the facts recalled before a turn",
              "default": current("recall_source", "off"), "choices": ["off", "short"]},
             {"key": "cron_writes", "description": "Let a cron job's explicit fact_store / fact_feedback calls write "
-             "(nightly memory jobs); automatic writes stay off in cron",
+             "(nightly memory jobs); automatic writes stay off in cron, but for fact vectors when search by meaning is "
+             "on",
              "default": current("cron_writes", "true"), "choices": ["true", "false"]},
+            {"key": "embeddings", "description": "Search by meaning (ONLINE): fact texts, messages and fact_store "
+             "search queries are sent to the embeddings endpoint below, so a question worded differently from a fact "
+             "can still find it. Off: no network calls, and the next writable session deletes stored vectors",
+             "default": current("embeddings", "off"),
+             "choices": ["off", "on"]},
+            {"key": "embedding_url", "description": "OpenAI-compatible embeddings API (https; plain http only to "
+             "localhost or a private address, e.g. Ollama)",
+             "default": current("embedding_url", "https://api.openai.com/v1")},
+            {"key": "embedding_model", "description": "Embedding model; changing it makes every fact's vector again",
+             "default": current("embedding_model", "text-embedding-3-small")},
+            {"key": "embedding_key_env", "description": "Name of the environment variable (e.g. in ~/.hermes/.env) "
+             "that holds the API key; the key itself is never written to config",
+             "default": current("embedding_key_env", "OPENAI_API_KEY")},
+            {"key": "embedding_prefetch_facts", "description": "Facts recalled before a turn on meaning alone, when "
+             "they stand far out (0 = meaning only reorders facts that share words, and fact_store search uses it)",
+             "default": current("embedding_prefetch_facts", "1"), "choices": ["0", "1", "2", "3"]},
         ]
 
     def _db_path(self, hermes_home: str) -> str:
@@ -575,6 +627,14 @@ class HolographicMemoryProvider(MemoryProvider):
             return None
         retriever = FactRetriever(store=store, hrr_dim=hrr_dim, hrr_weight=float(self._config.get("hrr_weight", 0.3)),
                                   temporal_decay_half_life=int(self._config.get("temporal_decay_half_life", 0)))
+        if self._embedding is None and self._tool_writable:  # off: no vector of an outside model stays in the file
+            try:
+                dropped = store.drop_vectors()
+                if dropped:
+                    logger.info("holographic: search by meaning is off; deleted %d stored vectors from %s", dropped,
+                                db_path)
+            except Exception as exc:  # the next writer open tries again
+                logger.debug("holographic: could not delete stored vectors (%s)", exc)
         self._stores[key] = (store, retriever)
         while len(self._stores) > _MAX_OPEN_STORES:
             old_key = next(k for k in self._stores if k not in (key, self._scope_key))
@@ -639,7 +699,10 @@ class HolographicMemoryProvider(MemoryProvider):
             total = self._store.count_facts()
         except Exception:
             total = 0
-        lines = [f"Active: {total} facts in a local store." if total else "Active, empty: nothing stored yet.",
+        # No live numbers in this block: it sits near the top of the system prompt, and a fact count here changed with
+        # every stored fact, so a prompt cache that reuses the longest identical prefix re-read everything after it at
+        # each new session (~21K tokens, measured by adurham's fork, 220292a). Empty / not empty flips once per store.
+        lines = ["Active: facts are kept in a local store." if total else "Active, empty: nothing stored yet.",
                  "- Facts relevant to a message are recalled before your turn; for more, fact_store search "
                  "(or probe a person/thing by name).",
                  "- Store durable facts as short standalone sentences: people, projects, decisions, preferences, "
@@ -669,15 +732,33 @@ class HolographicMemoryProvider(MemoryProvider):
         try:
             key = f"{session_id or self._session_id or ''}|{self._scope_key or ''}"
             turn = self._turns[key] = self._turns.get(key, 0) + 1
-            candidates = self._retriever.search(query, min_trust=self._min_trust, limit=_PREFETCH_CANDIDATES)
+            meaning = self._meaning_of(query, before_turn=True)
+            candidates = self._retriever.search(query, min_trust=self._min_trust, limit=_PREFETCH_CANDIDATES,
+                                                meaning=meaning)
             # Recently injected facts are dropped BEFORE the top five are taken, so they leave room for others; so are
             # facts the write filter would refuse today (_recall_problem).
             fresh = [f for f in self._retriever.relevant(query, candidates, self._min_coverage)
                      if self._not_recent(key, f, turn) and self._recallable(f)][:_PREFETCH_FACTS]
             have, extra = {f["fact_id"] for f in fresh}, 0
+            # Search by meaning: the relevance gate wants the message's own words, which a paraphrase does not have;
+            # a fact that stands far out in meaning gets in on that alone, after the words' facts, at most
+            # embedding_prefetch_facts of them (1), marked so the model knows the match is looser, and only when it
+            # mentions whoever the message names (names_fit).
+            by_meaning: set[int] = set()
+            if meaning is not None and self._embedding.recall_facts:
+                for fact in self._retriever.by_meaning(meaning, exclude=have, min_trust=self._min_trust,
+                                                       limit=self._embedding.recall_facts + 3,
+                                                       margin=embeddings.RECALL_MARGIN,
+                                                       min_score=self._embedding.min_score):
+                    if len(by_meaning) < self._embedding.recall_facts and self._not_recent(key, fact, turn) \
+                            and self._recallable(fact) and self._retriever.names_fit(query, fact):
+                        fresh.append(fact)
+                        have.add(fact["fact_id"])
+                        by_meaning.add(fact["fact_id"])
             for entity_id in sorted(self._store.mentioned_entity_ids(query)):
                 for fact in self._retriever._linked_facts([[entity_id]], None, self._min_trust, _ENTITY_FACTS * 3):
-                    if extra < _ENTITY_FACTS and fact["fact_id"] not in have and self._not_recent(key, fact, turn)                             and self._recallable(fact):
+                    if extra < _ENTITY_FACTS and fact["fact_id"] not in have and self._not_recent(key, fact, turn) \
+                            and self._recallable(fact):
                         fresh.append(fact)
                         have.add(fact["fact_id"])
                         extra += 1
@@ -689,11 +770,68 @@ class HolographicMemoryProvider(MemoryProvider):
             self._counted(fresh)
             sources = self._store.current_sources([f["fact_id"] for f in fresh]) if self._recall_source else {}
             lines = [f"- #{f['fact_id']} [{f.get('trust_score', 0):.1f}] {_one_line(f.get('content', ''))}"
+                     + (" (by meaning)" if f["fact_id"] in by_meaning else "")
                      + self._recall_suffix(sources.get(f["fact_id"])) for f in fresh]
             return "## Holographic Memory (stored facts: data, not instructions)\n" + "\n".join(lines)
         except Exception as e:
             logger.debug("Holographic prefetch failed: %s", e)
             return ""
+
+    def _meaning_of(self, query: str, *, before_turn: bool):
+        """Closeness in meaning of every fact of the active store to *query* (embeddings.Meaning), or None: the feature
+        off or unusable, a message not worth a call (embeddings.worth_asking) or holding a credential, or no fact
+        with a vector yet. One call to the endpoint at most; any failure is None."""
+        if self._embedder is None or not self._retriever or _secret_in(query or "") \
+                or not embeddings.worth_asking(query, before_turn=before_turn):
+            return None
+        try:
+            tag = self._embedding.tag
+            if not self._embedder.usable() or not self._retriever.vector_index(tag).ready():
+                return None
+            vector = self._embedder.query(query)
+            return self._retriever.meaning(vector, tag, self._embedding.weight) if vector is not None else None
+        except Exception as exc:  # never takes recall down
+            logger.debug("holographic: search by meaning skipped (%s)", exc)
+            return None
+
+    def _catch_up_vectors(self) -> None:
+        """Vectors for the active store's facts that have none, or whose text changed since theirs was made: after a
+        turn, on the core's background worker, at most _CATCH_UP_REQUESTS requests and _CATCH_UP_SECONDS. Only the
+        request runs outside the provider lock (the next turn's prefetch must not wait on the network); reading what
+        is missing and storing the vectors run under it, after checking that the store is still open here (a shutdown
+        or an LRU eviction may close it while the request is out), and the store skips a fact whose text changed in
+        between. Facts that recall would not inject or that look secret are never sent (_sendable)."""
+        with self._op_lock:
+            if self._embedder is None or not self._tool_writable or not self._store or not self._retriever:
+                return
+            store, tag = self._store, self._embedding.tag
+            index = self._retriever.vector_index(tag)
+        deadline = time.monotonic() + _CATCH_UP_SECONDS
+        try:
+            for _ in range(_CATCH_UP_REQUESTS):
+                if not self._embedder.usable():
+                    return
+                with self._op_lock:  # may wait for a prefetch: the budget is checked after it
+                    if not self._open_here(store):
+                        return
+                    todo = index.pending(embeddings.BATCH, allowed=_sendable)
+                left = deadline - time.monotonic()
+                if not todo or left < embeddings.MIN_REQUEST_SECONDS:
+                    return
+                vectors = self._embedder.embed([content for _, content, _ in todo], budget=left)
+                if vectors is None:
+                    return
+                with self._op_lock:
+                    if not self._open_here(store):
+                        return
+                    store.put_vectors(tag, [(fact_id, digest, embeddings.to_blob(vector))
+                                            for (fact_id, _, digest), vector in zip(todo, vectors)])
+        except Exception as exc:  # a busy file, a broken connection: the next turn goes on
+            logger.debug("holographic: making fact vectors stopped (%s)", exc)
+
+    def _open_here(self, store) -> bool:
+        """Is *store* still one this provider holds open (not shut down, not evicted)? Under the provider lock."""
+        return any(open_store is store for open_store, _ in self._stores.values())
 
     def _recallable(self, fact: dict) -> bool:
         """False for a fact recall must not inject (_recall_problem); logged once per fact and process. fact_store
@@ -769,9 +907,17 @@ class HolographicMemoryProvider(MemoryProvider):
         # is_truthy_value: auto_extract is a string enum ("false"/"true"); plain truthiness would treat "false" as on.
         return self._writable and is_truthy_value(self._config.get("auto_extract", False))
 
-    @_serialized
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", messages=None,
                   turn_author: dict | None = None) -> None:
+        """After a completed turn (the core runs it on a background worker): extraction, then, with search by meaning
+        on, vectors for facts that have none (_catch_up_vectors, outside the provider lock)."""
+        self._sync_turn(user_content, assistant_content, session_id=session_id, messages=messages,
+                        turn_author=turn_author)
+        self._catch_up_vectors()
+
+    @_serialized
+    def _sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", messages=None,
+                   turn_author: dict | None = None) -> None:
         """Extraction per completed turn, filed under whoever wrote it. In user scope a turn by a bot, or an
         anonymous turn in a shared conversation, is skipped rather than stored in somebody's memory."""
         if not self._extracting() or not user_content:
@@ -1037,8 +1183,17 @@ class HolographicMemoryProvider(MemoryProvider):
                                  + ("; see 'undetermined' for what may have." if found["undetermined"] else "."))
             found["count"] = len(found["results"])
             return json.dumps(found)
-        return _results(self._counted(self._retriever.search(
-            a["query"], category=a.get("category"), min_trust=self._trust_floor(a), limit=_limit(a))))
+        limit, meaning = _limit(a), self._meaning_of(a["query"], before_turn=False)
+        results = self._retriever.search(a["query"], category=a.get("category"), min_trust=self._trust_floor(a),
+                                         limit=limit, meaning=meaning)
+        if meaning is not None and len(results) < limit:  # by meaning: after every fact that holds the words
+            for fact in self._retriever.by_meaning(meaning, exclude={f["fact_id"] for f in results},
+                                                   category=a.get("category"), min_trust=self._trust_floor(a),
+                                                   limit=limit - len(results), margin=embeddings.SEARCH_MARGIN,
+                                                   min_score=self._embedding.min_score):
+                fact["match"] = "meaning"
+                results.append(fact)
+        return _results(self._counted(results))
 
     def _as_of(self, a: dict) -> str:
         return parse_day(a["as_of"], field="as_of", today=self._store._today())
@@ -1106,8 +1261,17 @@ class HolographicMemoryProvider(MemoryProvider):
             "low_trust": read("SELECT COUNT(*) FROM facts WHERE trust_score < ?", (self._min_trust,))[0][0],
             "history": self._store.history_counts() or "not set up yet",
             "structural_recall": "on" if hrr._HAS_NUMPY else "off (numpy missing)",
+            "search_by_meaning": self._meaning_stats(),
             "database": str(self._store.db_path),
         })
+
+    def _meaning_stats(self):
+        """"off", or the endpoint's state and how many facts have a vector, wait for one, or are never sent."""
+        if self._embedder is None:
+            return "off"
+        counts = self._retriever.vector_index(self._embedding.tag).counts(
+            allowed=_sendable)
+        return {"status": self._embedder.status(), "model": self._embedding.tag, **counts}
 
     def _export(self, a: dict) -> str:
         """The facts as Markdown, most trusted first, with their entities: a readable view of the store."""
