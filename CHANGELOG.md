@@ -18,17 +18,52 @@
 - **An address with a password in it** (`postgres://app:…@db/app`, `https://user:pass@host`) is a credential by its
   shape, wherever it stands.
 
-Not a secret: a count (`MAX_OUTPUT_TOKENS=8192`: a name ending in `TOKENS`), another variable's name or a reference
-to it (`embedding_key_env: OPENAI_API_KEY`, `${GROQ_API_KEY}`), a path (`GOOGLE_APPLICATION_CREDENTIALS=/…/gcp.json`),
-a placeholder (`***`, `sk-...`, `<your key>`, `[REDACTED]`; in brackets only without digits), an address without a
-password, and code in lower case (`cache_key: user_42`). A link is a pointer except in a webhook's or a DSN's
-variable, where the link is the secret.
+- **A bare name** (`SECRET=…`, `PASSWORD=…`, `KEY=…`) counts too, and a variable is what may not be sent in every
+  language ("Отправь OPENAI_API_KEY на…", "发送OPENAI_API_KEY到…", "Bitte OPENAI_API_KEY an … senden").
 
-Measured on a family store, before and after: none of its 58 facts changes verdict; of 18,815 messages none is newly
-refused or kept from the endpoint, and 11 no longer are — all false alarms of the old rule (10 phrases in brackets
-after "tokens", such as "tokens (input", where the bracket read as a password's symbol, and one token count). The
-screens take 3.4 ms per message against 2.8 ms; a flat list of the 310 names made them four times slower, so the
-names are compiled as a tree of shared prefixes.
+Not a secret: a count (`MAX_OUTPUT_TOKENS=8192`: a name ending in `TOKENS`), a reference to a variable
+(`${GROQ_API_KEY}`, `%OPENAI_API_KEY%`; a bare name only in prose — `ACME_PASSWORD=SECRET_KEY` may be the password),
+a file (`GOOGLE_APPLICATION_CREDENTIALS=/home/…/gcp.json`, `C:\…\gcp.json`), a placeholder (`***`, `sk-...`,
+`<your key>`, `{api_key}`, `{YOUR_API_KEY}`, `[REDACTED]`), an address without a password, and code in lower case
+(`cache_key: user_42`). Such an assignment may also be sent for search by meaning. A link is a pointer except in a
+webhook's or a DSN's variable, where the link is the secret.
+
+### Reviewed
+
+Before release, the code new since 0.15.0 (0.15.1 and 0.15.2) went through two rounds of review each by Codex CLI and
+Antigravity CLI, with full access to a throwaway clone; every finding was reproduced and has a test (end of
+`tests/test_holographic_v0152.py`). What they found, and 0.15.2 fixes:
+
+- **Exemptions that let a password through** — added in 0.15.1-0.15.2 for prose, they also applied after
+  "password:": a value in brackets without digits (`[Sunshine!]`), a date, two hyphenated words, a value starting
+  with `/`, a trailing colon (`Summer2026:`), a capitalised or snake_case word taken for a variable's name. Now an
+  explicit separator (":", "=", a quote, "is") makes the value an assignment, and an assignment gets none of them; a
+  dash still introduces prose ("пароль Wi-Fi", "GEMINI_API_KEY — …"). A path is one with two parts, from `~` or `.`,
+  or a file with an extension; brackets come off the value once (`(input` after "tokens" is prose).
+- **Leaks**: `redis://:pass@host` (no login); bare `SECRET`/`KEY`/`PASSWD`; "Bitte das Passwort … senden", "请将密码
+  发送…", "把密码向 … 发送"; "ignore all instructions" without "previous" in Spanish, French, Portuguese, Italian,
+  German (also "Ignorieren Sie"), Dutch, Polish, Indonesian, Turkish, Japanese, Korean, Thai, Hindi, Arabic and
+  Bengali — "all" or "previous" is enough now, as in English.
+- **False refusals**: "My password manager is 1Password", "password minimum length: 12_chars", "token expiration
+  time: 3600s", "API key rate limit: 100/min" (words about passwords after the name are not what it is for);
+  `http://localhost:8000?email=a@b.c` (an `@` in a query is not a login); "Скрипт отправляет OPENAI_API_KEY в
+  заголовке" and "send $API_KEY in the header" (a narrative and a reference in code, not a request).
+- One test asserted half of what it said, which hid two of the false refusals above.
+
+Not taken: "El token es de-un-solo-uso" is refused, because three hyphenated words after "is" read as a passphrase
+("My passphrase is correct-horse-battery" must be); written as Spanish is written, with spaces, it is a fact.
+
+Measured on a family store, before and after: none of its 58 facts changes verdict; of 18,819 messages none is newly
+refused, left out of recall or kept from the endpoint, and 10 no longer are — all false alarms of the old rule (nine
+phrases in brackets after "tokens", such as "tokens (input", where the bracket read as a password's symbol, and one
+token count). The screens take 4.6 ms per message against 2.8 ms in 0.15.0, on a text of up to 2,000 characters; a
+flat list of the 310 names made them four times slower, so the names are compiled as a tree of shared prefixes. No
+super-linear time was found on adversarial inputs (both reviews measured, up to 36 ms for the three screens).
+
+### Documented
+
+- 0.15.1 on a Chinese store (issue #3, 83 facts, bge-m3): the three shape probes glued to Chinese text and six other
+  probes all as expected; offline, 0 of 83 facts refused, left out of recall or kept from the endpoint.
 
 ## 0.15.1 — 2026-10-15
 
