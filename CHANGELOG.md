@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.15.2 — 2026-10-16
+
+### Fixed
+
+- **A key in an environment variable was stored and recalled.** "配置OPENAI_API_KEY=…" landed as a fact (issue #3):
+  the word `API_KEY` after `OPENAI_` has no edge, since `_` is part of a word, and an assignment was only kept from
+  the embeddings endpoint, never refused — so on a core that does not mask tool arguments the key would sit in the
+  store and go into prompts. The name of a variable is now a credential word like "password": with a value that
+  looks like one it is not stored, not recalled and not sent. The names: any in capitals that ends like a secret
+  (`…_KEY`, `…_TOKEN`, `…_SECRET`, `…_PASSWORD`, `…_CREDENTIALS`, `…_API_HASH`, `…_DSN`, `…_WEBHOOK`), plus 310
+  popular ones listed by name, in any case — model providers (OpenAI, Anthropic, Gemini, Mistral, Groq, xAI,
+  DeepSeek, OpenRouter, Hugging Face, Qwen, Moonshot, Zhipu, GigaChat, YandexGPT…), speech and images, search and
+  scraping, observability and vector stores, messengers and bots (Telegram, including `TG_API_HASH` and session
+  strings, Discord, Slack, LINE, WhatsApp…), code hosting and packages, clouds, mail, payments and work tools
+  (`_SECRET_ENV_NAMES`).
+- **An address with a password in it** (`postgres://app:…@db/app`, `https://user:pass@host`) is a credential by its
+  shape, wherever it stands.
+
+Not a secret: a count (`MAX_OUTPUT_TOKENS=8192`: a name ending in `TOKENS`), another variable's name or a reference
+to it (`embedding_key_env: OPENAI_API_KEY`, `${GROQ_API_KEY}`), a path (`GOOGLE_APPLICATION_CREDENTIALS=/…/gcp.json`),
+a placeholder (`***`, `sk-...`, `<your key>`, `[REDACTED]`; in brackets only without digits), an address without a
+password, and code in lower case (`cache_key: user_42`). A link is a pointer except in a webhook's or a DSN's
+variable, where the link is the secret.
+
+Measured on a family store, before and after: none of its 58 facts changes verdict; of 18,815 messages none is newly
+refused or kept from the endpoint, and 11 no longer are — all false alarms of the old rule (10 phrases in brackets
+after "tokens", such as "tokens (input", where the bracket read as a password's symbol, and one token count). The
+screens take 3.4 ms per message against 2.8 ms; a flat list of the 310 names made them four times slower, so the
+names are compiled as a tree of shared prefixes.
+
 ## 0.15.1 — 2026-10-15
 
 ### Fixed

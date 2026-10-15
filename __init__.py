@@ -243,6 +243,116 @@ _RE_INJECTION = re.compile(_alternatives(
     r"|systeemprompt|prompt\s+systemowy|sistem\s+istemi|prompt\s+sistem)\s*[:：]",
     re.IGNORECASE)
 
+# Environment variables that hold a key, a token or a password: "OPENAI_API_KEY=sk-…", "配置OPENAI_API_KEY=…",
+# "TELEGRAM_BOT_TOKEN: 123…". The name is a credential word like "password" (0.15.2, issue #3): before, "API_KEY" after
+# "OPENAI_" had no edge ("_" is a letter to a word), and an assignment was only kept from the endpoint, not refused —
+# so a key in one was stored and recalled. Any name that ends like a secret counts; the popular names of model and
+# service providers are listed by name too, so one that does not end like that ("TG_API_HASH", "QIANFAN_AK") counts.
+# What the value must be is unchanged, plus what a setting names instead of a secret (_env_value_is_plain).
+def _trie(words) -> str:
+    """One alternation of *words* as a tree of shared prefixes: a flat list of 300 names made every screen four times
+    slower, since the engine tries each name at every position."""
+    root: dict = {}
+    for word in words:
+        node = root
+        for ch in word:
+            node = node.setdefault(ch, {})
+        node[""] = {}
+
+    def emit(node: dict) -> str:
+        alts = [re.escape(ch) + emit(child) for ch, child in sorted(node.items()) if ch]
+        if not alts:
+            return ""
+        body = alts[0] if len(alts) == 1 else "(?:" + "|".join(alts) + ")"
+        if "" in node:
+            return "(?:" + body + ")?"
+        return body
+
+    return "(?:" + emit(root) + ")"
+
+
+_SECRET_ENV_NAMES = (
+    # model providers
+    "OPENAI_API_KEY", "OPENAI_ADMIN_KEY", "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_KEY", "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_API_KEY",
+    "VERTEX_API_KEY", "MISTRAL_API_KEY", "CODESTRAL_API_KEY", "COHERE_API_KEY", "CO_API_KEY", "GROQ_API_KEY",
+    "XAI_API_KEY", "GROK_API_KEY", "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY", "TOGETHER_API_KEY", "TOGETHERAI_API_KEY",
+    "FIREWORKS_API_KEY", "PERPLEXITY_API_KEY", "PPLX_API_KEY", "CEREBRAS_API_KEY", "SAMBANOVA_API_KEY",
+    "NVIDIA_API_KEY", "NGC_API_KEY", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_API_KEY",
+    "HUGGINGFACEHUB_API_TOKEN", "REPLICATE_API_TOKEN", "REPLICATE_API_KEY", "AI21_API_KEY", "VOYAGE_API_KEY",
+    "JINA_API_KEY", "NOMIC_API_KEY", "OLLAMA_API_KEY", "LITELLM_MASTER_KEY", "LITELLM_API_KEY", "NOUS_API_KEY",
+    "NOUS_PORTAL_API_KEY", "KIMI_API_KEY", "MOONSHOT_API_KEY", "DASHSCOPE_API_KEY", "QWEN_API_KEY",
+    "ZHIPUAI_API_KEY", "ZHIPU_API_KEY", "GLM_API_KEY", "SILICONFLOW_API_KEY", "MINIMAX_API_KEY", "BAICHUAN_API_KEY",
+    "QIANFAN_AK", "QIANFAN_SK", "QIANFAN_ACCESS_KEY", "QIANFAN_SECRET_KEY", "ARK_API_KEY", "VOLCENGINE_API_KEY",
+    "HUNYUAN_API_KEY", "STEPFUN_API_KEY", "YI_API_KEY", "LINGYIWANWU_API_KEY", "SPARK_API_KEY", "SPARK_API_SECRET",
+    "YANDEX_API_KEY", "YC_API_KEY", "YANDEX_GPT_API_KEY", "GIGACHAT_CREDENTIALS", "GIGACHAT_API_KEY",
+    "SBER_API_KEY", "UPSTAGE_API_KEY", "REKA_API_KEY", "WRITER_API_KEY", "LEPTON_API_KEY", "NOVITA_API_KEY",
+    "HYPERBOLIC_API_KEY", "DEEPINFRA_API_KEY", "DEEPINFRA_API_TOKEN", "ANYSCALE_API_KEY", "OCTOAI_TOKEN",
+    "PREDIBASE_API_TOKEN", "AWS_BEARER_TOKEN_BEDROCK", "WATSONX_APIKEY", "IBM_API_KEY", "CLOUDFLARE_AI_API_TOKEN",
+    # speech, images, video
+    "ELEVENLABS_API_KEY", "DEEPGRAM_API_KEY", "ASSEMBLYAI_API_KEY", "SPEECHMATICS_API_KEY", "CARTESIA_API_KEY",
+    "PLAYHT_API_KEY", "STABILITY_API_KEY", "STABILITY_KEY", "FAL_KEY", "FAL_API_KEY", "IDEOGRAM_API_KEY",
+    "RUNWAY_API_KEY", "RUNWAYML_API_SECRET", "LUMA_API_KEY", "MIDJOURNEY_TOKEN", "BFL_API_KEY", "HEYGEN_API_KEY",
+    "DID_API_KEY", "AZURE_SPEECH_KEY",
+    # search, scraping, agents' tools
+    "TAVILY_API_KEY", "SERPAPI_API_KEY", "SERPAPI_KEY", "SERPER_API_KEY", "BRAVE_API_KEY", "BRAVE_SEARCH_API_KEY",
+    "EXA_API_KEY", "FIRECRAWL_API_KEY", "JINA_READER_API_KEY", "APIFY_TOKEN", "APIFY_API_TOKEN", "BROWSERBASE_API_KEY",
+    "SCRAPINGBEE_API_KEY", "BING_API_KEY", "BING_SEARCH_V7_SUBSCRIPTION_KEY", "GOOGLE_CSE_KEY", "YOU_API_KEY",
+    "COMPOSIO_API_KEY", "E2B_API_KEY", "MEM0_API_KEY", "ZEP_API_KEY", "LETTA_API_KEY",
+    # observability, vector stores
+    "LANGSMITH_API_KEY", "LANGCHAIN_API_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_PUBLIC_KEY", "HELICONE_API_KEY",
+    "WANDB_API_KEY", "COMET_API_KEY", "ARIZE_API_KEY", "PHOENIX_API_KEY", "LOGFIRE_TOKEN", "SENTRY_AUTH_TOKEN",
+    "SENTRY_DSN", "DATADOG_API_KEY", "DD_API_KEY", "PINECONE_API_KEY", "QDRANT_API_KEY", "WEAVIATE_API_KEY",
+    "CHROMA_API_KEY", "MILVUS_TOKEN", "ZILLIZ_API_KEY", "UPSTASH_REDIS_REST_TOKEN", "UPSTASH_VECTOR_REST_TOKEN",
+    # messengers and bots
+    "TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN", "BOT_TOKEN", "TELEGRAM_API_HASH", "TG_API_HASH", "API_HASH",
+    "TELEGRAM_SESSION_STRING", "SESSION_STRING", "STRING_SESSION", "STORIES_SESSION_STRING", "DISCORD_TOKEN",
+    "DISCORD_BOT_TOKEN", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_USER_TOKEN", "SLACK_SIGNING_SECRET",
+    "SLACK_WEBHOOK_URL", "WHATSAPP_TOKEN", "WHATSAPP_ACCESS_TOKEN", "LINE_CHANNEL_ACCESS_TOKEN", "LINE_CHANNEL_SECRET",
+    "VIBER_AUTH_TOKEN", "MATRIX_ACCESS_TOKEN", "MATTERMOST_TOKEN", "TWILIO_AUTH_TOKEN", "TWILIO_API_SECRET",
+    "VK_TOKEN", "VK_API_TOKEN", "WECHAT_APP_SECRET", "WECOM_SECRET", "FEISHU_APP_SECRET", "LARK_APP_SECRET",
+    "DINGTALK_APP_SECRET", "SIGNAL_PASSWORD",
+    # code hosting, packages, CI
+    "GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PAT", "GITHUB_CLIENT_SECRET", "GITHUB_WEBHOOK_SECRET", "GITLAB_TOKEN",
+    "GITLAB_PRIVATE_TOKEN", "CI_JOB_TOKEN", "BITBUCKET_APP_PASSWORD", "NPM_TOKEN", "NODE_AUTH_TOKEN", "PYPI_TOKEN",
+    "PYPI_API_TOKEN", "TWINE_PASSWORD", "UV_PUBLISH_TOKEN", "CARGO_REGISTRY_TOKEN", "DOCKERHUB_TOKEN",
+    "DOCKER_PASSWORD", "CODECOV_TOKEN", "SONAR_TOKEN",
+    # cloud and hosting
+    "AWS_SECRET_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "AWS_SESSION_TOKEN", "AZURE_CLIENT_SECRET", "AZURE_STORAGE_KEY",
+    "AZURE_STORAGE_CONNECTION_STRING", "GOOGLE_APPLICATION_CREDENTIALS", "GCP_SERVICE_ACCOUNT_KEY",
+    "CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_KEY", "CF_API_TOKEN", "DIGITALOCEAN_TOKEN", "DIGITALOCEAN_ACCESS_TOKEN",
+    "HCLOUD_TOKEN", "LINODE_TOKEN", "VULTR_API_KEY", "OVH_APPLICATION_SECRET", "OVH_CONSUMER_KEY", "VERCEL_TOKEN",
+    "NETLIFY_AUTH_TOKEN", "HEROKU_API_KEY", "FLY_API_TOKEN", "RAILWAY_TOKEN", "RENDER_API_KEY", "ALIBABA_CLOUD_ACCESS_KEY_SECRET",
+    "ALIYUN_ACCESS_KEY_SECRET", "TENCENTCLOUD_SECRET_KEY", "HUAWEICLOUD_SDK_SK", "YC_TOKEN", "YC_IAM_TOKEN",
+    "SUPABASE_KEY", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_ROLE_KEY", "FIREBASE_API_KEY", "FIREBASE_TOKEN",
+    # data, mail, payments, work tools
+    "POSTGRES_PASSWORD", "MYSQL_PASSWORD", "MYSQL_ROOT_PASSWORD", "REDIS_PASSWORD", "SMTP_PASSWORD", "SMTP_PASS", "EMAIL_HOST_PASSWORD", "SENDGRID_API_KEY",
+    "MAILGUN_API_KEY", "POSTMARK_SERVER_TOKEN", "RESEND_API_KEY", "MAILCHIMP_API_KEY", "STRIPE_SECRET_KEY",
+    "STRIPE_API_KEY", "STRIPE_WEBHOOK_SECRET", "PAYPAL_CLIENT_SECRET", "YOOKASSA_SECRET_KEY", "NOTION_TOKEN",
+    "NOTION_API_KEY", "LINEAR_API_KEY", "JIRA_API_TOKEN", "ATLASSIAN_API_TOKEN", "CONFLUENCE_API_TOKEN",
+    "ASANA_ACCESS_TOKEN", "TRELLO_TOKEN", "AIRTABLE_API_KEY", "AIRTABLE_TOKEN", "FIGMA_TOKEN",
+    "FIGMA_ACCESS_TOKEN", "HUBSPOT_ACCESS_TOKEN", "SALESFORCE_PASSWORD", "ZAPIER_API_KEY", "SHOPIFY_ACCESS_TOKEN",
+    "DROPBOX_ACCESS_TOKEN", "GOOGLE_CLIENT_SECRET", "GOOGLE_REFRESH_TOKEN", "SPOTIFY_CLIENT_SECRET",
+    "TWITTER_BEARER_TOKEN", "X_BEARER_TOKEN", "TWITTER_API_SECRET", "REDDIT_CLIENT_SECRET", "YOUTUBE_API_KEY",
+    "HH_API_TOKEN", "AMOCRM_TOKEN", "BITRIX24_WEBHOOK",
+    # an application's own
+    "SECRET_KEY", "DJANGO_SECRET_KEY", "FLASK_SECRET_KEY", "JWT_SECRET", "JWT_SECRET_KEY", "SESSION_SECRET",
+    "NEXTAUTH_SECRET", "AUTH_SECRET", "ENCRYPTION_KEY", "MASTER_KEY", "WEBHOOK_SECRET", "CLIENT_SECRET", "APP_SECRET",
+    "ADMIN_PASSWORD", "ROOT_PASSWORD", "API_KEY", "API_TOKEN", "ACCESS_TOKEN", "REFRESH_TOKEN", "AUTH_TOKEN",
+    "PRIVATE_KEY", "SSH_PRIVATE_KEY", "GPG_PASSPHRASE", "VAULT_TOKEN", "NGROK_AUTHTOKEN", "TAILSCALE_AUTHKEY",
+)
+# Any other name in capitals that ends like a secret: …_KEY, …_TOKEN, …_SECRET, …_PASSWORD, …_CREDENTIALS,
+# …_API_HASH, …_DSN, …_WEBHOOK. Capitals only, as environment variables are written: "cache_key" in code is not one.
+# Singular only: "MAX_OUTPUT_TOKENS=8192" is a count. A database address is not listed: its password shows by itself
+# ("postgres://app:…@db", _RE_TOKEN_SHAPE), and without one it is a setting.
+_ENV_SECRET_NAME = (
+    r"(?-i:[A-Z][A-Z0-9]{0,40}(?:_[A-Z0-9]{1,40}){0,8}_(?:KEY|APIKEY|AUTHKEY|TOKEN|AUTHTOKEN|SECRET|PASSWORD|PASSWD"
+    r"|PWD|PASS|PASSPHRASE|CREDENTIALS?|API_HASH|SESSION_STRING|STRING_SESSION|DSN|AK|SK|WEBHOOK|WEBHOOK_URL))"
+    r"|" + _trie(_SECRET_ENV_NAMES))
+_RE_ENV_NAME = re.compile(_ENV_SECRET_NAME, re.IGNORECASE)
+# Names whose value is a link that is itself the secret (a webhook, a Sentry DSN): there a link is not a pointer.
+_RE_SECRET_LINK_NAME = re.compile(r"(?:WEBHOOK|WEBHOOK_URL|DSN)$", re.IGNORECASE)
+
 # What a credential is called, per language. Latin-script words are held to the edges; "pin" alone is English, and a
 # "PIN code" in other words ("código PIN", "PIN-Code") is listed with them. Hindi "पिन कोड" is left out: in India it is
 # also the postal code.
@@ -269,7 +379,9 @@ _CREDENTIAL_LATIN = (
     r"|[şs]ifre(?:si|n|niz|m|yi)?|parola(?:s[ıi]|n[ıi]z|m)|api\s+anahtar[ıi]?|gizli\s+anahtar|do[ğg]rulama\s+kodu"
     r"|pin\s+kodu"
     # id
-    r"|kata\s+sandi|sandi|kunci\s+(?:rahasia|api)|kode\s+(?:pin|verifikasi|otp|akses)")
+    r"|kata\s+sandi|sandi|kunci\s+(?:rahasia|api)|kode\s+(?:pin|verifikasi|otp|akses)"
+    # environment variables, in the text of any language
+    r"|" + _ENV_SECRET_NAME)
 _CREDENTIAL_NAMES = {
     "ru": r"парол[ьяюеи]|пин[\s-]?код\w*|токен\w*|ключ\w*\s+api|api[\s-]?ключ\w*|секретн\w*\s+ключ\w*"
           r"|код\w*\s+(?:подтверждения|доступа)",
@@ -375,14 +487,34 @@ _RE_TOKEN_SHAPE = re.compile(
     # a bot token alone or inside a Bot API address (".../bot<id>:<secret>/sendMessage", 0.14.6)
     r"|(?:(?<=bot)|(?<![A-Za-z0-9_:]))\d{6,12}:[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])"
     r"|" + _EDGE_START + r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*"
-    r"|-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----")
+    r"|-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----"
+    # an address with a login and a password in it: "postgres://app:Qw3rty@db/app", "https://user:pass@host" (0.15.2)
+    r"|(?i:[a-z][a-z0-9+.-]{1,20})://[^\s:/@]+:[^\s/@]+@")
 
 
 def _has_credential(text: str) -> bool:
     """A credential word with its value, or a token whose shape alone says it is one (_RE_TOKEN_SHAPE)."""
-    return bool(_RE_TOKEN_SHAPE.search(text)) \
-        or any(_looks_like_a_secret(m.group("value")) and not _a_count(m) for rx in _RE_CREDENTIALS
-               for m in rx.finditer(text))
+    return bool(_RE_TOKEN_SHAPE.search(text)) or any(_holds_a_secret(m) for rx in _RE_CREDENTIALS
+                                                     for m in rx.finditer(text))
+
+
+def _holds_a_secret(match: re.Match) -> bool:
+    """Does this credential word come with its value? Not a count after "tokens", not what a setting names."""
+    if _a_count(match):
+        return False
+    word = match.group("word").strip()
+    if _RE_ENV_NAME.fullmatch(word):
+        if _RE_ENV_PLAIN.fullmatch(_value(match.group("value"))):
+            return False
+        return _looks_like_a_secret(match.group("value"), links=not _RE_SECRET_LINK_NAME.search(word))
+    return _looks_like_a_secret(match.group("value"))
+
+
+# What an environment variable may be set to that is not a secret: another variable's name or a reference to it
+# ("embedding_key_env: OPENAI_API_KEY", "${GROQ_API_KEY}", "%OPENAI_API_KEY%"), or a lower-case identifier without
+# digits ("GITHUB_TOKEN: from_env") (0.15.2).
+_RE_ENV_PLAIN = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|%[A-Za-z_][A-Za-z0-9_]*%"
+                           r"|[a-z]+(?:[_.-][a-z]+)+")
 
 
 def _a_count(match: re.Match) -> bool:
@@ -401,9 +533,16 @@ def _value(token: str) -> str:
 _RE_HYPHENATED = re.compile(r"[^\W\d_]+-[^\W\d_]+")
 
 
-def _looks_like_a_secret(token: str) -> bool:
+# A placeholder for a value, not the value: "***", "sk-...", "<your key>", "[REDACTED]", "{token}" (0.15.2). In
+# brackets only without digits: "(input" after "tokens" is prose, "(Qw3rty" may be the value.
+_RE_PLACEHOLDER = re.compile(r"[*•xX.…]+|[<\[{(]\D*|\S{0,12}(?:\.\.\.|…)")
+
+
+def _looks_like_a_secret(token: str, links: bool = True) -> bool:
+    """*links*: a link or a path is a pointer, not a value (False for a webhook's or a DSN's variable)."""
     value = _value(token)
-    if len(value) < 4 or any(rx.fullmatch(value) for rx in (_RE_DECIMAL, _RE_DATE, _RE_POINTER, _RE_HYPHENATED)):
+    if len(value) < 4 or any(rx.fullmatch(value) for rx in (_RE_DECIMAL, _RE_DATE, _RE_HYPHENATED, _RE_PLACEHOLDER)) \
+            or (links and _RE_POINTER.fullmatch(value)):
         return False
     if any(c.isdigit() or (not c.isalnum() and c != "'") for c in value):
         return True

@@ -91,7 +91,9 @@ In `config.yaml` under `plugins.hermes-memory-store`:
   fact (JSON, tool or chat-role markup, instruction-like phrasing, a credential with its value or a token whose shape
   alone says it is one — an API key prefix, a Telegram bot token (also inside a Bot API address), a JWT, a private key
   (0.14.5) —; instructions and credentials in all eighteen languages of [Languages](#languages), also glued
-  to Chinese text (0.15.1) —, an image (markdown or
+  to Chinese text (0.15.1); an environment variable that holds a key, a token or a password, by its name — any in
+  capitals ending like `…_KEY` or `…_TOKEN` and 310 popular ones of model and service providers — and an address
+  with a password in it (0.15.2) —, an image (markdown or
   HTML), invisible characters, long blobs, >1000 characters) is refused with the reason. Recall
   checks a stored fact again before it goes into a prompt (0.13.0): one an older release, or another program, wrote
   past today's rules (markup, instructions, credentials, invisible characters, images) is left out of recall
