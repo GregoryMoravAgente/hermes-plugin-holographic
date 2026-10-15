@@ -196,27 +196,31 @@ _RE_INJECTION = re.compile(_alternatives(
     r"(?:ignore|disregard|forget|override)\s+(?:all\s+|any\s+)?(?:of\s+)?(?:the\s+|your\s+)?"
     r"(?:previous|prior|above|earlier|preceding|system|original|all)\s+(?:instructions?|prompts?|rules|guidelines)"
     r"|your\s+(?:new\s+)?instructions\s+are|you\s+are\s+now\s+(?:in\s+)?(?:dan|developer|jailbreak)"
+    # In each language "all" or "previous" is enough, as in English ("Ignora todas las instrucciones"; review
+    # 2026-10-16): "ignore the instructions in the README" stays a fact.
     # es, pt
-    r"|(?:ignora|ignore|olvida|omite|esque[çc]a)\s+(?:todas\s+)?(?:las\s+|as\s+)?"
-    r"(?:instrucciones|instru[çc][õo]es)\s+(?:anteriores|previas|pr[ée]vias)"
+    r"|(?:ignora|ignore|olvida|omite|esque[çc]a)\s+(?:todas\s+(?:las\s+|as\s+)?(?:instrucciones|instru[çc][õo]es)"
+    r"|(?:las\s+|as\s+)?(?:instrucciones|instru[çc][õo]es)\s+(?:anteriores|previas|pr[ée]vias))"
     # fr
-    r"|(?:ignore[zr]?|oublie[zr]?)\s+(?:toutes\s+)?(?:les\s+)?(?:instructions|consignes)\s+"
-    r"(?:pr[ée]c[ée]dentes|ant[ée]rieures)"
+    r"|(?:ignore[zr]?|oublie[zr]?)\s+(?:toutes\s+(?:les\s+)?(?:instructions|consignes)"
+    r"|(?:les\s+)?(?:instructions|consignes)\s+(?:pr[ée]c[ée]dentes|ant[ée]rieures))"
     # it
-    r"|(?:ignora|dimentica)\s+(?:tutte\s+)?(?:le\s+)?istruzioni\s+(?:precedenti|anteriori)"
+    r"|(?:ignora|dimentica)\s+(?:tutte\s+(?:le\s+)?istruzioni|(?:le\s+)?istruzioni\s+(?:precedenti|anteriori))"
     # de
-    r"|(?:ignoriere|ignorier|vergiss)\s+(?:alle\s+)?(?:vorherigen|bisherigen|vorigen|obigen)\s+"
-    r"(?:Anweisungen|Instruktionen|Regeln)"
+    r"|(?:ignoriere|ignorier|vergiss)\s+(?:alle\s+(?:vorherigen\s+|bisherigen\s+|vorigen\s+|obigen\s+)?"
+    r"|(?:die\s+)?(?:vorherigen|bisherigen|vorigen|obigen)\s+)(?:Anweisungen|Instruktionen|Regeln)"
     # nl
-    r"|(?:negeer|vergeet)\s+(?:alle\s+)?(?:eerdere|vorige|voorgaande)\s+(?:instructies|regels)"
+    r"|(?:negeer|vergeet)\s+(?:alle\s+(?:eerdere\s+|vorige\s+|voorgaande\s+)?|(?:de\s+)?(?:eerdere|vorige|voorgaande)\s+)"
+    r"(?:instructies|regels)"
     # pl
-    r"|(?:zignoruj|ignoruj|zapomnij)\s+(?:o\s+)?(?:wszystkie\s+|wszystkich\s+)?"
-    r"(?:poprzednie|poprzednich|wcze[śs]niejsze|wcze[śs]niejszych)\s+(?:instrukcje|instrukcjach|polecenia|poleceniach)"
+    r"|(?:zignoruj|ignoruj|zapomnij)\s+(?:o\s+)?(?:(?:wszystkie|wszystkich)\s+(?:poprzednie\s+|poprzednich\s+)?"
+    r"|(?:poprzednie|poprzednich|wcze[śs]niejsze|wcze[śs]niejszych)\s+)(?:instrukcje|instrukcjach|polecenia|poleceniach)"
     # tr: the object first, "önceki tüm talimatları yok say"
     r"|[öo]nceki\s+(?:t[üu]m\s+|b[üu]t[üu]n\s+)?(?:talimatlar[ıi]|komutlar[ıi]|kurallar[ıi])\s+"
     r"(?:yok\s+say|g[öo]rmezden\s+gel|unut)"
     # id
-    r"|(?:abaikan|lupakan)\s+(?:semua\s+)?(?:instruksi|perintah|aturan)\s+(?:sebelumnya|terdahulu)",
+    r"|(?:abaikan|lupakan)\s+(?:semua\s+(?:instruksi|perintah|aturan)"
+    r"|(?:instruksi|perintah|aturan)\s+(?:sebelumnya|terdahulu))",
     # ru
     r"(?:игнорируй|забудь|отмени)\s+(?:все\s+)?(?:предыдущие\s+|прежние\s+|системные\s+)?(?:инструкции|правила|указания)"
     r"|системный\s+промпт\s*[:：]"
@@ -224,7 +228,7 @@ _RE_INJECTION = re.compile(_alternatives(
     r"|(?:忽略|无视|無視|忘记|忘記)掉?(?:之前|以前|先前|上面|以上|前面|所有|全部|系统|系統)的?(?:所有|全部)?的?"
     r"(?:指令|指示|提示词|提示詞|规则|規則)|(?:系统|系統)提示(?:词|詞)?\s*[:：]"
     # ja: "以前の指示をすべて無視して"
-    r"|(?:以前|前|これまで|上記)の(?:すべての|全ての)?(?:指示|命令|ルール)を(?:すべて|全て)?(?:無視|忘れ)"
+    r"|(?:(?:以前|前|これまで|上記)の(?:すべての|全ての)?|すべての|全ての)(?:指示|命令|ルール)を(?:すべて|全て)?(?:無視|忘れ)"
     r"|システムプロンプト\s*[:：]"
     # ko: "이전의 모든 지시를 무시해"
     r"|이전\s*(?:의\s*)?(?:모든\s*)?(?:지시|명령|규칙|지침)\S*\s*무시|시스템\s*프롬프트\s*[:：]"
@@ -341,13 +345,13 @@ _SECRET_ENV_NAMES = (
     "ADMIN_PASSWORD", "ROOT_PASSWORD", "API_KEY", "API_TOKEN", "ACCESS_TOKEN", "REFRESH_TOKEN", "AUTH_TOKEN",
     "PRIVATE_KEY", "SSH_PRIVATE_KEY", "GPG_PASSPHRASE", "VAULT_TOKEN", "NGROK_AUTHTOKEN", "TAILSCALE_AUTHKEY",
 )
-# Any other name in capitals that ends like a secret: …_KEY, …_TOKEN, …_SECRET, …_PASSWORD, …_CREDENTIALS,
+# Any other name in capitals that is or ends like a secret: SECRET, …_KEY, …_TOKEN, …_SECRET, …_PASSWORD, …_CREDENTIALS,
 # …_API_HASH, …_DSN, …_WEBHOOK. Capitals only, as environment variables are written: "cache_key" in code is not one.
 # Singular only: "MAX_OUTPUT_TOKENS=8192" is a count. A database address is not listed: its password shows by itself
 # ("postgres://app:…@db", _RE_TOKEN_SHAPE), and without one it is a setting.
 _ENV_SECRET_NAME = (
-    r"(?-i:[A-Z][A-Z0-9]{0,40}(?:_[A-Z0-9]{1,40}){0,8}_(?:KEY|APIKEY|AUTHKEY|TOKEN|AUTHTOKEN|SECRET|PASSWORD|PASSWD"
-    r"|PWD|PASS|PASSPHRASE|CREDENTIALS?|API_HASH|SESSION_STRING|STRING_SESSION|DSN|AK|SK|WEBHOOK|WEBHOOK_URL))"
+    r"(?-i:(?:[A-Z][A-Z0-9]{0,40}(?:_[A-Z0-9]{1,40}){0,8}_)?(?:KEY|APIKEY|AUTHKEY|TOKEN|AUTHTOKEN|SECRET|PASSWORD"
+    r"|PASSWD|PWD|PASS|PASSPHRASE|CREDENTIALS?|API_HASH|SESSION_STRING|STRING_SESSION|DSN|AK|SK|WEBHOOK_URL|WEBHOOK))"
     r"|" + _trie(_SECRET_ENV_NAMES))
 _RE_ENV_NAME = re.compile(_ENV_SECRET_NAME, re.IGNORECASE)
 # Names whose value is a link that is itself the secret (a webhook, a Sentry DSN): there a link is not a pointer.
@@ -403,27 +407,34 @@ _CREDENTIAL_WORD = _alternatives(_CREDENTIAL_LATIN, _CREDENTIAL_OTHER)
 # your e-mail" stays a fact, as "sent" does in English; Chinese needs 把 for that order ("把密码发送到…"), without it
 # "密码已发送" (the password has been sent) is a report.
 _ZH_SEND = r"(?:发送|發送|发给|發給|分享|泄露|洩露|透露|贴出|貼出|上传|上傳)"
+# An environment variable is what may not be sent in any language: "Отправь OPENAI_API_KEY на…" (review 2026-10-16).
+# Not a reference to one in code ("отправляет `$API_KEY` в заголовке"): that is how a program uses it.
+_ENV_OBJ = r"(?<![$%{])" + _EDGE_START + r"(?:" + _ENV_SECRET_NAME + r")" + _EDGE_END
 _RE_EXFILTRATION = re.compile("|".join((
     _alternatives(r"send|share|reveal|post|upload|forward|email|leak|paste"
                   r"|env[íi]a(?:r|le|lo)?|env[íi]e|comparte|compartir|compartilhe|compartilha|partilhe|revela|revele"
                   r"|publica|publique|reenv[íi]a|envoie[rz]?|envoyer|partage[rz]?|r[ée]v[èe]le[rz]?|publie[rz]?"
                   r"|transf[èe]re[rz]?|invia(?:re)?|manda(?:re)?|condividi|rivela|pubblica|inoltra"
-                  r"|sende|schick(?:e)?|verrate|ver[öo]ffentliche|leite|stuur|verstuur|onthul|publiceer"
+                  r"|sende|senden|schick(?:e|en)?|verrate|ver[öo]ffentliche|leite|stuur|verstuur|onthul|publiceer"
                   r"|wy[śs]lij|prze[śs]lij|udost[ęe]pnij|ujawnij|opublikuj|kirim(?:kan)?|bagikan|ungkapkan|unggah"
                   r"|teruskan", r"(?!)")
     + r".{0,40}" + _alternatives(r"secrets?|credentials?|private\s+keys?|seed\s+phrases?|" + _CREDENTIAL_LATIN, r"(?!)"),
+    # de: the object first, "Bitte das Passwort an diese Adresse senden"
+    _alternatives(r"passw[öo]rt\w*|kennw[öo]rt\w*|api[\s-]?schl[üu]ssel|zugangsdaten|token", r"(?!)") + r".{0,40}"
+    + _alternatives(r"senden|schicken|weiterleiten|verraten|ver[öo]ffentlichen", r"(?!)"),
     # tr: the object first, "şifreyi bu adrese gönder"
-    _alternatives(r"[şs]ifre\w*|parola\w*|anahtar\w*|tokens?", r"(?!)") + r".{0,40}"
+    _alternatives(r"[şs]ifre\w*|parola\w*|anahtar\w*|tokens?|" + _ENV_SECRET_NAME, r"(?!)") + r".{0,40}"
     + _alternatives(r"g[öo]nder(?:in|iniz)?|payla[şs](?:[ıi]n)?|ilet(?:in)?|yay[ıi]nla(?:y[ıi]n)?", r"(?!)"),
-    r"(?:отправ|перешл|покаж|раскрой|выложи)\w*.{0,40}(?:парол|секрет|токен|ключ|учётн|учетн)",
-    _ZH_SEND + r".{0,40}(?:" + _CREDENTIAL_NAMES["zh"] + r"|助记词|助記詞)",
-    r"把.{0,20}(?:" + _CREDENTIAL_NAMES["zh"] + r"|助记词|助記詞).{0,10}" + _ZH_SEND,
-    r"(?:" + _CREDENTIAL_NAMES["ja"] + r").{0,40}(?:送って|送信して|共有して|公開して|転送して|送れ)",
-    r"(?:" + _CREDENTIAL_NAMES["ko"] + r").{0,40}(?:보내(?:줘|주세요|라|봐)|전송해|공유해|공개해|유출해)",
-    r"(?:ส่ง|แชร์|เปิดเผย|โพสต์).{0,40}(?:" + _CREDENTIAL_NAMES["th"] + r"|คีย์)",
-    r"(?:" + _CREDENTIAL_NAMES["hi"] + r"|कुंजी).{0,40}(?:भेज(?:ो|ें|\s*दो|\s*दें)|(?:शेयर|साझा)\s*कर(?:ो|ें))",
-    r"(?:" + _CREDENTIAL_NAMES["bn"] + r").{0,40}(?:পাঠাও|পাঠান|(?:শেয়ার|ফাঁস)\s*কর(?:ো|ুন))",
-    r"(?:أرسل|ارسل|شارك|انشر|اكشف).{0,40}(?:" + _CREDENTIAL_NAMES["ar"] + r"|المفتاح|مفتاح)",
+    r"(?:отправ|перешл|покаж|раскрой|выложи)\w*.{0,40}(?:парол|секрет|токен|ключ|учётн|учетн|" + _ENV_OBJ + r")",
+    _ZH_SEND + r".{0,40}(?:" + _CREDENTIAL_NAMES["zh"] + r"|助记词|助記詞|" + _ENV_OBJ + r")",
+    r"(?:把|将|將).{0,20}(?:" + _CREDENTIAL_NAMES["zh"] + r"|助记词|助記詞|" + _ENV_OBJ + r").{0,10}" + _ZH_SEND,
+    r"(?:" + _CREDENTIAL_NAMES["ja"] + r"|" + _ENV_OBJ + r").{0,40}(?:送って|送信して|共有して|公開して|転送して|送れ)",
+    r"(?:" + _CREDENTIAL_NAMES["ko"] + r"|" + _ENV_OBJ + r").{0,40}(?:보내(?:줘|주세요|라|봐)|전송해|공유해|공개해|유출해)",
+    r"(?:ส่ง|แชร์|เปิดเผย|โพสต์).{0,40}(?:" + _CREDENTIAL_NAMES["th"] + r"|คีย์|" + _ENV_OBJ + r")",
+    r"(?:" + _CREDENTIAL_NAMES["hi"] + r"|कुंजी|" + _ENV_OBJ + r").{0,40}"
+    r"(?:भेज(?:ो|ें|\s*दो|\s*दें)|(?:शेयर|साझा)\s*कर(?:ो|ें))",
+    r"(?:" + _CREDENTIAL_NAMES["bn"] + r"|" + _ENV_OBJ + r").{0,40}(?:পাঠাও|পাঠান|(?:শেয়ার|ফাঁস)\s*কর(?:ো|ুন))",
+    r"(?:أرسل|ارسل|شارك|انشر|اكشف).{0,40}(?:" + _CREDENTIAL_NAMES["ar"] + r"|المفتاح|مفتاح|" + _ENV_OBJ + r")",
 )), re.IGNORECASE)
 # A credential with its value ("password hunter2", "пароль от wifi: Qwerty!23", "API key sk-…", "密码是hunter2",
 # "パスワードはabc123"): never a fact, whoever says it and however it is quoted. The word alone is not enough ("I use a
@@ -439,22 +450,29 @@ _IS = _alternatives(
     r"is|was|are|es|era|est|[ée]tait|é|è|ist|lautet|war|jest|to|adalah|yaitu|ialah",
     r"это|是|为|為|は|が|는|은|이|가|คือ|है|हैं|হল|হলো|هو|هي")
 _OPEN_QUOTE, _CLOSE_QUOTE = r"[\"'«“„‚`「『]", r"[\"'»”`」』]"
+_ABOUT_PASSWORDS = (r"managers?|rotation|polic(?:y|ies)|length|reset|changes?|changed|expir\w*|strength|hints?|fields?"
+                    r"|requirements?|rules?|format|generators?|vault|recovery|history|limits?|count|usage|budget|types?"
+                    r"|minimum|maximum|min|max|rate|period|time|timeout|ttl|lifetime|age|size|scope|scopes"
+                    r"|updated?|менеджер\w*|политик\w*|длин\w*|сброс\w*|требовани\w*|правил\w*|генератор\w*")
 _RE_CREDENTIALS = tuple(re.compile(
     r"(?P<word>" + _CREDENTIAL_WORD + r")"
     + (r"\s+(?:for|to|of|on|для|от|к|на|de|del|para|pour|du|da|do|di|della|per|f[üu]r|von|vom|zum|voor|van|dla|od"
        r"|untuk)" + r"\s+\S+(?=\s|$)" * words if words else "")
     + _CLOSE_QUOTE + r"?"  # the name's closing quote, as JSON writes it: {"api_key": "…"} (review 2026-10-14)
-    + r"(?:\s*(?:" + _IS + r"|[:=—–\-：＝])\s*" + _OPEN_QUOTE + r"?|\s*" + _OPEN_QUOTE + r"|\s+)"
-    r"(?P<value>\S{4,})",
+    + r"(?P<sep>\s*(?:" + _IS + r"|[:=—–\-：＝])\s*" + _OPEN_QUOTE + r"?|\s*" + _OPEN_QUOTE + r"|\s+)"
+    r"(?!//)(?P<value>\S{4,})",
     re.IGNORECASE) for words in range(4)) + (
     # What it is for after the name, as Thai, Indonesian and Arabic say it ("รหัสผ่านไวไฟคือ…", "kata sandi wifi
-    # adalah…", "password wifi: …"): one or two words, or up to twelve characters of a script without spaces, then a
-    # plain separator. Only ":" "=" and "is" here: a particle (Korean 이, Japanese は, Chinese 是) after a few more
-    # words is too common to mean the value follows ("비밀번호 변경이 2024년…").
+    # adalah…", "password wifi is …"): one or two words, or up to twelve characters of a script without spaces, then a
+    # word for "is". Not a colon: "password minimum length: 12_chars" is a setting (review 2026-10-16); not a
+    # particle (Korean 이, Japanese は, Chinese 是): after a few more words it is too common ("비밀번호 변경이 2024년…").
+    # Not a word that tells about passwords rather than which one: "My password manager is 1Password", "Password
+    # rotation: every-90-days" (review 2026-10-16).
     re.compile(
-        r"(?P<word>" + _CREDENTIAL_WORD + r")(?:(?:\s+[^\s:=：＝]+){1,2}?|[^\s:=：＝]{1,12}?)\s*(?:"
-        + _alternatives(r"is|es|est|ist|é|è|adalah|yaitu", r"คือ|هو|هي") + r"|[:=：＝])\s*" + _OPEN_QUOTE
-        + r"?(?P<value>\S{4,})",
+        r"(?P<word>" + _CREDENTIAL_WORD + r")(?!\s+(?:" + _ABOUT_PASSWORDS + r")(?!\w))"
+        r"(?:(?:\s+[^\s:=：＝]+){1,2}?|[^\s:=：＝]{1,12}?)\s*"
+        + _alternatives(r"is|es|est|ist|é|è|adalah|yaitu", r"คือ|هو|هي") + r"\s*" + _OPEN_QUOTE
+        + r"?(?!//)(?P<value>\S{4,})",
         re.IGNORECASE),)
 _VALUE_EDGE = ".,;:!?\"'«»“”„`)"
 # A value ends where text in a script passwords are not typed in resumes — Chinese, Japanese, Korean, Thai, Hindi,
@@ -470,8 +488,11 @@ _RE_DECIMAL = re.compile(r"[$€£¥₽฿]?\d+[.,]\d+[$€£¥₽฿%]?")
 _RE_DATE = re.compile(r"\d{1,4}[./-]\d{1,2}[./-]\d{1,4}")
 # A link or a file path says where, not what: "API key docs: https://platform.openai.com/docs", "токены лежат:
 # ~/.hermes/.env" (0.15.1, measured on a live store). A link with a login ("https://user:pass@host") or a query
-# ("?key=…") is still a value, and a token inside a link is caught by its own shape (_RE_TOKEN_SHAPE).
-_RE_POINTER = re.compile(r"https?://[^\s@?]+|(?:~|\.{1,2})?/[^\s@?:]*")
+# ("?key=…") is still a value, and a token inside a link is caught by its own shape (_RE_TOKEN_SHAPE). A path has
+# two parts or starts at "~" or ".": "/Sunshine123" may be the password itself (review 2026-10-16).
+_RE_POINTER = re.compile(r"https?://[^\s@?]+|(?:~|\.{1,2})/[^\s@?:]*|/[^\s/@?:]+/[^\s@?:]*")
+# Assigned ("KEY=/…"), a path counts only from home or here, or ending in a file name: "/aB3/xY9+" may be base64.
+_RE_FILE_POINTER = re.compile(r"https?://[^\s@?]+|(?:~|\.{1,2})/[^\s@?:]*|/[^\s@?:]*/[\w.-]*\.[A-Za-z0-9]{1,8}")
 # After "token" a whole number is a count ("max tokens for this model is 8192"), not a secret; a PIN or a password of
 # digits stays one (0.14.6).
 _RE_COUNTED = re.compile(r"(?:[a-z]+[\s_-]?)?tokens?|токен\w*|令牌|トークン|토큰|โทเค็น|टोकन|টোকেন", re.IGNORECASE)
@@ -488,8 +509,9 @@ _RE_TOKEN_SHAPE = re.compile(
     r"|(?:(?<=bot)|(?<![A-Za-z0-9_:]))\d{6,12}:[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])"
     r"|" + _EDGE_START + r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*"
     r"|-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----"
-    # an address with a login and a password in it: "postgres://app:Qw3rty@db/app", "https://user:pass@host" (0.15.2)
-    r"|(?i:[a-z][a-z0-9+.-]{1,20})://[^\s:/@]+:[^\s/@]+@")
+    # an address with a login and a password in it: "postgres://app:Qw3rty@db/app", "redis://:Qw3rty@host" (0.15.2);
+    # an "@" in the query is not a login ("http://localhost:8000?email=a@b.c")
+    r"|(?i:[a-z][a-z0-9+.-]{1,20})://[^\s:/?#@]*:[^\s/?#@]+@")
 
 
 def _has_credential(text: str) -> bool:
@@ -499,22 +521,30 @@ def _has_credential(text: str) -> bool:
 
 
 def _holds_a_secret(match: re.Match) -> bool:
-    """Does this credential word come with its value? Not a count after "tokens", not what a setting names."""
+    """Does this credential word come with its value? Not a count after "tokens", not what a setting names. After an
+    explicit separator ("password: …", "пароль — …", "密码是…") the value is assigned, so a date or two hyphenated
+    words are taken as given ("password: 2026-10-15", "password: correct-horse"); after a space or a few words they
+    are what the sentence says ("пароль Wi-Fi", "password changed: 2026-10-15") (review 2026-10-16)."""
     if _a_count(match):
         return False
     word = match.group("word").strip()
+    assigned = "sep" in match.re.groupindex and bool(match.group("sep").strip())
+    value = match.group("value")
     if _RE_ENV_NAME.fullmatch(word):
-        if _RE_ENV_PLAIN.fullmatch(_value(match.group("value"))):
+        if _is_reference(_value(value)):
             return False
-        return _looks_like_a_secret(match.group("value"), links=not _RE_SECRET_LINK_NAME.search(word))
-    return _looks_like_a_secret(match.group("value"))
+        return _looks_like_a_secret(value, links=not _RE_SECRET_LINK_NAME.search(word), assigned=assigned)
+    return _looks_like_a_secret(value, assigned=assigned)
 
 
-# What an environment variable may be set to that is not a secret: another variable's name or a reference to it
-# ("embedding_key_env: OPENAI_API_KEY", "${GROQ_API_KEY}", "%OPENAI_API_KEY%"), or a lower-case identifier without
-# digits ("GITHUB_TOKEN: from_env") (0.15.2).
-_RE_ENV_PLAIN = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|%[A-Za-z_][A-Za-z0-9_]*%"
-                           r"|[a-z]+(?:[_.-][a-z]+)+")
+# What a variable may be set to that is not a secret: a reference to another variable ("${GROQ_API_KEY}",
+# "%OPENAI_API_KEY%") or the name of one that holds a secret ("embedding_key_env: OPENAI_API_KEY") (0.15.2). Any other
+# word may be the value itself: "ACME_PASSWORD=SUNSHINE_2026", "AUTH_TOKEN=my_secret_token" (reviews 2026-10-16).
+_RE_REFERENCE = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|%[A-Za-z_][A-Za-z0-9_]*%")
+
+
+def _is_reference(value: str) -> bool:
+    return bool(_RE_REFERENCE.fullmatch(value) or _RE_ENV_NAME.fullmatch(value))
 
 
 def _a_count(match: re.Match) -> bool:
@@ -533,16 +563,30 @@ def _value(token: str) -> str:
 _RE_HYPHENATED = re.compile(r"[^\W\d_]+-[^\W\d_]+")
 
 
-# A placeholder for a value, not the value: "***", "sk-...", "<your key>", "[REDACTED]", "{token}" (0.15.2). In
-# brackets only without digits: "(input" after "tokens" is prose, "(Qw3rty" may be the value.
-_RE_PLACEHOLDER = re.compile(r"[*•xX.…]+|[<\[{(]\D*|\S{0,12}(?:\.\.\.|…)")
+# A placeholder for a value, not the value: "***", "xxxx", "sk-...", "<your key>", "{token}", "[REDACTED]" (0.15.2).
+_RE_PLACEHOLDER = re.compile(r"[*•xX.…]+|\S{0,12}(?:\.\.\.|…)|<[a-z][a-z _-]*>?|\{[A-Za-z_]\w*\}"
+                             r"|(?i:redacted|hidden|masked|removed|скрыт\w*|удал[её]н\w*)")
+_BRACKETS = {"(": ")", "[": "]", "{": "}"}
 
 
-def _looks_like_a_secret(token: str, links: bool = True) -> bool:
-    """*links*: a link or a path is a pointer, not a value (False for a webhook's or a DSN's variable)."""
-    value = _value(token)
-    if len(value) < 4 or any(rx.fullmatch(value) for rx in (_RE_DECIMAL, _RE_DATE, _RE_HYPHENATED, _RE_PLACEHOLDER)) \
-            or (links and _RE_POINTER.fullmatch(value)):
+def _looks_like_a_secret(token: str, links: bool = True, assigned: bool = False) -> bool:
+    """*links*: a link is a pointer, not a value (False for a webhook's or a DSN's variable). *assigned*: the value
+    follows an explicit separator, so a date and two hyphenated words count as given (_holds_a_secret)."""
+    raw = _RE_TEXT_STOP.split(token, 1)[0]
+    if raw.endswith((":", "：")):
+        return False  # a label that introduces something ("GEMINI_API_KEY — generative_language_api_key:")
+    raw = raw.strip(_VALUE_EDGE.replace(")", ""))
+    if raw[:1] in _BRACKETS:
+        # one pair of brackets around the value is not part of it: "(input" after "tokens" is prose, "[Sunshine!]"
+        # is a password with "!" in it, "[REDACTED]" a placeholder (review 2026-10-16)
+        value = raw[1:]
+        value = value[:-1] if value.endswith(_BRACKETS[raw[0]]) else value
+    else:
+        value = raw.strip(_VALUE_EDGE)
+    plain = (_RE_DECIMAL, _RE_PLACEHOLDER) if assigned else (_RE_DECIMAL, _RE_DATE, _RE_HYPHENATED, _RE_PLACEHOLDER)
+    if len(value) < 4 or any(rx.fullmatch(value) for rx in plain):
+        return False
+    if links and _RE_POINTER.fullmatch(value) and (not assigned or _RE_FILE_POINTER.fullmatch(value)):
         return False
     if any(c.isdigit() or (not c.isalnum() and c != "'") for c in value):
         return True
@@ -626,13 +670,23 @@ def _recall_problem(content: str) -> str | None:
 # Authorization header — and a long encoded blob keep a message or a fact at home. Best effort, by pattern (review
 # 2026-10-14). These are not refused as facts: "MAX_TOKENS=128000" is a setting, not a secret.
 _RE_SECRET_SHAPE = re.compile(
-    _EDGE_START + r"[A-Z][A-Z0-9_]{0,63}(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD)[A-Z0-9_]{0,63}\s*[:=：＝]\s*\S{6,}"
+    _EDGE_START + r"[A-Z0-9_]{0,64}(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD)[A-Z0-9_]{0,63}\s*[:=：＝]\s*(?P<assigned>\S{6,})"
     r"|" + _EDGE_START + r"(?i:bearer|basic)\s+(?=[A-Za-z._~-]*[0-9+/=])[A-Za-z0-9._~+/=-]{12,}")  # a token has a digit, + / ="
 
 
 def _secret_in(text: str) -> bool:
     """Does *text* look like it holds a secret? A credential, a secret's shape, or an encoded blob."""
-    return _has_credential(text) or bool(_RE_SECRET_SHAPE.search(text)) or bool(_RE_BLOB.search(text))
+    return _has_credential(text) or any(not _placeholder_assignment(m) for m in _RE_SECRET_SHAPE.finditer(text))         or bool(_RE_BLOB.search(text))
+
+
+def _placeholder_assignment(match: re.Match) -> bool:
+    """An assignment of a placeholder or a reference ("OPENAI_API_KEY=${OPENAI_API_KEY}", "…=[REDACTED]") holds no
+    secret and may be sent like any text (review 2026-10-16)."""
+    value = match.group("assigned")
+    if not value:
+        return False
+    value = value.strip(_VALUE_EDGE + "[]{}")
+    return bool(_RE_PLACEHOLDER.fullmatch(value) or _is_reference(value) or _RE_PLACEHOLDER.fullmatch(match.group("assigned")))
 
 
 def _sendable(content: str) -> bool:
