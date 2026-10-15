@@ -175,40 +175,194 @@ def _extract_floor(text: str) -> int:
 # What a fact must not be. Facts are injected into later prompts, so instructions and tool transcripts stored as
 # "facts" would be replayed as context; refused with the reason, so the agent can rewrite it.
 _FACT_MAX_CHARS = 1000
+# Where a Latin word or a token starts and ends: no Latin letter, digit or "_" next to it. Not \b: Python counts a
+# Chinese, Japanese or Thai character as a word character, and those languages write no spaces, so in "密钥是sk-…" or
+# "请ignore all previous instructions" \b found no edge and the screens below saw nothing (0.15.1, njwangfeng in #3).
+# Words of other scripts get no edges at all, for the same reason.
+_EDGE_START, _EDGE_END = r"(?<![0-9A-Za-z_À-ɏ])", r"(?![0-9A-Za-z_À-ɏ])"
+
+
+def _alternatives(latin: str, other: str) -> str:
+    """One alternation: Latin-script words held to the edges, words of other scripts as they are."""
+    return r"(?:" + _EDGE_START + r"(?:" + latin + r")" + _EDGE_END + r"|" + other + r")"
+
+
+# The screens below speak every language the plugin matches words in: English, Russian, Chinese, Japanese, Korean,
+# Thai, Spanish, French, Portuguese, Italian, German, Dutch, Polish, Turkish, Indonesian, Hindi, Arabic and Bengali
+# (0.15.1; English and Russian only before, Chinese from the first fix of 0.15.1).
 # Classic injection phrasing only: "ignore previous instructions", not "Anton asks me to ignore style rules in drafts".
-_RE_INJECTION = re.compile(
-    r"\b(?:ignore|disregard|forget|override)\s+(?:all\s+|any\s+)?(?:of\s+)?(?:the\s+|your\s+)?"
-    r"(?:previous|prior|above|earlier|preceding|system|original|all)\s+(?:instructions?|prompts?|rules|guidelines)\b"
-    r"|\byour\s+(?:new\s+)?instructions\s+are\b|\bsystem\s+prompt\s*:|\byou\s+are\s+now\s+(?:in\s+)?(?:dan|developer|jailbreak)"
-    r"|(?:игнорируй|забудь|отмени)\s+(?:все\s+)?(?:предыдущие\s+|прежние\s+|системные\s+)?(?:инструкции|правила|указания)"
-    r"|системный\s+промпт\s*:",
+_RE_INJECTION = re.compile(_alternatives(
+    # en
+    r"(?:ignore|disregard|forget|override)\s+(?:all\s+|any\s+)?(?:of\s+)?(?:the\s+|your\s+)?"
+    r"(?:previous|prior|above|earlier|preceding|system|original|all)\s+(?:instructions?|prompts?|rules|guidelines)"
+    r"|your\s+(?:new\s+)?instructions\s+are|you\s+are\s+now\s+(?:in\s+)?(?:dan|developer|jailbreak)"
+    # es, pt
+    r"|(?:ignora|ignore|olvida|omite|esque[çc]a)\s+(?:todas\s+)?(?:las\s+|as\s+)?"
+    r"(?:instrucciones|instru[çc][õo]es)\s+(?:anteriores|previas|pr[ée]vias)"
+    # fr
+    r"|(?:ignore[zr]?|oublie[zr]?)\s+(?:toutes\s+)?(?:les\s+)?(?:instructions|consignes)\s+"
+    r"(?:pr[ée]c[ée]dentes|ant[ée]rieures)"
+    # it
+    r"|(?:ignora|dimentica)\s+(?:tutte\s+)?(?:le\s+)?istruzioni\s+(?:precedenti|anteriori)"
+    # de
+    r"|(?:ignoriere|ignorier|vergiss)\s+(?:alle\s+)?(?:vorherigen|bisherigen|vorigen|obigen)\s+"
+    r"(?:Anweisungen|Instruktionen|Regeln)"
+    # nl
+    r"|(?:negeer|vergeet)\s+(?:alle\s+)?(?:eerdere|vorige|voorgaande)\s+(?:instructies|regels)"
+    # pl
+    r"|(?:zignoruj|ignoruj|zapomnij)\s+(?:o\s+)?(?:wszystkie\s+|wszystkich\s+)?"
+    r"(?:poprzednie|poprzednich|wcze[śs]niejsze|wcze[śs]niejszych)\s+(?:instrukcje|instrukcjach|polecenia|poleceniach)"
+    # tr: the object first, "önceki tüm talimatları yok say"
+    r"|[öo]nceki\s+(?:t[üu]m\s+|b[üu]t[üu]n\s+)?(?:talimatlar[ıi]|komutlar[ıi]|kurallar[ıi])\s+"
+    r"(?:yok\s+say|g[öo]rmezden\s+gel|unut)"
+    # id
+    r"|(?:abaikan|lupakan)\s+(?:semua\s+)?(?:instruksi|perintah|aturan)\s+(?:sebelumnya|terdahulu)",
+    # ru
+    r"(?:игнорируй|забудь|отмени)\s+(?:все\s+)?(?:предыдущие\s+|прежние\s+|системные\s+)?(?:инструкции|правила|указания)"
+    r"|системный\s+промпт\s*[:：]"
+    # zh: "忽略之前的所有指令" (ignore all previous instructions), "系统提示词：" (system prompt:)
+    r"|(?:忽略|无视|無視|忘记|忘記)掉?(?:之前|以前|先前|上面|以上|前面|所有|全部|系统|系統)的?(?:所有|全部)?的?"
+    r"(?:指令|指示|提示词|提示詞|规则|規則)|(?:系统|系統)提示(?:词|詞)?\s*[:：]"
+    # ja: "以前の指示をすべて無視して"
+    r"|(?:以前|前|これまで|上記)の(?:すべての|全ての)?(?:指示|命令|ルール)を(?:すべて|全て)?(?:無視|忘れ)"
+    r"|システムプロンプト\s*[:：]"
+    # ko: "이전의 모든 지시를 무시해"
+    r"|이전\s*(?:의\s*)?(?:모든\s*)?(?:지시|명령|규칙|지침)\S*\s*무시|시스템\s*프롬프트\s*[:：]"
+    # th: "เพิกเฉยต่อคำสั่งก่อนหน้าทั้งหมด"
+    r"|(?:เพิกเฉย(?:ต่อ)?|ละเว้น|ไม่ต้องสนใจ|ลืม)\s*(?:คำสั่ง|คำแนะนำ|กฎ)(?:ทั้งหมด)?\s*(?:ก่อนหน้า|ที่ผ่านมา|ข้างต้น)"
+    r"|พรอมต์ระบบ\s*[:：]"
+    # hi: "पिछले सभी निर्देशों को अनदेखा करो"
+    r"|पिछल[ेी]\s+(?:सभी\s+|सारे\s+)?(?:निर्देशों|निर्देश|नियमों)\s+(?:को\s+)?(?:अनदेखा|नज़रअंदाज़|नजरअंदाज|भूल)"
+    r"|सिस्टम\s+प्रॉम्प्ट\s*[:：]"
+    # ar: "تجاهل جميع التعليمات السابقة"
+    r"|(?:تجاهل|انس|إنس)\s+(?:جميع\s+|كل\s+)?(?:التعليمات|الأوامر|القواعد)\s+السابقة"
+    # bn: "আগের সব নির্দেশ উপেক্ষা কর"
+    r"|(?:আগের|পূর্ববর্তী)\s+(?:সব\s+|সকল\s+)?(?:নির্দেশ|নির্দেশনা|নিয়ম)\S*\s+(?:উপেক্ষা|ভুলে)")
+    # "system prompt:" in the Latin languages: an edge before it, none after the colon
+    + r"|" + _EDGE_START + r"(?:system\s+prompt|prompt\s+(?:del|do|di)\s+sistema|prompt\s+syst[èe]me|systemprompt"
+    r"|systeemprompt|prompt\s+systemowy|sistem\s+istemi|prompt\s+sistem)\s*[:：]",
     re.IGNORECASE)
-# Asking the assistant to hand credentials to someone: an instruction to act, never a fact about the user.
-_RE_EXFILTRATION = re.compile(
-    r"\b(?:send|share|reveal|post|upload|forward|email|leak|paste)\b.{0,40}\b(?:passwords?|secrets?|tokens?|api[\s_-]?keys?|"
-    r"credentials?|private\s+keys?|seed\s+phrases?)\b"
-    r"|(?:отправ|перешл|покаж|раскрой|выложи)\w*.{0,40}(?:парол|секрет|токен|ключ|учётн|учетн)",
-    re.IGNORECASE)
-# A credential with its value ("password hunter2", "пароль от wifi: Qwerty!23", "API key sk-…"): never a fact,
-# whoever says it and however it is quoted. The word alone is not enough ("I use a password manager", "the token
-# expires"): the value must look like one — a digit or a symbol in it, or twelve characters and more that are not one
-# lower-case word ("API key authentication"); a decimal number is a price, not a PIN ("the token is 0.125 USD").
+
+# What a credential is called, per language. Latin-script words are held to the edges; "pin" alone is English, and a
+# "PIN code" in other words ("código PIN", "PIN-Code") is listed with them. Hindi "पिन कोड" is left out: in India it is
+# also the postal code.
+_CREDENTIAL_LATIN = (
+    # en
+    r"pass(?:words?|phrases?|codes?)|pwd|pins?(?:[\s-]?codes?)?|pincode|api[\s_-]?keys?"
+    r"|(?:access|auth|bearer|refresh)[\s_-]?tokens?|secret[\s_-]?keys?|tokens?|otp|2fa\s+codes?"
+    # es, pt
+    r"|contrase[ñn]as?|senhas?|claves?\s+(?:de\s+(?:la\s+)?)?api|chaves?\s+(?:de\s+|da\s+)?api|clave\s+secreta"
+    r"|chave\s+secreta|c[óo]digo\s+(?:pin|de\s+verificaci[óo]n|de\s+verifica[çc][ãa]o|de\s+acceso|de\s+acesso)"
+    # fr
+    r"|mots?\s+de\s+passe|cl[ée]s?\s+(?:d['’]\s*)?api|cl[ée]\s+secr[èe]te|code\s+(?:pin|de\s+v[ée]rification|d['’]acc[èe]s)"
+    # it
+    r"|chiav[ei]\s+(?:dell['’]\s*|di\s+)?api|chiave\s+segreta|codice\s+(?:pin|di\s+verifica|di\s+accesso)"
+    r"|parola\s+d['’]ordine"
+    # de
+    r"|passw[öo]rt(?:er|e)?|kennw[öo]rt(?:er|e)?|api[\s-]?schl[üu]ssel|geheimschl[üu]ssel|zugangscode"
+    r"|best[äa]tigungscode"
+    # nl
+    r"|wachtwoord(?:en)?|api[\s-]?sleutel|geheime\s+sleutel|verificatiecode|toegangscode"
+    # pl
+    r"|has[łl](?:o|a|em|u)|ha[śs]le|klucz(?:a|em)?\s+api|klucz\s+tajny|kod(?:u)?\s+(?:pin|weryfikacyjny|dost[ęe]pu)"
+    # tr
+    r"|[şs]ifre(?:si|n|niz|m|yi)?|parola(?:s[ıi]|n[ıi]z|m)|api\s+anahtar[ıi]?|gizli\s+anahtar|do[ğg]rulama\s+kodu"
+    r"|pin\s+kodu"
+    # id
+    r"|kata\s+sandi|sandi|kunci\s+(?:rahasia|api)|kode\s+(?:pin|verifikasi|otp|akses)")
+_CREDENTIAL_NAMES = {
+    "ru": r"парол[ьяюеи]|пин[\s-]?код\w*|токен\w*|ключ\w*\s+api|api[\s-]?ключ\w*|секретн\w*\s+ключ\w*"
+          r"|код\w*\s+(?:подтверждения|доступа)",
+    "zh": r"密码|密碼|口令|密钥|密鑰|金钥|金鑰|私钥|私鑰|令牌|验证码|驗證碼",
+    "ja": r"パスワード|暗証番号|APIキー|ＡＰＩキー|秘密鍵|トークン|認証コード|確認コード|PINコード",
+    "ko": r"비밀번호|패스워드|암호|API\s*키|비밀\s*키|토큰|인증\s*번호|인증\s*코드|PIN\s*번호",
+    "th": r"รหัสผ่าน|รหัส\s*(?:PIN|OTP|ยืนยัน)|รหัสพิน|โทเค็น|คีย์\s*API|API\s*คีย์",
+    "hi": r"पासवर्ड|ओटीपी|टोकन|एपीआई\s*कुंजी|गुप्त\s*कुंजी|कूटशब्द",
+    "bn": r"পাসওয়ার্ড|ওটিপি|টোকেন|এপিআই\s*কী|গোপন\s*কী|পিন\s*কোড",
+    "ar": r"كلمة\s+(?:ال)?مرور|كلمة\s+(?:ال)?سر|الرقم\s+السري|رمز\s+(?:ال)?تحقق|مفتاح\s+(?:ال)?api|المفتاح\s+السري"
+          r"|رمز\s+(?:ال)?دخول",
+}
+_CREDENTIAL_OTHER = "|".join(_CREDENTIAL_NAMES.values())
+_CREDENTIAL_WORD = _alternatives(_CREDENTIAL_LATIN, _CREDENTIAL_OTHER)
+# Asking the assistant to hand credentials to someone: an instruction to act, never a fact about the user. The verb and
+# the credential are paired within a language (the Latin languages count as one): an English "POST" next to a Russian
+# "токен" is an HTTP request, not a request to leak it. Languages that put the verb after the object ("şifreyi gönder",
+# "パスワードを送って", "비밀번호를 보내줘", "पासवर्ड भेजो") have only their request forms, so "the password was sent to
+# your e-mail" stays a fact, as "sent" does in English; Chinese needs 把 for that order ("把密码发送到…"), without it
+# "密码已发送" (the password has been sent) is a report.
+_ZH_SEND = r"(?:发送|發送|发给|發給|分享|泄露|洩露|透露|贴出|貼出|上传|上傳)"
+_RE_EXFILTRATION = re.compile("|".join((
+    _alternatives(r"send|share|reveal|post|upload|forward|email|leak|paste"
+                  r"|env[íi]a(?:r|le|lo)?|env[íi]e|comparte|compartir|compartilhe|compartilha|partilhe|revela|revele"
+                  r"|publica|publique|reenv[íi]a|envoie[rz]?|envoyer|partage[rz]?|r[ée]v[èe]le[rz]?|publie[rz]?"
+                  r"|transf[èe]re[rz]?|invia(?:re)?|manda(?:re)?|condividi|rivela|pubblica|inoltra"
+                  r"|sende|schick(?:e)?|verrate|ver[öo]ffentliche|leite|stuur|verstuur|onthul|publiceer"
+                  r"|wy[śs]lij|prze[śs]lij|udost[ęe]pnij|ujawnij|opublikuj|kirim(?:kan)?|bagikan|ungkapkan|unggah"
+                  r"|teruskan", r"(?!)")
+    + r".{0,40}" + _alternatives(r"secrets?|credentials?|private\s+keys?|seed\s+phrases?|" + _CREDENTIAL_LATIN, r"(?!)"),
+    # tr: the object first, "şifreyi bu adrese gönder"
+    _alternatives(r"[şs]ifre\w*|parola\w*|anahtar\w*|tokens?", r"(?!)") + r".{0,40}"
+    + _alternatives(r"g[öo]nder(?:in|iniz)?|payla[şs](?:[ıi]n)?|ilet(?:in)?|yay[ıi]nla(?:y[ıi]n)?", r"(?!)"),
+    r"(?:отправ|перешл|покаж|раскрой|выложи)\w*.{0,40}(?:парол|секрет|токен|ключ|учётн|учетн)",
+    _ZH_SEND + r".{0,40}(?:" + _CREDENTIAL_NAMES["zh"] + r"|助记词|助記詞)",
+    r"把.{0,20}(?:" + _CREDENTIAL_NAMES["zh"] + r"|助记词|助記詞).{0,10}" + _ZH_SEND,
+    r"(?:" + _CREDENTIAL_NAMES["ja"] + r").{0,40}(?:送って|送信して|共有して|公開して|転送して|送れ)",
+    r"(?:" + _CREDENTIAL_NAMES["ko"] + r").{0,40}(?:보내(?:줘|주세요|라|봐)|전송해|공유해|공개해|유출해)",
+    r"(?:ส่ง|แชร์|เปิดเผย|โพสต์).{0,40}(?:" + _CREDENTIAL_NAMES["th"] + r"|คีย์)",
+    r"(?:" + _CREDENTIAL_NAMES["hi"] + r"|कुंजी).{0,40}(?:भेज(?:ो|ें|\s*दो|\s*दें)|(?:शेयर|साझा)\s*कर(?:ो|ें))",
+    r"(?:" + _CREDENTIAL_NAMES["bn"] + r").{0,40}(?:পাঠাও|পাঠান|(?:শেয়ার|ফাঁস)\s*কর(?:ো|ুন))",
+    r"(?:أرسل|ارسل|شارك|انشر|اكشف).{0,40}(?:" + _CREDENTIAL_NAMES["ar"] + r"|المفتاح|مفتاح)",
+)), re.IGNORECASE)
+# A credential with its value ("password hunter2", "пароль от wifi: Qwerty!23", "API key sk-…", "密码是hunter2",
+# "パスワードはabc123"): never a fact, whoever says it and however it is quoted. The word alone is not enough ("I use a
+# password manager", "the token expires"): the value must look like one — a digit or a symbol in it, or twelve
+# characters and more that are not one lower-case word ("API key authentication"); a decimal number is a price, not a
+# PIN ("the token is 0.125 USD").
 # One pattern per length of the "for the home wifi" part (none, one to three words): a single pattern settles on its
 # first match, and with a longer optional part "от wifi: Qwerty123, не забудь" took "забудь" for the value.
+# Between the name and the value: a space, a separator (":", "=", the full-width "：" and "＝"), "is" in the language
+# (Spanish "es", German "ist", Japanese "は", Korean "는", Chinese "是", Thai "คือ"…) or a quote. One of them must be
+# there: "passwordQwerty" is one word. Particles glue to the name in Japanese, Korean, Chinese and Thai.
+_IS = _alternatives(
+    r"is|was|are|es|era|est|[ée]tait|é|è|ist|lautet|war|jest|to|adalah|yaitu|ialah",
+    r"это|是|为|為|は|が|는|은|이|가|คือ|है|हैं|হল|হলো|هو|هي")
+_OPEN_QUOTE, _CLOSE_QUOTE = r"[\"'«“„‚`「『]", r"[\"'»”`」』]"
 _RE_CREDENTIALS = tuple(re.compile(
-    r"(?P<word>\b(?:pass(?:words?|phrases?|codes?)|pwd|pins?(?:\s+codes?)?|api[\s_-]?keys?|(?:access|auth|bearer|refresh)"
-    r"[\s_-]?tokens?|secret[\s_-]?keys?|tokens?|otp|2fa\s+codes?)\b"
-    r"|парол[ьяюеи]|пин[\s-]?код\w*|токен\w*|ключ\w*\s+api)"
-    + (r"\s+(?:for|to|of|on|для|от|к|на)" + r"\s+\S+(?=\s|$)" * words if words else "")
-    + r"[\"'»”`]?"  # the name's closing quote, as JSON writes it: {"api_key": "…"} (review 2026-10-14)
-    # the value starts after a space, a separator or a quote ("password:Qwerty123" has no space)
-    + r"\s*(?:\b(?:is|was|are)\b|[:=—–-]|это)?\s*[\"'«“`]?(?<![^\s:=—–\-\"'«“`])(?P<value>\S{4,})",
-    re.IGNORECASE) for words in range(4))
-_VALUE_EDGE = ".,;:!?\"'«»“”`)"
+    r"(?P<word>" + _CREDENTIAL_WORD + r")"
+    + (r"\s+(?:for|to|of|on|для|от|к|на|de|del|para|pour|du|da|do|di|della|per|f[üu]r|von|vom|zum|voor|van|dla|od"
+       r"|untuk)" + r"\s+\S+(?=\s|$)" * words if words else "")
+    + _CLOSE_QUOTE + r"?"  # the name's closing quote, as JSON writes it: {"api_key": "…"} (review 2026-10-14)
+    + r"(?:\s*(?:" + _IS + r"|[:=—–\-：＝])\s*" + _OPEN_QUOTE + r"?|\s*" + _OPEN_QUOTE + r"|\s+)"
+    r"(?P<value>\S{4,})",
+    re.IGNORECASE) for words in range(4)) + (
+    # What it is for after the name, as Thai, Indonesian and Arabic say it ("รหัสผ่านไวไฟคือ…", "kata sandi wifi
+    # adalah…", "password wifi: …"): one or two words, or up to twelve characters of a script without spaces, then a
+    # plain separator. Only ":" "=" and "is" here: a particle (Korean 이, Japanese は, Chinese 是) after a few more
+    # words is too common to mean the value follows ("비밀번호 변경이 2024년…").
+    re.compile(
+        r"(?P<word>" + _CREDENTIAL_WORD + r")(?:(?:\s+[^\s:=：＝]+){1,2}?|[^\s:=：＝]{1,12}?)\s*(?:"
+        + _alternatives(r"is|es|est|ist|é|è|adalah|yaitu", r"คือ|هو|هي") + r"|[:=：＝])\s*" + _OPEN_QUOTE
+        + r"?(?P<value>\S{4,})",
+        re.IGNORECASE),)
+_VALUE_EDGE = ".,;:!?\"'«»“”„`)"
+# A value ends where text in a script passwords are not typed in resumes — Chinese, Japanese, Korean, Thai, Hindi,
+# Bengali, Arabic and their punctuation; their digits stay part of it. "密码是hunter2test，记得保存" holds
+# "hunter2test", and "令牌是一次性的" (the token is single-use) holds no value at all. Without this a Devanagari vowel
+# sign, which is not a letter to Python, read as the symbol of a password ("पासवर्ड बदलना है").
+_RE_TEXT_STOP = re.compile(
+    "[؀-ٟ٪-ۯۺ-ۿऀ-॥॰-ॿঀ-৥ৰ-৿"
+    "฀-๏๚-๿ᄀ-ᇿ　-〿぀-ヿ㄰-㆏㐀-䶿一-鿿"
+    "가-힯豈-﫿＀-／：-￯]")
 _RE_DECIMAL = re.compile(r"[$€£¥₽฿]?\d+[.,]\d+[$€£¥₽฿%]?")
+# A date is when, not which: "password changed: 2026-10-15", "пароль сменили: 15.10.2026" (0.15.1).
+_RE_DATE = re.compile(r"\d{1,4}[./-]\d{1,2}[./-]\d{1,4}")
+# A link or a file path says where, not what: "API key docs: https://platform.openai.com/docs", "токены лежат:
+# ~/.hermes/.env" (0.15.1, measured on a live store). A link with a login ("https://user:pass@host") or a query
+# ("?key=…") is still a value, and a token inside a link is caught by its own shape (_RE_TOKEN_SHAPE).
+_RE_POINTER = re.compile(r"https?://[^\s@?]+|(?:~|\.{1,2})?/[^\s@?:]*")
 # After "token" a whole number is a count ("max tokens for this model is 8192"), not a secret; a PIN or a password of
 # digits stays one (0.14.6).
-_RE_COUNTED = re.compile(r"(?:[a-z]+[\s_-]?)?tokens?|токен\w*", re.IGNORECASE)
+_RE_COUNTED = re.compile(r"(?:[a-z]+[\s_-]?)?tokens?|токен\w*|令牌|トークン|토큰|โทเค็น|टोकन|টোকেন", re.IGNORECASE)
 
 
 # A token whose shape alone says what it is — a common API key prefix, a Telegram bot token (the bot id, a colon, 35
@@ -216,11 +370,11 @@ _RE_COUNTED = re.compile(r"(?:[a-z]+[\s_-]?)?tokens?|токен\w*", re.IGNORECA
 # never stored, recalled or sent (0.14.5). Before, only search by meaning screened most of these, so a bare token
 # could be stored as a fact and recalled; a bot token and a JWT were not screened at all.
 _RE_TOKEN_SHAPE = re.compile(
-    r"\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+    _EDGE_START + r"(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
     r"|xox[abprs]-[A-Za-z0-9-]{10,}|A[KS]IA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|glpat-[A-Za-z0-9_-]{20,})"
     # a bot token alone or inside a Bot API address (".../bot<id>:<secret>/sendMessage", 0.14.6)
-    r"|(?:(?<=bot)|(?<![\w:]))\d{6,12}:[A-Za-z0-9_-]{35}(?![\w-])"
-    r"|\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*"
+    r"|(?:(?<=bot)|(?<![A-Za-z0-9_:]))\d{6,12}:[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])"
+    r"|" + _EDGE_START + r"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*"
     r"|-----BEGIN [A-Z0-9 ]{0,40}PRIVATE KEY-----")
 
 
@@ -234,12 +388,22 @@ def _has_credential(text: str) -> bool:
 def _a_count(match: re.Match) -> bool:
     """A whole number after "token(s)": how many, not which (_RE_COUNTED)."""
     return bool(_RE_COUNTED.fullmatch(match.group("word").strip())) \
-        and match.group("value").strip(_VALUE_EDGE).replace(",", "").replace("_", "").isdigit()
+        and _value(match.group("value")).replace(",", "").replace("_", "").isdigit()
+
+
+def _value(token: str) -> str:
+    """The value as typed: up to where text of a script without passwords resumes (_RE_TEXT_STOP), edges off."""
+    return _RE_TEXT_STOP.split(token, 1)[0].strip(_VALUE_EDGE)
+
+
+# Two words joined by a hyphen are a word ("пароль Wi-Fi", "e-mail"), not a password with a symbol in it; three and
+# more are a passphrase ("correct-horse-battery") (0.15.1).
+_RE_HYPHENATED = re.compile(r"[^\W\d_]+-[^\W\d_]+")
 
 
 def _looks_like_a_secret(token: str) -> bool:
-    value = token.strip(_VALUE_EDGE)
-    if len(value) < 4 or _RE_DECIMAL.fullmatch(value):
+    value = _value(token)
+    if len(value) < 4 or any(rx.fullmatch(value) for rx in (_RE_DECIMAL, _RE_DATE, _RE_POINTER, _RE_HYPHENATED)):
         return False
     if any(c.isdigit() or (not c.isalnum() and c != "'") for c in value):
         return True
@@ -248,7 +412,7 @@ def _looks_like_a_secret(token: str) -> bool:
 
 # Quoted spans are reported text ("the test case contains 'ignore previous instructions'"), not instructions.
 _RE_QUOTED_SPAN = re.compile(r"\"[^\"\n]*\"|'[^'\n]*'|«[^»\n]*»|“[^”\n]*”")
-_RE_ROLE_MARKUP = re.compile(r"(?im)^\s*(?:system|assistant|user|tool)\s*:|</?(?:tool_call|function_call|system|assistant)\b|<\|")
+_RE_ROLE_MARKUP = re.compile(r"(?im)^\s*(?:system|assistant|user|tool)\s*[:：]|</?(?:tool_call|function_call|system|assistant)\b|<\|")
 _RE_BLOB = re.compile(r"[A-Za-z0-9+/=_-]{200,}")
 # An image, markdown or HTML ("![x](https://host/p?d=…)", "![x][1]", "<img src=…>"): a client that renders it fetches
 # its address by itself, so a fact holding one could leak whatever the model is led to put into the address — in the
@@ -323,8 +487,8 @@ def _recall_problem(content: str) -> str | None:
 # Authorization header — and a long encoded blob keep a message or a fact at home. Best effort, by pattern (review
 # 2026-10-14). These are not refused as facts: "MAX_TOKENS=128000" is a setting, not a secret.
 _RE_SECRET_SHAPE = re.compile(
-    r"\b[A-Z][A-Z0-9_]{0,63}(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD)[A-Z0-9_]{0,63}\s*[:=]\s*\S{6,}"
-    r"|\b(?i:bearer|basic)\s+(?=[A-Za-z._~-]*[0-9+/=])[A-Za-z0-9._~+/=-]{12,}")  # a token has a digit, + / ="
+    _EDGE_START + r"[A-Z][A-Z0-9_]{0,63}(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD)[A-Z0-9_]{0,63}\s*[:=：＝]\s*\S{6,}"
+    r"|" + _EDGE_START + r"(?i:bearer|basic)\s+(?=[A-Za-z._~-]*[0-9+/=])[A-Za-z0-9._~+/=-]{12,}")  # a token has a digit, + / ="
 
 
 def _secret_in(text: str) -> bool:

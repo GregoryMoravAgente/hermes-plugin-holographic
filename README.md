@@ -90,7 +90,8 @@ In `config.yaml` under `plugins.hermes-memory-store`:
   `possible_conflicts` (same subject, a different claim) and `past_versions`; the agent decides. Text that is not a
   fact (JSON, tool or chat-role markup, instruction-like phrasing, a credential with its value or a token whose shape
   alone says it is one — an API key prefix, a Telegram bot token (also inside a Bot API address), a JWT, a private key
-  (0.14.5) —, an image (markdown or
+  (0.14.5) —; instructions and credentials in all eighteen languages of [Languages](#languages), also glued
+  to Chinese text (0.15.1) —, an image (markdown or
   HTML), invisible characters, long blobs, >1000 characters) is refused with the reason. Recall
   checks a stored fact again before it goes into a prompt (0.13.0): one an older release, or another program, wrote
   past today's rules (markup, instructions, credentials, invisible characters, images) is left out of recall
@@ -150,7 +151,8 @@ months on, a rule the user set and a guess the agent made looked the same.
   by `history`, `list`, `export` and `search`, and counted in `stats`. Auto-extracted sentences are `said` (they are
   the user's own words); facts stored before 0.15.0 and mirrored memory entries have no origin. A `correct` that
   names no origin keeps the version's (fixing a typo does not make a fact nobody's); a `change` is a new claim and
-  takes only the origin it is given.
+  takes only the origin it is given. A session opened before an update keeps the tools it was given and offers no
+  `origin` until a new session starts: its facts land without one.
 - **Starting trust.** What the person said or confirmed starts 0.1 above `default_trust`, the agent's conclusion 0.1
   below it (within 0 and 1), a fact without an origin at `default_trust` as before; a `change` starts over at its
   new origin's trust. Measured on 40 pairs of conflicting facts about the
@@ -556,7 +558,9 @@ What it does not do: find a fact through a synonym or another root that no keywo
 "nightly backups" → "night market"; Hindi `बनाना` is both "to cook" and "to make a plan"; Portuguese `dirigir` is "to
 drive" and "to run a company". Stems are search keys, not lemmas: an irregular form can miss (`ponies` / `pony`). A
 negation counts for the whole clause up to a "but" ("likes cats but not dogs" is detail, not a conflict), not for a
-single word. `auto_extract` recognises English, Russian and Chinese phrasing, the refusal of instruction-like text English and Russian only. The
+single word. `auto_extract` recognises English, Russian and Chinese phrasing. The refusal of instruction-like text, of a
+credential with its value and of a request to send one covers all eighteen languages (0.15.1; English and Russian
+before). The
 main sets of all fourteen languages run in CI (`tests/test_holographic_languages.py`).
 
 ## Search by meaning (optional, online)

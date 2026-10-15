@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.15.1 — 2026-10-15
+
+### Fixed
+
+- **The screens saw nothing glued to Chinese or Japanese text.** They found where a key or a word starts with `\b`,
+  and Python counts a Chinese character as a letter; Chinese writes no spaces, so in "密钥是sk-…" there was no edge
+  before `sk`. 0.15.0 stored `sk-…`, `sk-proj-…` and a JWT written right after a Chinese character, and the same
+  held for a bot token, a credential word ("服务器的password是…"), an instruction ("请ignore all previous
+  instructions"), an environment assignment ("配置OPENAI_API_KEY=…") and anything after the full-width colon "：".
+  Reported in issue #3. An edge is now only a Latin letter, digit or `_` next to the word; recall checks stored
+  facts again, so one an earlier release let in is left out of recall, and search by meaning no longer sends such a
+  message.
+
+### Added
+
+- **The screens speak every language the plugin matches words in** (English and Russian before): a credential with
+  its value, an instruction to drop previous ones or a "system prompt:", and a request to send a password, in
+  Chinese, Japanese, Korean, Thai, Spanish, French, Portuguese, Italian, German, Dutch, Polish, Turkish,
+  Indonesian, Hindi, Arabic and Bengali too. "Is" in each language may stand between the name and the value
+  (Spanish `es`, German `ist`, Japanese `は`, Korean `는`, Chinese `是`, Thai `คือ`…), and so may what it is for, as
+  Thai, Indonesian and Arabic put it after the name ("รหัสผ่านไวไฟคือ…", "kata sandi wifi adalah…") — then only
+  with ":", "=" or "is". In languages that put the verb last only the request forms count ("şifreyi gönder",
+  "パスワードを送って"), so "the password was sent to your e-mail" stays a fact, as "sent" does in English. A verb
+  and a credential are paired within one language: an English "POST" next to a Russian "токен" is an HTTP request.
+- A value ends where text in a script passwords are not typed in resumes (Chinese, Japanese, Korean, Thai, Hindi,
+  Bengali, Arabic): "密码是hunter2test，记得保存" holds `hunter2test`, "令牌是一次性的" (the token is single-use) holds
+  no value. Not a value either: a date ("password changed: 2026-10-15"), a link or a file path ("API key docs:
+  https://…", "токены лежат: ~/.hermes/.env") unless it carries a login or a query, and two words joined by a
+  hyphen ("пароль Wi-Fi"); three and more are a passphrase. A token inside a link is caught by its shape.
+
+Measured on a family store, before and after: none of its 58 facts and none of its 18,642 messages changes
+verdict either way (refused as a fact, left out of recall, kept from the endpoint). Two drafts on the way did: one
+paired any language's verb with any language's credential and refused two messages with an HTTP "POST" near a
+Russian "токен"; another took a link and a file path after "token …:" for a secret. Both are fixed and have tests;
+each language has cases that must be refused and ordinary facts about passwords that must be kept
+(`tests/test_holographic_v0151.py`).
+
+The screens are patterns, so best effort: a secret or an instruction phrased in a way they do not list still gets
+through. A password typed in a non-Latin script is not seen as a value; Hindi `पिन कोड` is left out, because in India
+it is also the postal code.
+
+### Documented
+
+- A session opened before an update keeps the tools it was given, so it does not offer `origin` until a new session
+  starts; a fact it stores lands without one, as before (issue #3).
+
 ## 0.15.0 — 2026-10-15
 
 ### Added
