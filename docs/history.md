@@ -103,8 +103,13 @@ said it":
 | `chat_id`, `thread_id` | `-1001234567890`, `7` |
 | `session_id` | the Hermes session |
 | `user_id`, `user_name` | the author of the turn |
+| `origin` (0.15.0) | who stands behind it: `said` (the person said it), `confirmed` (the agent's conclusion, the person agreed), `inferred` (the agent's own conclusion); empty: not known |
 
 Chat names are not stored (they change and they leak). Facts from before 0.8.0 say "source unknown".
+
+Confirmations (0.15.0) live in their own table, one row per fact per session (per day without a session): when, the
+session, the person's id, and through what (`feedback`, `tool`), never text. A conclusion with a confirmation counts as
+`confirmed`. `change` and a resume drop a fact's confirmations (they were of the old claim), `forget` deletes them.
 
 - `list`, `history` and `export` show the source in full.
 - Prefetch does not show it by default (`recall_source: off`). `recall_source: short` appends
@@ -177,8 +182,12 @@ CREATE TABLE fact_versions (
     supersedes, superseded_by,                  -- version_ids
     trust_score,                                -- snapshot when the version was closed
     src_via, src_platform, src_chat_type, src_chat_id, src_thread_id, src_session_id, src_user_id, src_user_name,
+    src_origin,                                 -- 0.15.0, added by the first 0.15.0 writer to an older file
     UNIQUE (fact_id, seq)
 );
+-- 0.15.0
+CREATE TABLE fact_confirmations (fact_id INTEGER NOT NULL, confirmed_at TEXT NOT NULL, session_id TEXT, user_id TEXT,
+                                 via TEXT);
 -- at most one current version per fact
 CREATE UNIQUE INDEX idx_versions_current ON fact_versions(fact_id) WHERE status = 'current';
 CREATE VIRTUAL TABLE fact_versions_fts USING fts5(content, tags, content=fact_versions, content_rowid=version_id);

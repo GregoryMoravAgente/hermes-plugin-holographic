@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS fact_versions (
     src_session_id TEXT,
     src_user_id    TEXT,
     src_user_name  TEXT,
+    src_origin     TEXT,  -- 0.15.0: said / confirmed / inferred; a file an older version created gets it on migration
     UNIQUE (fact_id, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_versions_fact  ON fact_versions(fact_id);
@@ -71,10 +72,28 @@ CREATE TABLE IF NOT EXISTS forgotten (
     forgotten_at TEXT NOT NULL,
     digests      TEXT NOT NULL
 );
+
+-- 0.15.0: each time a person confirmed a fact, once per session (fact_feedback confirmed, or the same text added
+-- again as said). No text; forget deletes the rows with the fact.
+CREATE TABLE IF NOT EXISTS fact_confirmations (
+    fact_id      INTEGER NOT NULL,
+    confirmed_at TEXT NOT NULL,
+    session_id   TEXT,
+    user_id      TEXT,
+    via          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_confirmations_fact ON fact_confirmations(fact_id);
 """
 
-HISTORY_SCHEMA_VERSION = 1
-SOURCE_FIELDS = ("via", "platform", "chat_type", "chat_id", "thread_id", "session_id", "user_id", "user_name")
+HISTORY_SCHEMA_VERSION = 1  # 0.15.0's additions are additive: an older writer still opens the file
+# Who stood behind a version (0.15.0): the person said it, the person confirmed the agent's conclusion, or the agent
+# concluded it. No value: not known (everything stored before 0.15.0, mirrored memory entries).
+ORIGINS = ("said", "confirmed", "inferred")
+# The trust a new or changed fact starts with, as a step from default_trust: what the person said or confirmed above
+# an unknown origin, the agent's own conclusion below it (measured: 40 of 40 conflicting pairs, see CHANGELOG 0.15.0).
+ORIGIN_TRUST = {"said": 0.1, "confirmed": 0.1, "inferred": -0.1}
+SOURCE_FIELDS = ("via", "platform", "chat_type", "chat_id", "thread_id", "session_id", "user_id", "user_name",
+                 "origin")
 _SOURCE_COLUMNS = tuple(f"src_{f}" for f in SOURCE_FIELDS)
 CLOSED = ("changed", "ended")  # past versions that really held; 'corrected' ones never did
 _TS = "%Y-%m-%d %H:%M:%S"  # SQLite CURRENT_TIMESTAMP format, UTC
@@ -130,7 +149,8 @@ def version_state(row, day: str) -> tuple[str, str]:
 
 def source_of(row, prefix: str = "src_") -> dict | None:
     """The provenance of a version row as a dict (empty fields left out); None for facts stored before 0.8.0."""
-    src = {f: row[prefix + f] for f in SOURCE_FIELDS if row[prefix + f] not in (None, "")}
+    present = row.keys()  # a file an older version created has no src_origin until a writer migrates it
+    src = {f: row[prefix + f] for f in SOURCE_FIELDS if prefix + f in present and row[prefix + f] not in (None, "")}
     return None if not src or src.get("via") == "legacy" else src
 
 
@@ -356,9 +376,12 @@ class HistoryMixin:
             new_tags = fact["tags"] if tags is None else tags
             seq = self._replace_current(fact_id, "changed", content, new_category, new_tags, valid_from=start,
                                         source=source, valid_to=end, exact=exact, trust=fact["trust_score"])
-            # A changed fact has not earned the old text's feedback (as `supersedes` did by making a new fact).
+            # A changed fact has not earned the old text's feedback (as `supersedes` did by making a new fact), nor
+            # its confirmations: they confirmed the old claim (review 2026-10-15). It starts at its origin's trust.
             self._rewrite_fact(fact_id, content, new_category, new_tags, entities=entities, old_category=fact["category"],
-                               reset_trust=True)
+                               reset_trust=True, trust=self.start_trust((source or {}).get("origin")))
+            if self._confirmations_ready():
+                self._write("DELETE FROM fact_confirmations WHERE fact_id = ?", (fact_id,))
             return {"fact_id": fact_id, "status": "changed", "version": seq,
                     "previous_until": end if exact else f"before {end}"}
 
@@ -374,7 +397,11 @@ class HistoryMixin:
                                    valid_from=start, source=source, supersedes=last["version_id"])
         self._write("UPDATE fact_versions SET superseded_by = ? WHERE version_id = ?", (new, last["version_id"]))
         row = self._version(new)
-        self._insert_fact_row(fact_id, row, trust=self.default_trust, entities=entities)
+        start_trust = self.start_trust((source or {}).get("origin"))
+        self._insert_fact_row(fact_id, row, trust=self.default_trust if start_trust is None else start_trust,
+                              entities=entities)
+        if self._confirmations_ready():  # they confirmed what it said before it ended
+            self._write("DELETE FROM fact_confirmations WHERE fact_id = ?", (fact_id,))
         return {"fact_id": fact_id, "status": "resumed", "version": int(row["seq"])}
 
     def end_fact(self, fact_id: int, *, valid_to=None) -> dict:
@@ -427,7 +454,8 @@ class HistoryMixin:
             if new_text == fact["content"] and new_start == cur["valid_from"]:
                 return {"fact_id": fact_id, "status": "unchanged"}
             seq = self._replace_current(fact_id, "corrected", new_text, fact["category"], fact["tags"],
-                                        valid_from=new_start, source=source, trust=fact["trust_score"])
+                                        valid_from=new_start, source=self._with_origin(source, cur),
+                                        trust=fact["trust_score"])
             if new_text != fact["content"]:
                 self._rewrite_fact(fact_id, new_text, fact["category"], fact["tags"], entities=entities,
                                    old_category=fact["category"])
@@ -516,6 +544,7 @@ class HistoryMixin:
         versions = self._write("DELETE FROM fact_versions WHERE fact_id = ?", (fact_id,)).rowcount
         if self._entry.get("migrated"):  # the row may be gone already (another writer): its vector goes regardless
             self._write("DELETE FROM fact_embeddings WHERE fact_id = ?", (fact_id,))
+            self._write("DELETE FROM fact_confirmations WHERE fact_id = ?", (fact_id,))
         digests = sorted({self.digest(t) for t in texts})
         old = self._one("SELECT digests FROM forgotten WHERE fact_id = ?", (fact_id,))
         if old is not None:
@@ -642,12 +671,111 @@ class HistoryMixin:
         return {"past_versions": counts.get("changed", 0) + counts.get("ended", 0), "corrected": counts.get("corrected", 0),
                 "ended_facts": ended, "forgotten": self.read("SELECT COUNT(*) FROM forgotten")[0][0]}
 
+    def _source_columns(self) -> tuple:
+        """The source columns this file has: a reader may open a file an older writer created, without src_origin."""
+        cols = self._entry.get("source_columns")
+        if cols is None or len(cols) < len(_SOURCE_COLUMNS):  # a writer elsewhere may have added it since
+            have = {r[1] for r in self._conn.execute("PRAGMA table_info(fact_versions)")}
+            cols = self._entry["source_columns"] = tuple(c for c in _SOURCE_COLUMNS if c in have)
+        return cols
+
+    def _confirmations_ready(self) -> bool:
+        if not self._entry.get("confirmations"):
+            self._entry["confirmations"] = bool(self._one(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fact_confirmations'"))
+        return self._entry["confirmations"]
+
+    def origins(self, fact_ids) -> dict[int, dict]:
+        """{fact_id: {"origin": said | confirmed | inferred | None, "confirmations": n}} of current facts. A conclusion
+        a person has confirmed since counts as confirmed; the version keeps what it was stored as."""
+        ids = [int(i) for i in fact_ids]
+        if not ids or not self.history_ready():
+            return {}
+        has_origin = "src_origin" in self._source_columns()
+        counted = self._confirmations_ready()
+        out = {}
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            marks = ",".join("?" * len(chunk))
+            confirmations = {r[0]: r[1] for r in self.read(
+                f"SELECT fact_id, COUNT(*) FROM fact_confirmations WHERE fact_id IN ({marks}) GROUP BY fact_id",
+                chunk)} if counted else {}
+            stored = {r[0]: r[1] for r in self.read(
+                f"SELECT fact_id, src_origin FROM fact_versions WHERE status = 'current' AND fact_id IN ({marks})",
+                chunk)} if has_origin else {}
+            for fact_id in chunk:
+                origin, n = stored.get(fact_id), confirmations.get(fact_id, 0)
+                if n and origin not in ("said", "confirmed"):
+                    origin = "confirmed"
+                out[fact_id] = {"origin": origin if origin in ORIGINS else None, "confirmations": n}
+        return out
+
+    def start_trust(self, origin) -> float | None:
+        """The trust a new or changed fact starts with by its origin (ORIGIN_TRUST), clamped to [0, 1]; None when the
+        origin is not given (the default applies)."""
+        if origin not in ORIGIN_TRUST:
+            return None
+        return max(0.0, min(1.0, float(self.default_trust) + ORIGIN_TRUST[origin]))
+
+    def _with_origin(self, source: dict | None, version) -> dict | None:
+        """A correction that names no origin keeps its version's: fixing a typo does not make a fact nobody's."""
+        if (source or {}).get("origin") or version is None or "src_origin" not in version.keys() \
+                or not version["src_origin"]:
+            return source
+        return {**(source or {}), "origin": version["src_origin"]}
+
+    def drop_orphan_confirmations(self) -> None:
+        """Confirmations of facts an older version's forget erased (it deletes the versions, not these rows)."""
+        if self._confirmations_ready():
+            self._write("DELETE FROM fact_confirmations WHERE fact_id NOT IN (SELECT fact_id FROM fact_versions)")
+
+    def stale_inferences(self, stale_days: int, limit: int) -> list[int]:
+        """Fact ids whose current version is the agent's own conclusion, stored more than *stale_days* ago, that
+        nobody has confirmed since: the oldest first, at most *limit* (review)."""
+        if not self.history_ready() or "src_origin" not in self._source_columns():
+            return []
+        unconfirmed = ("AND NOT EXISTS (SELECT 1 FROM fact_confirmations c WHERE c.fact_id = v.fact_id) "
+                       if self._confirmations_ready() else "")
+        return [r[0] for r in self.read(
+            "SELECT v.fact_id FROM fact_versions v JOIN facts f ON f.fact_id = v.fact_id WHERE v.status = 'current' "
+            f"AND v.src_origin = 'inferred' AND julianday('now') - julianday(v.recorded_at) > ? {unconfirmed}"
+            "ORDER BY v.recorded_at LIMIT ?", (stale_days, limit))]
+
+    def record_confirmation(self, fact_id: int, source: dict | None, *, bump: float = 0.05) -> dict:
+        """A person confirmed a current fact: one row per session — or per day where there is no session (a CLI
+        call, a script), so repeating the call cannot pile rows up (review 2026-10-15). Trust rises by *bump* only
+        for a person who has not confirmed this fact before: in a group chat one member repeating "yes, true"
+        session after session raises it once (a known id; without one, once per session). Returns {fact_id,
+        confirmed: a new row, confirmations, trust_score, origin}. Raises KeyError if the fact is not current."""
+        src = source or {}
+        session = str(src.get("session_id") or "") or f"day:{self._today()}"
+        user = str(src.get("user_id") or "")
+        with self._tx():
+            row = self._one("SELECT trust_score FROM facts WHERE fact_id = ?", (fact_id,))
+            if row is None:
+                raise KeyError(f"fact_id {fact_id} not found")
+            again = bool(self._one("SELECT 1 FROM fact_confirmations WHERE fact_id = ? AND session_id = ?",
+                                   (fact_id, session)))
+            trust = row["trust_score"]
+            if not again:
+                known = bool(user) and bool(self._one(
+                    "SELECT 1 FROM fact_confirmations WHERE fact_id = ? AND user_id = ?", (fact_id, user)))
+                self._write("INSERT INTO fact_confirmations (fact_id, confirmed_at, session_id, user_id, via) "
+                            "VALUES (?, ?, ?, ?, ?)", (fact_id, self._now(), session, user or None,
+                                                       str(src.get("via") or "") or None))
+                if not known:
+                    trust = min(1.0, round(trust + bump, 6))
+                    self._write("UPDATE facts SET trust_score = ? WHERE fact_id = ?", (trust, fact_id))
+        info = self.origins([fact_id]).get(fact_id, {})
+        return {"fact_id": fact_id, "confirmed": not again, "confirmations": info.get("confirmations", 0),
+                "trust_score": trust, "origin": info.get("origin")}
+
     def current_sources(self, fact_ids) -> dict[int, dict | None]:
         """{fact_id: source of its current version} (None: unknown, stored before 0.8.0)."""
         ids = [int(i) for i in fact_ids]
         if not ids or not self.history_ready():
             return {}
-        cols = ", ".join(_SOURCE_COLUMNS)
+        cols = ", ".join(self._source_columns())
         out = {}
         for i in range(0, len(ids), 500):
             chunk = ids[i:i + 500]
@@ -660,5 +788,5 @@ class HistoryMixin:
         return out
 
 
-__all__ = ["HISTORY_SCHEMA", "HistoryMixin", "HistoryUnavailable", "HistoryTooNew", "CLOSED", "SOURCE_FIELDS", "normalize",
+__all__ = ["HISTORY_SCHEMA", "HistoryMixin", "HistoryUnavailable", "HistoryTooNew", "CLOSED", "ORIGINS", "SOURCE_FIELDS", "normalize",
            "parse_day", "version_state", "source_of"]

@@ -276,6 +276,7 @@ class MemoryStore(HistoryMixin):
                 elif migrate:
                     self._check_vectors()
                     self._drop_orphan_vectors()  # facts an older version deleted while this process held the file
+                    self.drop_orphan_confirmations()  # the same for confirmations (review 2026-10-15)
                     self.scrub()  # a forget whose file rewrite another process blocked: retried by every writer open
             except BaseException:
                 self.close()  # drop our reference; a broken connection must not stay registered
@@ -306,10 +307,15 @@ class MemoryStore(HistoryMixin):
         - HRR vectors are re-encoded when ``hrr_dim`` differs from the dimension they were written with (recorded in
           ``meta``; before 0.4.0, inferred from the stored blobs), so a changed setting no longer breaks queries.
         0.8.0 adds the history tables (executescript commits, so before the transaction) and versions every fact; 0.14.0
-        the vectors of search by meaning, whose rows for facts an older version deleted are dropped here."""
+        the vectors of search by meaning, whose rows for facts an older version deleted are dropped here; 0.15.0 the
+        origin of a version and the confirmations of a fact, whose rows an older version's forget left are dropped."""
         self._conn.executescript(HISTORY_SCHEMA + _EMBEDDINGS_SCHEMA)
         with self._tx():
             self._conn.execute("DELETE FROM fact_embeddings WHERE fact_id NOT IN (SELECT fact_id FROM facts)")
+            if "src_origin" not in {r[1] for r in self._conn.execute("PRAGMA table_info(fact_versions)")}:
+                self._conn.execute("ALTER TABLE fact_versions ADD COLUMN src_origin TEXT")
+            self._entry.pop("source_columns", None)
+            self._conn.execute("DELETE FROM fact_confirmations WHERE fact_id NOT IN (SELECT fact_id FROM fact_versions)")
             if "name_key" not in {r[1] for r in self._conn.execute("PRAGMA table_info(entities)")}:
                 self._conn.execute("ALTER TABLE entities ADD COLUMN name_key TEXT")
             # Aliases an older version deleted the entity of, or that point nowhere: drop before anything resolves them.
@@ -529,8 +535,8 @@ class MemoryStore(HistoryMixin):
                     raise DuplicateContentError(int(other["fact_id"]))
                 cur = self._current_version(fact_id)
                 self._replace_current(fact_id, "corrected", content, category or row["category"],
-                                      row["tags"] if tags is None else tags, valid_from=cur["valid_from"], source=source,
-                                      trust=row["trust_score"])
+                                      row["tags"] if tags is None else tags, valid_from=cur["valid_from"],
+                                      source=self._with_origin(source, cur), trust=row["trust_score"])
             elif history and (tags is not None or category is not None):
                 self._write("UPDATE fact_versions SET tags = COALESCE(?, tags), category = COALESCE(?, category) "
                             "WHERE fact_id = ? AND status = 'current'", (tags, category, fact_id))
@@ -594,9 +600,9 @@ class MemoryStore(HistoryMixin):
         survive), vector and banks follow. reset_trust: a changed fact starts over (default trust, no counts)."""
         sets = ["content = ?", "category = ?", "tags = ?", "updated_at = CURRENT_TIMESTAMP"]
         params: list = [content, category or "general", tags or ""]
-        if reset_trust:
+        if reset_trust:  # *trust*, when given, is where it starts over (its origin's, 0.15.0)
             sets += ["trust_score = ?", "helpful_count = 0", "retrieval_count = 0"]
-            params.append(self.default_trust)
+            params.append(self.default_trust if trust is None else _clamp_trust(trust))
         elif trust is not None:
             sets.append("trust_score = ?")
             params.append(_clamp_trust(trust))

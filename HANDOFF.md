@@ -70,6 +70,10 @@ obtained; keep it that way.
   reproduce; `test_parallel_searches_never_share_a_query_vector` guards it.
 - Loanwords (`_LOANWORDS` in `text.py`, 0.14.5): extend the list by exact spellings only; check every new Cyrillic
   spelling's forms (`_RU_ENDINGS`) against common words, never match by stem.
+- Origin and confirmations (0.15.0): the nightly dreaming job should call `fact_feedback confirmed` for facts a
+  person's message backs (it already finds them for promotion) — that, not repeated `add`, is where confirmations come
+  from on a real store (0 repeats in 22 adds on the maintainer's). After a week or two, read `stats.origin` to see
+  whether the agent fills `origin` at all; if most new facts are still `unknown`, the tool description needs work.
 - Upstream PRs to the bundled copy that were never merged and are worth reviewing here: hermes-agent#133389
   (retrieval contract tests), #123599 (setup offers saved config).
 

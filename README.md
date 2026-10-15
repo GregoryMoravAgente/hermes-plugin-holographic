@@ -76,7 +76,7 @@ In `config.yaml` under `plugins.hermes-memory-store`:
 | Tool | Description |
 |------|-------------|
 | `fact_store` | add, search, probe, related, reason, contradict, change, end, correct, revert, forget, history, update, remove, list, stats, export, review, entities, alias, enrich |
-| `fact_feedback` | Rate a fact helpful or unhelpful (moves its trust score) |
+| `fact_feedback` | Rate a fact helpful or unhelpful (moves its trust score), or record that the person confirmed it (0.15.0) |
 
 - **search**: keyword candidates in any word form (`Маши` finds `Маша`, `deploys` finds `deploy`, `kucingnya` finds
   `kucing`; see [Languages](#languages)), reranked by word overlap and HRR similarity, weighted by trust.
@@ -139,6 +139,36 @@ A fact that stops being current is not overwritten. The agent says what happened
   the fact back from old messages and tells other tools which ids to clean from their own copies.
 - Older prompts keep working: `add supersedes=X` is `change X` (the id now stays `X`), `update content=` is `correct`,
   `remove` is `forget`.
+
+### Who stands behind a fact (0.15.0)
+
+The source says where a fact was written; it did not say whether the person said it or the agent concluded it. Six
+months on, a rule the user set and a guess the agent made looked the same.
+
+- **Origin.** `add`, `change` and `correct` take `origin`: `said` (the person said it), `confirmed` (the agent's
+  conclusion, and the person agreed) or `inferred` (the agent's own conclusion). It is kept with the version, shown
+  by `history`, `list`, `export` and `search`, and counted in `stats`. Auto-extracted sentences are `said` (they are
+  the user's own words); facts stored before 0.15.0 and mirrored memory entries have no origin. A `correct` that
+  names no origin keeps the version's (fixing a typo does not make a fact nobody's); a `change` is a new claim and
+  takes only the origin it is given.
+- **Starting trust.** What the person said or confirmed starts 0.1 above `default_trust`, the agent's conclusion 0.1
+  below it (within 0 and 1), a fact without an origin at `default_trust` as before; a `change` starts over at its
+  new origin's trust. Measured on 40 pairs of conflicting facts about the
+  same person (one said, one inferred, stored in alternating order): without origins the one said came first in 17;
+  with a step of 0.05, 0.1 or 0.15, in 40 of 40, in `search` and before a turn alike. An inference with no rival
+  was still recalled every time (10 of 10). 0.1 keeps the order after a helpful vote or two on the inference.
+- **Confirmations.** `fact_feedback {action: confirmed, fact_id}` records that the person confirmed a fact — said it
+  again or agreed when asked — and the same text added again with `origin: said` in a later session counts too (not
+  in the session that stored it: that is the agent repeating itself). At most one confirmation per fact per session,
+  or per day where there is no session. Trust rises by 0.05 for each person who confirms a fact the first time:
+  one group-chat member saying "yes, true" session after session raises it once (without a known id, once per
+  session). An inference that has been confirmed counts as `confirmed`; a `change` drops the confirmations, which
+  were of the old claim. A nightly job that finds a person's message backing a fact can confirm it the same way.
+- **Recall says what is a guess.** Before a turn, an inference nobody confirmed ends with `(inferred)`, so the model
+  does not repeat it as something it was told. `review` lists inferences nobody confirmed in 60 days.
+
+On a family store the agent stored 22 facts in four months and never the same one twice, so confirmation by
+repetition alone will be rare there: the explicit `confirmed` and a nightly job are where confirmations come from.
 
 The full contract, including what the plugin cannot clean (Hermes's own session database, `hermes backup`
 archives): [docs/history.md](docs/history.md).
@@ -621,7 +651,10 @@ such as `OPENAI_API_KEY=…`, an Authorization header, the prefixes of common AP
 `AKIA`, `ASIA`, `AIza`, `xox…-`, `glpat-`), a Telegram bot token, a JWT, a PEM private key, a long encoded blob; of a message, only the first 2,000
 characters are checked — and sent. That check is by pattern, so best effort: a secret in a shape
 it does not know goes out with the message. `forget` deletes the vector, but the provider has seen the text: what it
-keeps is up to its terms, and some free tiers may use what they receive to improve their models. A local server keeps
+keeps is up to its terms, and some free tiers may use what they receive to improve their models. The plugin cannot
+tell whether a vector belongs to the text it sent: an endpoint or aggregator that mixes up concurrent answers gives a
+search another text's closeness, silently (a user saw one fact by meaning carry the cosine of a parallel query,
+issue #3; the plugin's own side is covered by a test). A local server keeps
 everything on the machine; plain `http` is accepted only to localhost, a private or link-local address, a host name
 without a dot or one ending in `.local`, `.lan`, `.internal` or `.home.arpa` (judged by the name; the address it
 resolves to is not checked), and needs no key. A redirect is refused. With `scope: user`, `chat` or `thread` every
@@ -673,8 +706,10 @@ keywords, is a separate benchmark; one store does not show what another will do.
   makes is a fact's vector when search by meaning is on.
 - With `auto_extract` on, user messages matching the preference/decision patterns are stored at session end.
 - `retrieval_count` counts how often a fact was handed to the model; nothing else is tracked.
-- Each version keeps its source: platform, chat type, chat / thread / session id and the author of the turn (id and
-  display name). Chat names are not kept. `forget` deletes the source with the fact.
+- Each version keeps its source: platform, chat type, chat / thread / session id, the author of the turn (id and
+  display name) and, from 0.15.0, its origin (said / confirmed / inferred). Chat names are not kept. Each confirmation
+  keeps its time, session id and the person's id, no text. `forget` deletes the source and the confirmations with
+  the fact.
 - `forget` deletes a fact for good (see [History](#history-sources-and-forgetting-080)); copies outside this database
   (Hermes's session transcripts, backups, other tools' caches) are not the plugin's to rewrite.
 - Dependencies: `numpy` (HRR algebra) and `snowballstemmer` (word forms; pure Python; Polish stems need 3.1 or

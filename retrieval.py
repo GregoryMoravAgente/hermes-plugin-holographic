@@ -885,6 +885,13 @@ class FactRetriever:
                 f"SELECT {_FACT_COLUMNS} FROM facts WHERE retrieval_count = 0 AND julianday('now') - julianday(created_at) > ? "
                 "ORDER BY created_at LIMIT ?", (stale_days, limit)):
             add(dict(fact), f"never recalled in {stale_days}+ days")
+        # the agent's own conclusions that nobody confirmed in that time (0.15.0): confirm, correct or forget
+        # (the age of the version that made it an inference, not of the fact; selected in SQL, at most *limit*)
+        stale = self.store.stale_inferences(stale_days, limit)
+        rows = {r["fact_id"]: dict(r) for r in self._rows(stale, None, 0.0)} if stale else {}
+        for fact_id in stale:
+            if fact_id in rows:
+                add(rows[fact_id], f"an inference nobody confirmed in {stale_days}+ days")
         if len(out) >= limit:
             return out[:limit]
         # near-duplicates among the most recent 200 facts (bounded pair scan), the more trusted one kept

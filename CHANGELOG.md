@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.15.0 — 2026-10-15
+
+### Added
+
+- **Who stands behind a fact.** `add`, `change` and `correct` take `origin`: `said` (the person said it), `confirmed`
+  (the agent's conclusion, the person agreed) or `inferred` (the agent's own conclusion). It is kept with the
+  version (`fact_versions.src_origin`) and shown by `history`, `list`, `export`, `search` and `stats`;
+  auto-extracted sentences are `said`. What the person said or confirmed starts 0.1 above `default_trust`, an
+  inference 0.1 below; a fact without an origin starts where it did. Before a turn, an inference nobody confirmed
+  ends with `(inferred)`; `review` lists those older than 60 days. Idea from the `origin_kind` of a memory kit for
+  coding agents (GuruDevvv/claude-memory-kit), where a rule records whether the owner said it or the agent guessed.
+- **Confirmations.** `fact_feedback {action: confirmed}` records that the person confirmed a fact; the same text
+  added again with `origin: said` in a later session counts too. At most one per fact per session (per day without
+  a session); +0.05 trust for each person the first time they confirm a fact (table `fact_confirmations`: time,
+  session id, the person's id; no text; `forget` deletes the rows). A confirmed inference counts as `confirmed`.
+
+Before release a full review by Antigravity CLI found, and 0.15.0 fixes: a `change` kept the old claim's
+confirmations, so a new guess read as confirmed, and ignored the new origin's trust; without a session id (a CLI
+call, a script) the once-per-session rule did not hold and trust could be pushed to 1.0 by repeating the call; a
+`correct` without `origin` wiped the version's; `review` aged an inference by its fact, not by the version that
+made it one, and scanned every old fact; adding the same text twice in the session that stored it counted as the
+person confirming it; one group-chat member could raise a fact's trust every session; confirmations an older
+release's `forget` left behind were dropped only on the first open of a process; a custom `default_trust` near 0 or
+1 could start a fact outside [0, 1].
+
+Measured: 40 pairs of conflicting facts about the same person, one said and one inferred, stored in alternating
+order. Without origins the one said came first in 17 (search and recall alike); with a trust step of 0.05, 0.1 or
+0.15, in 40 of 40. An inference with no rival was recalled every time (10 of 10). On a family store the agent stored
+22 facts in four months and never the same text twice, so repetition alone will rarely confirm anything there: the
+explicit `confirmed`, from the agent or a nightly job, is the path.
+
+### Compatibility
+
+Additive: a column and a table, no history schema bump, so 0.14.x opens a 0.15.0 file for writing and its versions
+simply have no origin. A read-only context of 0.15.0 reads a file no 0.15.0 writer has migrated (no column, no
+table); the next writer adds both and drops confirmations an older `forget` left behind.
+
+### Documented
+
+- An endpoint or aggregator that mixes up concurrent answers gives a search another text's closeness, and the plugin
+  cannot tell. Issue #3: a fact by meaning arrived with a cosine of 0.4819; embedded alone, the query gives that fact
+  0.5879, while a query running in parallel gives it 0.4811 — the plugin's side is covered by the 0.14.5 test.
+- Search with no word in common keeps its bar: the same user's 18 no-answer questions on bge-m3 (Chinese, 79 facts)
+  got a fact by meaning in 3 under it, and would in 16 under the relaxed rank-plus-z rule.
+
 ## 0.14.6 — 2026-10-15
 
 Fixes from a full review of 0.14.5 by Antigravity CLI; each is covered by a test.
