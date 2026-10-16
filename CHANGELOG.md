@@ -1,5 +1,119 @@
 # Changelog
 
+## 0.16.1 — 2026-10-16
+
+What the 0.16.0 rebuild showed on a Chinese store (issue #4: 49 entities → 26, every removal junk, no declared name
+lost — and two new names that should not have been), and the same kinds of seam found elsewhere. The extraction rules
+are now 3 (`_ENTITY_RULES`), so a store 0.16.0 indexed is rebuilt again on a writer's first open.
+
+### Fixed
+
+- **A capitalized name glued to Chinese text was taken with its tail.** "Docker Hub直连可用" became one name: a
+  word of letters ran on from Latin into Han, and Han letters have no case, so the word still read as capitalized.
+  Words are now split where their letters change script or case (`_script_pieces`), and a name never crosses that
+  seam: "Docker Hub直连可用" gives "Docker Hub". The same seam elsewhere: "测试Docker Hub直连" (the name glued after
+  Chinese was not found at all) and a Russian ending glued to a Latin name ("на Docker Hubе" gives "Docker Hub").
+- **A name could begin with a symbol**: "+.siliconflow.cn" passed, since only a leading hyphen or dash was refused. A
+  name now begins with a letter or a digit (".NET" may: a dot and a capital), for given names too.
+- **A count in quotes passed as an identifier**: "14 days" — a bare number counted as an identifier. An identifier now
+  has a letter in it ("gpt-4o", "kanban.db", "华为mate60" stay). The lower-case rule also judges a span by its letters
+  with case whatever else it holds ("华为 mate" goes, "华为 Mate" stays).
+- **A name ran across a line break**: a heading and a name on the next line ("Meeting Notes⏎Alice Smith") were one
+  name. Words of one name are separated by spaces on one line now — no line break of any kind, the Unicode line and
+  paragraph separators, NEL, VT and FF included — and "X aka Y" stays on one line too.
+- **Straight double quotes beside Chinese characters were not quotes**: 用"Docker Hub"直连 gave no quoted name, since
+  the quote had to sit beside a non-word character and Han is one. Beside a digit or a letter with case — judged by
+  the letter itself, so full-width letters count — they are still not quotes (a 5" screen); single quotes keep the old
+  rule (don't, it's).
+- **"X aka Y" next to a word of two scripts** is read with that whole word as the side, judged as a name in quotes
+  is: "华为mate60 aka Huawei" stays a pair, and a phrase glued to a name ("Docker Hub直连 aka DH" gives "Hub直连")
+  stays provisional. A first draft cut the word at the seam and lost model names with their aliases on the rebuild.
+- **A known name was mentioned across separators.** The analysis keeps the words of a text and drops what stood
+  between them, so "Alice\nSmith", "Alice, Smith", "Alice\vSmith" and two items of a list mentioned Alice Smith. The
+  text is now read stretch by stretch between line breaks, control and format characters, brackets, quotes and other
+  punctuation — but not `'` `&` `-` `+`, nor a dot, colon or slash inside a word or the dot of an initial, which hold
+  names together (O'Brien, AT&T, Jean-Luc, C++, Node.js, Яндекс.Такси, 1С:Предприятие, J. R. R. Tolkien, U.S. Army) —
+  in NFKC as names are indexed ("Ａｌｉｃｅ Ｓｍｉｔｈ" mentions Alice Smith), with words split where their script
+  changes, as the extractor reads them ("用Docker Hub直连" and "на Docker Hubе" mention Docker Hub).
+- **A Chinese name was found across a seam between two words**: a declared 和服 (kimono) in 我和服务员说话 ("I talk
+  to the waiter"), where 和 and 服务员 are two words. A known name is found in Chinese text only from word cut to word
+  cut (`text.zh_word_cuts`), so 小米科技, which the segmenter splits as 小米 | 科技, is still found in 我在小米科技工作,
+  and 北京 is not found inside 北京大学; Traditional and Simplified compare as one.
+- **Full-width, invisible and control characters passed the gate.** "https：／／example.com" is a URL once NFKC folds
+  its colon and slashes, as the entity key does; a zero-width space or joiner made a copy of a deleted name that its
+  tombstone did not know; a line break or NUL inside quotes ("Alice\rSmith") made a name that the key folds into
+  Alice Smith. The checks run on the NFKC form too; a name is one line, holds no control character, and a format
+  character only as ZWJ / ZWNJ between letters of the scripts that write words with them (Arabic, Persian, Indic);
+  a guessed name holds no emoji. Vowel signs count with their letters ("श्री" passes the letter bar).
+- **A deleted name came back in another spelling**: after 臺灣大學 was deleted, 台湾大学 was a new name. A tombstone
+  now also holds the name folded as search folds it (Traditional and Simplified as one, accents dropped); those
+  0.16.0 wrote are still read.
+- **Quadratic reading of adversarial text**: a run of 10,000 spaces took a second per fact, and three such facts held
+  the rebuild's write lock for 6.5 s — the "aka" pattern began with a run of spaces, and quoted spans had no bound.
+  "aka" is found as a word and its spaces checked outside the pattern, and a quoted span is read up to 60 characters;
+  10,000 spaces, quotes, backticks or "a aka" take milliseconds.
+- **".NET" was the word "net".** Its key dropped the dot, so it was one entity with "net", and "a fishing net"
+  mentioned it. A leading dot before a letter or a digit is now part of the key (`.net`), a known name with one is
+  mentioned only with its dot, and the extractor and given names keep it. Keys written the old way are moved on a
+  writer's open (`_rekey_entities`), and tombstones written under them still hold. Curly single quotes ‘ ’ are now
+  edges of a key, as the double ones were.
+- **Japanese, Korean and Thai sentences in quotes were names.** They have no spaces and few or no Han characters, so
+  neither the word count nor the bar of 16 Han characters held. The bar now counts every letter of a script written
+  without spaces (Han, kana, Hangul, Thai...), and a quoted span ending as a Japanese or Korean sentence does — です,
+  ます, ません, ください…, 니다, 세요, 어요… — is something said ("私は学生です", "좋아요"); names ending in one of
+  their letters stay (ゆか, 캐나다). Words are also split where Han meets Hangul or Thai (Han with kana stays one, as
+  Japanese writes it).
+- **Text is read in NFC**, so a letter written with a combining accent is one letter ("José" either way). Markdown
+  code gives no names — spans of any run of backticks, fenced blocks of ``` (an unclosed one to the end; not when a
+  backtick follows on the same line, which is a span) and of ~~~ with a closing fence (`Alice Smith` in a code span was
+  a person, and ``Alice Smith aka Mallory Jones`` gave an established name an alias). Indented lines are not taken
+  for code: in notes they are nested lists ("Family:⏎    - Alice Smith (wife)"), which a draft lost.
+- **A short name someone gives is accepted**: "3M", "O2", "C++" failed the rule that a name is mostly letters even
+  when the agent named them. That rule is for names guessed from text; a given name needs one letter, may begin with
+  `.` `'` `$` before a letter (".net", "'s-Hertogenbosch", "$GME"), and loses invisible marks a browser leaves in it
+  (the bidi marks of an Arabic or Hebrew name) instead of being refused; a refusal is logged.
+- **A stored "X aka Y" took over a name two facts held, on the rebuild.** Fact ids stay through `update` and `change`,
+  so an old fact edited into "Mallory Jones aka Alice Smith" sorted before the facts about Alice Smith, and the replay
+  made her Mallory's alias. A name two facts held before the rebuild is now no "Y" a text may take.
+- **A tab joined the cells of a table into one name** ("Alice Smith⇥Bob Jones"), which the gate then refused whole;
+  a tab ends a name.
+- **Modifier letters cut a word**: ʻ ʼ ʿ (Hawaiʻi, Вʼячеслав, Muʿāwiya) counted as a script seam; they hold a word
+  together, as ー and 々 do in Japanese.
+- **Семён and Семен were two people**: ё is е in a key (Артём / Артем, Фёдор / Федор), and so in tombstones.
+- **The quotes of Chinese, Japanese and Korean were no quotes**: 「华为」, 《平凡的世界》, 『東京大学』, 〈小王子〉 gave
+  no names, and in scripts without case quotes are the only way a name is found.
+- **Vowel signs ended a word**: the word class leaves out the vowel signs of Indic and Thai script and Arabic harakat,
+  so "श्री राम aka Ram" had no side; they belong to their word now.
+- A function word is no side of "aka" ("Bruce Banner aka the Hulk" gave the alias "the"; "папа" stays an alias); one
+  lower-case word glued to Chinese is a product name more often than speech (“微信pay”, “小米pad” stay).
+
+### Not taken
+
+"hrr_dim" and "JD_COOKIE", which the reporter also deleted, are identifiers in code style: the gate keeps those
+("kanban.db", "gpt-4o" are names), so they stay provisional and `delete_entity` takes them out. A number glued to a
+word is read as an identifier either way ("mate60" and "14days" alike). A sentence-initial word in a capitalized run
+("Called Alice Smith") is left as it was: nothing tells it from "Jean Paul Sartre" at the start of a sentence. A
+tombstone holds the exact name deleted and its folded form (deleting 鍾楚紅 also suppresses 鐘楚紅: both fold to one
+Simplified spelling): after "Docker Hub直连可用" was deleted under 0.16.0, the rebuild may find
+"Docker Hub" in the same fact, which is another name. Found and left for later: a Russian name of several words is not
+mentioned in another case ("Марии Ивановой" does not mention "Мария Иванова"; one-word names are), as in 0.16.0.
+
+### Reviewed
+
+Before release the code went through reviews by Codex CLI (gpt-6.1-sol, then gpt-6-astra) and Antigravity CLI in
+throwaway copies, and by an agent on Claude Fable 5.1 (which found that two fixes of the first draft broke names
+that worked in 0.16.0: names with a dot inside, and indented lists); their findings are the entries above from "X aka Y next to a word of two scripts" on, each with a
+test. "14 DAYS" in quotes stays a provisional name: by its shape it is "50 Cent".
+
+### Measured
+
+- On the reporter's store (issue #4, 0.16.0): 49 entities (19 declared, 30 guessed) → 26 (19 declared, 7
+  provisional) after the rebuild, every removal junk, declared names kept every link, one name went from 4 linked
+  facts to 16, facts untouched (86); `delete_entity` removed the 7 provisional ones as documented.
+- Tests: 212 new in `tests/test_holographic_v0161.py` (129 fail on 0.16.0); the suite 1895 passed on Hermes 0.22.2.
+  On a family store (58 facts) the rebuild under the new rules changes nothing; 5,000 synthetic facts take 0.61 ms
+  per fact (0.45 in 0.16.0: the text is read more carefully), well inside the bounds of a rebuild on open.
+
 ## 0.16.0 — 2026-10-16
 
 Which names are entities (issue #4: on a Chinese store of ~150 facts, about 40 of 89 entities were regex fragments,

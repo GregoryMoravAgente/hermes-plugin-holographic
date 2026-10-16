@@ -2,6 +2,7 @@
 
 import contextlib
 import itertools
+from collections import Counter
 import logging
 import os
 import re
@@ -13,7 +14,9 @@ from pathlib import Path
 from . import holographic as hrr
 from .embeddings import text_hash
 from .history import HISTORY_SCHEMA, HistoryMixin, parse_day
-from .text import UNSEGMENTED, analyze, is_greeting, is_identifier, name_keys, zh_phrase
+from .text import UNSEGMENTED, _script, analyze, is_greeting, is_identifier, name_keys, zh_phrase
+from .text import fold as text_fold
+from .text import STOPWORDS, is_chinese, ja_ko_phrase, zh_word_cuts
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +113,7 @@ SCHEMA_VERSION = 2  # 1 = 0.1.x-0.3.x layout, 2 = + meta, entities.name_key, ent
 # The rules entities are guessed from a fact's text by (meta.entity_rules; none recorded = 1, before 0.16.0). A store
 # indexed under older rules is rebuilt on a writer's first open (rebuild_entity_index), up to the fact count below; a
 # larger one on request. Raise it with every change of _extract_entities / _name_shaped that drops what they took.
-_ENTITY_RULES = 2
+_ENTITY_RULES = 3  # 2: 0.16.0; 3: 0.16.1 (script seams, line breaks, leading symbols, counts in quotes)
 # Where an alias came from (entity_aliases.source, 0.16.0): 'user' (alias, rename, a merge someone asked for), 'aka'
 # ("X aka Y" in a fact's text: it goes with the last fact that says it) or 'legacy' (written before 0.16.0 or by an
 # older release since: kept like a given one, and dropped only when a forgotten fact said it as "X aka Y").
@@ -130,12 +133,30 @@ _MAX_COUNTED_IDS = 500  # record_retrievals batch cap (far under SQLite's bound-
 # Entity extraction, applied in order: capitalized multi-word phrases in any cased script ("John Doe", "Мария
 # Иванова"), short quoted terms (straight, curly, guillemets; straight quotes only at word boundaries, so
 # contractions like don't / it's never pair up), then both sides of "X aka Y".
-_RE_WORD = re.compile(r"[^\W\d_]+(?:-[^\W\d_]+)*")  # letters only; hyphenated names stay one word
-_RE_TOKEN = re.compile(r"\w+(?:-\w+)*")  # aka sides may be handles with digits
-_RE_QUOTED = (re.compile(r'(?<!\w)"([^"\n]+)"(?!\w)'), re.compile(r"(?<!\w)'([^'\n]+)'(?!\w)"),
-              re.compile(r"«([^»\n]+)»"), re.compile(r"“([^”\n]+)”"),
-              re.compile(r"„([^“”\n]+)[“”]"))
-_RE_AKA = re.compile(r"\s+(?:aka|a\.k\.a\.|also\s+known\s+as)\s+", re.IGNORECASE)
+# Combining marks are part of a word (0.16.1): \w leaves out the vowel signs of Indic and Thai script and Arabic
+# harakat, so "श्री राम aka Ram" had no side. Ranges: combining diacritics, Arabic marks, the Indic blocks, Thai, Lao,
+# Myanmar and Khmer signs.
+_MARKS = "".join(f"{chr(a)}-{chr(b)}" for a, b in (
+    (0x0300, 0x036F), (0x0610, 0x061A), (0x064B, 0x065F), (0x0670, 0x0670), (0x06D6, 0x06ED), (0x0900, 0x0DFF),
+    (0x0E31, 0x0E31), (0x0E34, 0x0E3A), (0x0E47, 0x0E4E), (0x0EB1, 0x0EB1), (0x0EB4, 0x0EBC), (0x0EC8, 0x0ECD),
+    (0x102B, 0x103E), (0x17B4, 0x17D3)))
+_RE_WORD = re.compile(r"(?:[^\W\d_]|[" + _MARKS + r"])+(?:-(?:[^\W\d_]|[" + _MARKS + r"])+)*")  # hyphenated: one word
+_RE_TOKEN = re.compile(r"(?:\w|[" + _MARKS + r"])+(?:-(?:\w|[" + _MARKS + r"])+)*")  # aka sides: handles with digits
+# Straight double quotes are found by _straight_quoted (0.16.1); single quotes keep \w beside them (don't, it's).
+# Bounded by _QUOTED_MAX_CHARS (a longer span is no name anyway): an opening mark without a closing one is then
+# read once, not to the end of the text from every opening mark (review 0.16.1: 5,000 "«" took 0.4 s).
+_RE_QUOTED = tuple(re.compile(p.replace("+", "{1,60}")) for p in (
+    r"(?<!\w)'([^'\n]+)'(?!\w)", r"«([^»\n]+)»", r"“([^”\n]+)”", r"„([^“”\n]+)[“”]",
+    # 0.16.1: the corner and title marks of Chinese, Japanese and Korean (「华为」, 《平凡的世界》, 『東京大学』): in scripts
+    # without case, quotes are the only way a name is found
+    r"「([^」\n]+)」", r"『([^』\n]+)』", r"《([^》\n]+)》", r"〈([^〉\n]+)〉"))
+# Spaces on one line (no line break of any kind: the str.splitlines boundaries) — also around "aka" (0.16.1)
+_INLINE_SPACE_CHAR = "[^\\S\n\r\x0b\x0c\x1c\x1d\x1e\x85" + chr(0x2028) + chr(0x2029) + "]"
+_INLINE_SPACE = _INLINE_SPACE_CHAR + "+"
+# The word alone, with one inline space on each side as lookarounds: a leading run of spaces in the pattern made a
+# text of 10,000 spaces quadratic (review 0.16.1); _aka_pairs checks the spaces around it.
+_RE_AKA = re.compile(f"(?<={_INLINE_SPACE_CHAR})(?:aka|a\\.k\\.a\\.|also{_INLINE_SPACE}known{_INLINE_SPACE}as)"
+                     f"(?={_INLINE_SPACE_CHAR})", re.IGNORECASE)
 # A comma too (0.16.0): the legacy aliases column is comma-separated, see _legacy_aliases.
 _RE_NOT_A_NAME = re.compile(r"[=/\\@<>{}\[\]|`,]|://|\b\d{1,3}(?:\.\d{1,3}){3}\b")
 # A quoted span longer than this is a quotation ("she said: 'see you on Friday'"), not a name. Chinese and Japanese
@@ -176,6 +197,20 @@ def entity_key(name: str) -> str:
     """Identity key of an entity name: NFKC, casefold, hyphens/underscores as spaces, whitespace collapsed, edge
     punctuation stripped. "Hermes Agent", "hermes-agent" and "HERMES  AGENT" are one entity; "coop" and "co-op" are
     not merged into each other (a hyphen becomes a space, it is not deleted)."""
+    text = " ".join(unicodedata.normalize("NFKC", name or "").casefold().replace("-", " ").replace("_", " ")
+                    .replace("ё", "е").split())  # Семён is Семен (0.16.1)
+    text = text.strip(_KEY_EDGES).rstrip(_KEY_EDGES + ".")
+    # A leading dot before a letter or a digit is part of the name (0.16.1): ".NET" is not "net", whose key it had,
+    # so the word "net" in "a fishing net" mentioned .NET
+    return text if text[:1] == "." and text[1:2].isalnum() else text.lstrip(_KEY_EDGES + ".")
+
+
+_KEY_EDGES = " ,;:!?'\"«»“”„‘’"  # ‘ ’ since 0.16.1
+
+
+def _entity_key_0160(name: str) -> str:
+    """entity_key as 0.16.0 and earlier computed it: the key a tombstone of then was written under, and that older
+    rows hold until _rekey_entities moves them."""
     text = unicodedata.normalize("NFKC", name or "").casefold().replace("-", " ").replace("_", " ")
     return " ".join(text.split()).strip(" .,;:!?'\"«»“”„")
 
@@ -186,11 +221,207 @@ def _is_capitalized(word: str) -> bool:
     return all(len(part) > 1 and part[0].isupper() and part[1:].islower() for part in word.split("-"))
 
 
+class _Piece:
+    """A part of a regex match, with the match's start / end / group interface."""
+    __slots__ = ("_start", "_end", "_text", "word")
+
+    def __init__(self, start: int, end: int, text: str, word: tuple[int, int]):
+        self._start, self._end, self._text = start, end, text
+        self.word = word  # (start, end) of the whole match the piece came from
+
+    def start(self) -> int:
+        return self._start
+
+    def end(self) -> int:
+        return self._end
+
+    def group(self, _=0) -> str:
+        return self._text
+
+
+def _script_pieces(text: str, pattern: re.Pattern) -> list[_Piece]:
+    """The matches of *pattern* in *text*, each split where its letters change script or letter case (Latin, Cyrillic,
+    Greek; Han, kana, Hangul, Thai...): "Hub直连可用" is two pieces, "Hub" and "直连可用", and "Hubе" two (0.16.1, issue #4:
+    "Docker Hub直连可用" was taken as one name). Hyphens and digits go with the letters after them; two pieces of one word
+    have no gap between them, so a run of names never crosses the seam."""
+    out = []
+    for m in pattern.finditer(text):
+        word, base = m.group(0), m.start()
+        start, key, last = 0, None, -1
+        for i, c in enumerate(word):
+            if not c.isalpha() or unicodedata.category(c) == "Lm":  # ʻ ʼ ー 々 hold a word together (0.16.1)
+                continue
+            cased = c.lower() != c.upper()
+            k = (_script(c), cased, "" if cased else _uncased_block(c))
+            if key is not None and k != key:
+                out.append(_Piece(base + start, base + last + 1, word[start:last + 1], (base, m.end())))
+                start = last + 1
+            key, last = k, i
+        out.append(_Piece(base + start, base + len(word), word[start:], (base, m.end())))
+    return out
+
+
+def _hugs(text: str, i: int) -> bool:
+    """Whether text[i] is a digit or a letter with case: a straight double quote beside one is no quote (a 5" screen,
+    an inch mark inside a word). A letter of a script without case may touch it: Chinese writes 用"Docker Hub"直连."""
+    if not 0 <= i < len(text):
+        return False
+    c = text[i]
+    return c.isdigit() or (c.isalpha() and c.lower() != c.upper())
+
+
+def _straight_quoted(text: str) -> list[str]:
+    """Spans between straight double quotes on one line, as a regex with lookarounds would pair them: an opening quote
+    not right after a digit or a letter with case, the next quote closing it unless a digit or such a letter follows
+    (0.16.1: the old word-character lookarounds missed 用"Docker Hub"直连, and character ranges missed full-width letters)."""
+    quotes = [i for i, c in enumerate(text) if c == '"']
+    out, k = [], 0
+    while k < len(quotes) - 1:
+        i, j = quotes[k], quotes[k + 1]
+        if not _hugs(text, i - 1) and i + 1 < j <= i + 1 + _QUOTED_MAX_CHARS and "\n" not in text[i + 1:j] \
+                and not _hugs(text, j + 1):
+            out.append(text[i + 1:j])
+            k += 2
+        else:
+            k += 1
+    return out
+
+
+_RE_FENCE = re.compile(r"[ ]{0,3}(`{3,}|~{3,})")
+_RE_TICKS = re.compile(r"`+")
+
+
+def _without_code(text: str) -> str:
+    """*text* with Markdown code blanked out, offsets kept: code is not a name (0.16.1: `Alice Smith` in a code span
+    was a person, and "True aka False" a pair). Fenced blocks — ``` with no backtick after it on the line (else it is
+    an inline span), to the closing fence or the end; ~~~ only with a closing fence, since a line of tildes is as often
+    a rule — and inline spans of any run of backticks closed by a run of the same length; one pass. Indented lines are
+    not taken for code: in notes they are nested lists ("Family:⏎    - Alice Smith", review 0.16.1). Blanked with NUL,
+    neither a letter nor a space, so no name runs across it."""
+    if "`" not in text and "~~~" not in text:
+        return text
+    chars = list(text)
+    lines = text.splitlines(keepends=True)
+    fences = [_RE_FENCE.match(line) for line in lines]
+    pos, fence = 0, None
+    for n, (line, m) in enumerate(zip(lines, fences)):
+        if m is not None and fence is None:
+            mark = m.group(1)[0]
+            opens = "`" not in line[m.end():] if mark == "`" else any(
+                f is not None and f.group(1)[0] == "~" for f in fences[n + 1:])
+            if opens:
+                fence = mark * 3
+                chars[pos:pos + len(line)] = "\0" * len(line)
+        elif fence is not None:
+            chars[pos:pos + len(line)] = "\0" * len(line)
+            if m is not None and m.group(1).startswith(fence):
+                fence = None
+        pos += len(line)
+    text = "".join(chars)
+    opened = None
+    for m in _RE_TICKS.finditer(text):
+        if opened is None:
+            opened = m
+        elif len(m.group(0)) == len(opened.group(0)):
+            chars[opened.start():m.end()] = "\0" * (m.end() - opened.start())
+            opened = None
+    return "".join(chars)
+
+
+def _mixed(name: str) -> bool:
+    """A word of two scripts or cases glued together ("华为mate60"): read as strictly as a name in quotes."""
+    return any(p.word != (p.start(), p.end()) for p in _script_pieces(name, _RE_TOKEN))
+
+
+_ZERO_WIDTH_JOINERS = chr(0x200C) + chr(0x200D)
+_MENTION_KEEPS = frozenset("'’&-‐‑_@#*%+")  # inside a word or a name: o'brien, at&t, jean-luc, c++
+
+
+def _mention_stretches(text: str) -> list[str]:
+    """*text* cut at everything the words of one name never stand across (0.16.1): line breaks and control characters,
+    invisible format characters, brackets, quotes and other punctuation but the few that hold words together
+    (_MENTION_KEEPS), and emoji. The analysis keeps the words and drops what stood between them, so before this
+    "Alice\nSmith", "Alice, Smith" and two items of a list mentioned Alice Smith."""
+    out, start = [], 0
+    for i, c in enumerate(text):
+        if c == "\t":
+            continue
+        cat = unicodedata.category(c)
+        if cat in ("Cc", "Zl", "Zp", "So", "Sk") or (cat == "Cf" and c not in _ZERO_WIDTH_JOINERS) \
+                or (cat[0] == "P" and c not in _MENTION_KEEPS and not _holds_word(text, i)):
+            if i > start:
+                out.append(text[start:i])
+            start = i + 1
+    if start < len(text):
+        out.append(text[start:])
+    return [_split_seams(stretch) for stretch in out]
+
+
+def _holds_word(text: str, i: int) -> bool:
+    """Whether the punctuation at *i* is part of a name, not a cut (review 0.16.1): a dot, colon or slash between two
+    letters or digits (Node.js, Яндекс.Такси, 1С:Предприятие, app.example.com), or the dot after an initial or a short
+    abbreviation (J. R. R. Tolkien, А. С. Пушкин, Dr. Alice Smith, U.S. Army). "Alice. Smith went" stays cut."""
+    c = text[i]
+    if c in ".:/" and 0 < i < len(text) - 1 and text[i - 1].isalnum() and text[i + 1].isalnum():
+        return True
+    if c != ".":
+        return False
+    j = i
+    while j > 0 and text[j - 1].isalpha():
+        j -= 1
+    return 1 <= i - j <= 2 and (j == 0 or not text[j - 1].isalnum())
+
+
+def _split_seams(stretch: str) -> str:
+    """*stretch* with a space where a word changes script, as the extractor reads it (0.16.1): "用Docker Hub直连" and
+    "на Docker Hubе" mention Docker Hub."""
+    cuts = [piece.start() for piece in _script_pieces(stretch, _RE_TOKEN) if piece.start() != piece.word[0]]
+    if not cuts:
+        return stretch
+    out, last = [], 0
+    for cut in cuts:
+        out += (stretch[last:cut], " ")
+        last = cut
+    return "".join(out) + stretch[last:]
+
+
+def _found_between_cuts(folded: str, name: str, cuts: frozenset) -> bool:
+    """Whether *name* occurs in *folded* Chinese text beginning and ending at word cuts (or beside a character that is
+    not Han, where a Han word ends anyway)."""
+    def cut(i: int) -> bool:
+        return i in cuts or i == 0 or i == len(folded) or not (
+            _RE_HAN.match(folded[i - 1]) and _RE_HAN.match(folded[i]))
+    start = folded.find(name) if name else -1
+    while start >= 0:
+        if cut(start) and cut(start + len(name)):
+            return True
+        start = folded.find(name, start + 1)
+    return False
+
+
+def _uncased_block(c: str) -> str:
+    """Which writing a letter without case belongs to, for _script_pieces: Hangul, Thai, Lao, Khmer, Myanmar apart, and
+    Han with kana as one (a Japanese word mixes them: 山田さん). Review 0.16.1: "测试삼성" was one piece."""
+    name = unicodedata.name(c, "")
+    for block in ("HANGUL", "THAI", "LAO", "KHMER", "MYANMAR"):
+        if name.startswith(block):
+            return block
+    return "CJK" if UNSEGMENTED.match(c) else _script(c)
+
+
+def _inline_gap(gap: str) -> bool:
+    """Spaces between two words of one name: some, and no line break of any kind — str.splitlines' boundaries: LF, CR,
+    VT, FF, NEL, the Unicode line and paragraph separators (0.16.1: a heading and a name on the next line were taken
+    as one name)."""
+    return bool(gap) and gap.isspace() and len(("x" + gap + "x").splitlines()) == 1 \
+        and not any(unicodedata.category(c) == "Cc" for c in gap)  # a tab too: cells of a table (review 0.16.1)
+
+
 def _capitalized_phrases(text: str) -> list[str]:
     """Names of two to five capitalized words in any cased script, minus a sentence-opening function word."""
     phrases = []
-    words_in_order = list(_RE_WORD.finditer(text))
-    run: list[re.Match] = []
+    words_in_order = _script_pieces(text, _RE_WORD)
+    run: list[_Piece] = []
 
     def flush():
         words = run[1:] if run and fold(run[0].group(0)) in _SENTENCE_STARTERS else run
@@ -198,7 +429,7 @@ def _capitalized_phrases(text: str) -> list[str]:
             phrases.append(text[words[0].start():words[-1].end()])
 
     for m in words_in_order:
-        if _is_capitalized(m.group(0)) and (not run or text[run[-1].end():m.start()].isspace()):
+        if _is_capitalized(m.group(0)) and (not run or _inline_gap(text[run[-1].end():m.start()])):
             run.append(m)
             continue
         flush()
@@ -209,23 +440,37 @@ def _capitalized_phrases(text: str) -> list[str]:
 
 def _aka_side(segment: str, *, from_end: bool) -> str | None:
     """The name right before (from_end) or right after an 'aka': a capitalized run, else a single token."""
-    tokens = list(_RE_TOKEN.finditer(segment))
+    tokens = _script_pieces(segment, _RE_TOKEN)
     if not tokens:
         return None
     edge = tokens[-1] if from_end else tokens[0]
     if (edge.end() != len(segment)) if from_end else (edge.start() != 0):
         return None  # punctuation between the name and 'aka'
+    if edge.word != (edge.start(), edge.end()):
+        # a word of two scripts ("华为mate60 aka Huawei"): the whole word is the side, alone, and _aka_pairs judges it
+        # as a name in quotes is judged (0.16.1: cutting it at the seam lost a model name and its alias)
+        return segment[edge.word[0]:edge.word[1]]
     picked = [edge]
     if _is_capitalized(edge.group(0)):
         neighbours = reversed(tokens[:-1]) if from_end else tokens[1:]
         for tok in neighbours:
             gap = segment[tok.end():picked[-1].start()] if from_end else segment[picked[-1].end():tok.start()]
-            if len(picked) >= _PHRASE_MAX_WORDS or not gap.isspace() or not _is_capitalized(tok.group(0)):
+            if len(picked) >= _PHRASE_MAX_WORDS or not _inline_gap(gap) or not _is_capitalized(tok.group(0)):
                 break
             picked.append(tok)
     if from_end:
         picked.reverse()
     return segment[picked[0].start():picked[-1].end()]
+
+
+def _clean_given(name) -> str:
+    """A name someone gives, without what they cannot have meant: edge punctuation (a leading dot stays: ".NET") and
+    invisible format characters such as the bidi marks a browser leaves in an Arabic or Hebrew name (ZWJ / ZWNJ stay
+    where the script writes them). Review 0.16.1: such a name was refused, silently."""
+    if not isinstance(name, str):
+        return ""
+    name = "".join(c for i, c in enumerate(name) if unicodedata.category(c) != "Cf" or _joiner_ok(name, i))
+    return name.strip(" ,;:!?").rstrip(".")
 
 
 def _legacy_aliases(names) -> str:
@@ -235,13 +480,41 @@ def _legacy_aliases(names) -> str:
     return ",".join(dict.fromkeys(n.strip() for n in names if isinstance(n, str) and n.strip() and "," not in n))
 
 
-def _valid_entity(name: str) -> bool:
-    """Reject what is not a name: too short or long, CLI flags, key=value, paths, URLs, IPs, mostly non-letters. The
+def _valid_entity(name: str, *, given: bool = False) -> bool:
+    """Reject what is not a name: too short or long, not beginning with a letter or a digit (".NET" may: a dot and a
+    capital), key=value, paths, URLs, IPs, mostly non-letters. The
     check for names someone gave (entities=[...], alias, rename); names guessed from text pass _name_shaped too."""
-    if not 2 <= len(name) <= _ENTITY_MAX_CHARS or name[0] in "-–—" or _RE_NOT_A_NAME.search(name):
+    if not 2 <= len(name) <= _ENTITY_MAX_CHARS or _RE_NOT_A_NAME.search(name):
+        return False
+    # The same checks on the form names are compared in (0.16.1): "https：／／example.com" is a URL once NFKC folds its
+    # full-width colon and slashes, as entity_key does; and no invisible format character (a zero-width space makes a
+    # copy of a deleted name that its tombstone does not know) — but ZWJ / ZWNJ, which some scripts write words with.
+    folded = unicodedata.normalize("NFKC", name)
+    if _RE_NOT_A_NAME.search(folded) or len(name.splitlines()) > 1 or any(
+            unicodedata.category(c) == "Cc" or (unicodedata.category(c) == "Cf" and not _joiner_ok(name, i))
+            for i, c in enumerate(name)):
+        return False
+    if not (name[0].isalnum() or (name[0] == "." and name[1:2].isupper())  # 0.16.1: "+.siliconflow.cn", "-flag"
+            or (given and name[0] in ".'’$" and name[1:2].isalnum())):  # given: ".net", "'s-Hertogenbosch", "$GME"
         return False
     visible = [c for c in name if not c.isspace()]
-    return sum(c.isalpha() for c in visible) >= 0.6 * len(visible)
+    if given:  # someone named it: "3M", "O2", "C++" are names; a letter is enough
+        return any(c.isalpha() for c in visible)
+    # vowel signs and other marks count with their letters (review 0.16.1: "श्री" fell under the bar)
+    return sum(c.isalpha() or unicodedata.category(c)[0] == "M" for c in visible) >= 0.6 * len(visible)
+
+
+_JOINER_SCRIPTS = frozenset({"arabic", "devanagari", "bengali", "indic"})
+
+
+def _joiner_ok(name: str, i: int) -> bool:
+    """A zero-width joiner or non-joiner between two letters (or a letter and a mark) of a script that writes words
+    with them; anywhere else it only makes a copy of a name that its key and tombstone do not know (review 0.16.1:
+    "Alice\u200d Smith" came back after "Alice Smith" was deleted)."""
+    if name[i] not in "\u200c\u200d" or not 0 < i < len(name) - 1:
+        return False
+    return all(_script(c) in _JOINER_SCRIPTS for c in (name[i - 1], name[i + 1]) if c.isalpha()) and \
+        any(c.isalpha() or unicodedata.category(c)[0] == "M" for c in (name[i - 1], name[i + 1]))
 
 
 def _name_shaped(name: str, *, quoted: bool) -> bool:
@@ -253,8 +526,8 @@ def _name_shaped(name: str, *, quoted: bool) -> bool:
     (text.zh_phrase: “先去搜索再告诉我答案”, “知道了”; 平凡的世界, 有赞科技有限公司 and 饿了么 stay), or more Han characters
     than a name has (a quotation). A name in lower case, or a phrase that only reads as one, is what someone said;
     the agent can still name it with entities, and what passes and is no name stays provisional."""
-    if not _valid_entity(name):
-        return False
+    if not _valid_entity(name) or any(unicodedata.category(c) in ("So", "Sk") for c in name):
+        return False  # an emoji or another picture is no part of a name guessed from text ("Alice🙂Smith")
     tokens = [t.strip(".,;:!?()'\"«»“”„") for t in name.split()]
     if any(_RE_VERSION.fullmatch(t) for t in tokens) and not any(
             any(c.isupper() or (c.isalpha() and c.lower() == c.upper()) for c in t)
@@ -262,11 +535,17 @@ def _name_shaped(name: str, *, quoted: bool) -> bool:
         return False
     if not quoted:
         return True
+    # Judged on the letters that have case, whatever else the span holds ("hrr_dim太大" too), and an identifier must
+    # have a letter in it: "14 days" is a count, "gpt-4o" a name (0.16.1, issue #4)
     cased = [c for c in name if c.isalpha() and c.lower() != c.upper()]
-    if cased and len(cased) == sum(c.isalpha() for c in name) and not any(c.isupper() for c in cased) \
-            and not any(is_identifier(t) for t in tokens):
+    if cased and not any(c.isupper() for c in cased) \
+            and not any(is_identifier(t) and any(c.isalpha() for c in t) for t in tokens) \
+            and not (len(tokens) == 1 and _mixed(name)):  # one word glued to Chinese: 微信pay, 小米pad (review 0.16.1)
         return False
-    return len(_RE_HAN.findall(name)) <= _QUOTED_MAX_HAN and not is_greeting(name) and not zh_phrase(name)
+    # Every letter of a script written without spaces counts (Han, kana, Hangul, Thai...: review 0.16.1, a Japanese or
+    # Thai sentence in quotes has no space and few Han), and Japanese and Korean predicates end what is said
+    return sum(len(run) for run in UNSEGMENTED.findall(name)) <= _QUOTED_MAX_HAN and not is_greeting(name) \
+        and not zh_phrase(name) and not ja_ko_phrase(name)
 
 
 def _restrict_permissions(db_path: Path) -> None:
@@ -394,12 +673,36 @@ class MemoryStore(HistoryMixin):
                         self._conn.execute("INSERT OR IGNORE INTO entity_aliases (alias_key, entity_id, alias) VALUES (?, ?, ?)",
                                            (key, row["entity_id"], alias.strip()))
             self._reconcile_entity_keys()
+            self._rekey_entities()
             self._conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_key ON entities(name_key) WHERE name_key IS NOT NULL")
             self._sync_hrr_dim()
             self._migrate_history()
             self._bump()
             self._conn.execute("INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
                                "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(SCHEMA_VERSION),))
+
+    def _rekey_entities(self) -> None:
+        """Keys and alias keys written before entity_key changed (0.16.1: ".NET" was "net", "‘Alice’" was "‘alice’") are
+        moved to today's; an entity whose new key another one holds is merged into it, an alias row whose new key is
+        taken goes (the other row already says it)."""
+        for r in self._conn.execute("SELECT entity_id, name, name_key, entity_type FROM entities "
+                                    "WHERE name_key IS NOT NULL ORDER BY entity_id").fetchall():
+            key = entity_key(r["name"])
+            if not key or key == r["name_key"]:
+                continue
+            owner = self._one("SELECT entity_id FROM entities WHERE name_key = ? AND entity_id != ?", (key, r["entity_id"]))
+            if owner is None:
+                self._conn.execute("UPDATE entities SET name_key = ? WHERE entity_id = ?", (key, r["entity_id"]))
+            else:
+                self._merge_into(r["entity_id"], owner[0], declared=r["entity_type"] == "declared")
+        for r in self._conn.execute("SELECT alias_key, entity_id, alias FROM entity_aliases").fetchall():
+            key = entity_key(r["alias"])
+            if not key or key == r["alias_key"]:
+                continue
+            if self._one("SELECT 1 FROM entity_aliases WHERE alias_key = ?", (key,)) is None:
+                self._conn.execute("UPDATE entity_aliases SET alias_key = ? WHERE alias_key = ?", (key, r["alias_key"]))
+            else:
+                self._conn.execute("DELETE FROM entity_aliases WHERE alias_key = ?", (r["alias_key"],))
 
     def _reconcile_entity_keys(self) -> None:
         """Fill missing name keys; merge entities whose keys collide into the oldest of them."""
@@ -817,11 +1120,13 @@ class MemoryStore(HistoryMixin):
         a name delete_entity removed."""
         if not isinstance(name, str) or not isinstance(alias, str):
             raise ValueError("an alias needs two names")
+        if source == "user":
+            name, alias = _clean_given(name), _clean_given(alias)
         key, alias_key = entity_key(name), entity_key(alias)
         if not key or not alias_key or key == alias_key:
             raise ValueError("an alias needs two different non-empty names")
         for side in (name, alias):  # a name someone gives passes what every given name does (review 0.16.0)
-            if not _valid_entity(side.strip()):
+            if not _valid_entity(side.strip(), given=True):
                 raise ValueError(f"'{side.strip()[:80]}' cannot be a name (2-{_ENTITY_MAX_CHARS} characters, mostly "
                                  "letters; no paths, URLs, key=value, commas or flags)")
         with self._tx():
@@ -936,31 +1241,41 @@ class MemoryStore(HistoryMixin):
 
     def _extract_entities(self, text: str) -> list[str]:
         """Entity candidates (see the pattern table) shaped like a name (_name_shaped) and not deleted (delete_entity),
-        deduplicated by casefold in first-seen order."""
+        deduplicated by casefold in first-seen order. The text is read in NFC, so a letter written with a combining
+        accent is one letter ("José" either way), and with code spans and blocks blanked out (0.16.1)."""
+        text = _without_code(unicodedata.normalize("NFC", text or ""))
+        quoted = _straight_quoted(text) + [m.group(1) for pattern in _RE_QUOTED for m in pattern.finditer(text)]
         found = [(n, False) for n in _capitalized_phrases(text)] + [
-            (m.group(1), True) for pattern in _RE_QUOTED for m in pattern.finditer(text)
-            if len(m.group(1)) <= _QUOTED_MAX_CHARS and len(m.group(1).split()) <= _QUOTED_MAX_WORDS]
+            (q, True) for q in quoted if len(q) <= _QUOTED_MAX_CHARS and len(q.split()) <= _QUOTED_MAX_WORDS]
         for left, right in self._aka_pairs(text):
             found += [(left, False), (right, False)]
         uniq: dict[str, str] = {}  # casefolded key -> first-seen spelling, insertion-ordered
         for raw, quoted in found:
-            name = raw.strip(" .,;:!?") if raw else ""
+            name = raw.strip(" ,;:!?").rstrip(".") if raw else ""  # a leading dot stays: ".NET" (0.16.1)
             if name and fold(name) not in uniq and _name_shaped(name, quoted=quoted) and not self._tombstoned(name):
                 uniq[fold(name)] = name
         return list(uniq.values())
 
     def _aka_pairs(self, text: str) -> list[tuple[str, str]]:
-        """(name, alias) for the first _AKA_MAX "X aka Y" in *text* whose sides are shaped like names and not deleted.
+        """(name, alias) for the first _AKA_MAX "X aka Y" in *text* (NFC, code blanked: see _extract_entities) whose
+        sides are shaped like names and not deleted.
         Each side is read within _AKA_WINDOW characters of its "aka": reading the whole text before and after every
         "aka" made a 10,000-character chain of them take a second per fact (review 0.16.0). A name is at most
         _ENTITY_MAX_CHARS long, far under the window, so a run the window cuts is too long to be a name anyway."""
+        text = _without_code(unicodedata.normalize("NFC", text or ""))
         pairs = []
         for m in itertools.islice(_RE_AKA.finditer(text), _AKA_MAX):
-            left = _aka_side(text[max(0, m.start() - _AKA_WINDOW):m.start()], from_end=True)
-            right = _aka_side(text[m.end():m.end() + _AKA_WINDOW], from_end=False)
-            left, right = (n.strip(" .,;:!?") if n else "" for n in (left, right))
-            if _name_shaped(left, quoted=False) and _name_shaped(right, quoted=False) and entity_key(left) != entity_key(right) \
-                    and not self._tombstoned(left) and not self._tombstoned(right):
+            before, after = text[max(0, m.start() - _AKA_WINDOW):m.start()], text[m.end():m.end() + _AKA_WINDOW]
+            left_text, right_text = before.rstrip(), after.lstrip()
+            if not (_inline_gap(before[len(left_text):]) and _inline_gap(after[:len(after) - len(right_text)])):
+                continue  # "aka" on a line of its own
+            left = _aka_side(left_text, from_end=True)
+            right = _aka_side(right_text, from_end=False)
+            left, right = (n.strip(" ,;:!?").rstrip(".") if n else "" for n in (left, right))
+            if text_fold(left.lower()) in STOPWORDS or text_fold(right.lower()) in STOPWORDS:
+                continue  # "Bruce Banner aka the Hulk": "the" is no alias (review 0.16.1)
+            if _name_shaped(left, quoted=_mixed(left)) and _name_shaped(right, quoted=_mixed(right)) \
+                    and entity_key(left) != entity_key(right) and not self._tombstoned(left) and not self._tombstoned(right):
                 pairs.append((left, right))
         return pairs
 
@@ -988,8 +1303,10 @@ class MemoryStore(HistoryMixin):
         """Link names the caller declared (one-word names allowed) and mark them declared. A declared name is someone
         naming it: a tombstone of delete_entity on it is lifted."""
         for name in declared or ():
-            name = name.strip(" .,;:!?") if isinstance(name, str) else ""
-            if _valid_entity(name):
+            name = _clean_given(name)
+            if not _valid_entity(name, given=True):
+                logger.info("holographic: a declared name of %d characters is no name; not linked", len(name))
+            else:
                 self._lift_tombstones(name)
                 entity_id = self._resolve_entity(name)
                 if self._write("UPDATE entities SET entity_type = 'declared' WHERE entity_id = ? AND entity_type != 'declared'",
@@ -1014,6 +1331,10 @@ class MemoryStore(HistoryMixin):
                         names.setdefault(row["entity_id"], []).append(row["alias"])
                 for row in self._conn.execute("SELECT entity_id, name, aliases, entity_type FROM entities"):
                     for name in [row["name"], *((row["aliases"] or "").split(",")), *names.get(row["entity_id"], [])]:
+                        name = unicodedata.normalize("NFKC", name)  # as mentioned_entity_ids reads text
+                        if name.strip().startswith(".") and len(name.strip()) > 1:  # ".NET": with its dot, below
+                            index.setdefault(".", []).append((int(row["entity_id"]), name.strip().lower()))
+                            continue
                         key = name_keys(name)
                         if len(key) > 1 or (key and row["entity_type"] == "declared"):
                             for first in key[0][0]:
@@ -1028,22 +1349,40 @@ class MemoryStore(HistoryMixin):
         """Known entities whose name (or alias) occurs in *text* as a run of words: a Latin-script name as written
         (or with 's), a name in another script by its keys, so "Маши" and "Машу" mention "Маша" and "لإيفا" mentions
         "إيفا", while "jeans" does not mention "Jean" and "машина" not "Маша". Looked up by each word's keys, not by
-        scanning names."""
-        sequence = analyze(text).words
+        scanning names. The text is read in NFKC, as names are indexed, and stretch by stretch between separators
+        (0.16.1): the words of one name stand together on one line, never across a line break, a comma or a bracket
+        ("Alice\nSmith" and "Alice, Smith" do not mention Alice Smith)."""
+        text = unicodedata.normalize("NFKC", text or "")
         index = self._known_entities()
         found = set()
-        for i, word in enumerate(sequence):
-            for first in word.keys:
-                for entity_id, key in index.get(first, ()):
-                    if entity_id not in found and len(sequence) - i >= len(key) and all(
-                            sequence[i + j].text in forms if exact else not forms.isdisjoint(sequence[i + j].keys)
-                            for j, (forms, exact) in enumerate(key)):
+        for stretch in _mention_stretches(text):
+            sequence = analyze(stretch).words
+            for i, word in enumerate(sequence):
+                for first in word.keys:
+                    for entity_id, key in index.get(first, ()):
+                        if entity_id not in found and len(sequence) - i >= len(key) and all(
+                                sequence[i + j].text in forms if exact else not forms.isdisjoint(sequence[i + j].keys)
+                                for j, (forms, exact) in enumerate(key)):
+                            found.add(entity_id)
+        lowered_text = text.lower()
+        for entity_id, name in index.get(".", ()):  # ".NET" with its dot, not the word "net" (0.16.1)
+            if entity_id not in found and re.search(r"(?<![\w.])" + re.escape(name) + r"(?!\w)", lowered_text):
+                found.add(entity_id)
+        substring_names = index.get("", ())
+        if substring_names and UNSEGMENTED.search(text):  # a name in Chinese/Thai text has no spaces around it
+            if is_chinese(text):
+                # From word cut to word cut only (0.16.1: 和服 was found in 我和服务员, "I and the waiter"), Traditional
+                # and Simplified as one
+                folded = analyze(text).text
+                cuts = zh_word_cuts(folded)
+                for entity_id, name in substring_names:
+                    if entity_id not in found and _found_between_cuts(folded, text_fold(name), cuts):
                         found.add(entity_id)
-        if UNSEGMENTED.search(text or ""):  # a name in Chinese/Thai text has no spaces around it: substring match
-            lowered = text.lower()
-            for entity_id, name in index.get("", ()):
-                if name in lowered:
-                    found.add(entity_id)
+            else:
+                lowered = text.lower()
+                for entity_id, name in substring_names:
+                    if name in lowered:
+                        found.add(entity_id)
         return found
 
     def _resolve_entity(self, name: str) -> int:
@@ -1141,12 +1480,21 @@ class MemoryStore(HistoryMixin):
         """A deleted name is kept as a keyed hash, as the text of a forgotten fact is: the file never says it."""
         return self.digest("entity " + entity_key(name))
 
+    def _name_digests(self, name: str) -> set[str]:
+        """The digests a deleted name is kept under: its key, and its key folded as search folds words (Traditional and
+        Simplified Chinese as one, accents dropped), so 台湾大学 is suppressed after 臺灣大學 was deleted (review 0.16.1).
+        The first is what 0.16.0 wrote."""
+        key = entity_key(name)
+        return {self.digest("entity " + k) for k in (key, text_fold(key), _entity_key_0160(name))}
+
     def _tombstoned(self, name: str) -> bool:
         """Whether delete_entity removed this name: text never creates it again."""
         if not self._entry.get("migrated") or not entity_key(name) \
                 or self._one("SELECT 1 FROM entity_tombstones LIMIT 1") is None:
             return False
-        return self._one("SELECT 1 FROM entity_tombstones WHERE digest = ?", (self._name_digest(name),)) is not None
+        digests = sorted(self._name_digests(name))
+        return self._one(f"SELECT 1 FROM entity_tombstones WHERE digest IN ({','.join('?' * len(digests))})",
+                         digests) is not None
 
     def _lift_tombstones(self, *names: str) -> None:
         """Someone named it (entities=[...], alias, rename): a deleted name may be created from text again."""
@@ -1154,7 +1502,8 @@ class MemoryStore(HistoryMixin):
             return
         for name in names:
             if entity_key(name or ""):
-                self._write("DELETE FROM entity_tombstones WHERE digest = ?", (self._name_digest(name),))
+                for digest in sorted(self._name_digests(name)):
+                    self._write("DELETE FROM entity_tombstones WHERE digest = ?", (digest,))
 
     def _reencode(self, fact_ids) -> int:
         """Vectors of facts whose entities changed: computed again; without numpy emptied, so that the next writer that
@@ -1203,7 +1552,7 @@ class MemoryStore(HistoryMixin):
                 self._write("DELETE FROM entity_aliases WHERE entity_id = ?", (entity_id,))
                 self._write("DELETE FROM entities WHERE entity_id = ?", (entity_id,))
             if self._entry.get("migrated"):
-                for digest in sorted({self._name_digest(n) for n in names if entity_key(n)}):
+                for digest in sorted({d for n in names if entity_key(n) for d in self._name_digests(n)}):
                     self._write("INSERT OR IGNORE INTO entity_tombstones (digest) VALUES (?)", (digest,))
                 self._write("INSERT INTO meta (key, value) VALUES ('scrub_pending', '1') "
                             "ON CONFLICT(key) DO UPDATE SET value = excluded.value")
@@ -1219,9 +1568,9 @@ class MemoryStore(HistoryMixin):
         refused: two entities become one only through alias, never through a rename (a typo would merge two people).
         KeyError for an unknown name; ValueError for an empty or unusable new name, or one that names two entities."""
         self._require_writer()
-        new = new_name.strip(" .,;:!?") if isinstance(new_name, str) else ""
+        new = _clean_given(new_name)
         new_key = entity_key(new)
-        if not new_key or not _valid_entity(new):
+        if not new_key or not _valid_entity(new, given=True):
             raise ValueError(f"'{str(new_name)[:80]}' cannot be a name (2-{_ENTITY_MAX_CHARS} characters, mostly letters; "
                              "no paths, URLs, key=value, commas or flags)")
         with self._tx():
@@ -1286,13 +1635,18 @@ class MemoryStore(HistoryMixin):
             protected = {r[0] for r in self._conn.execute("SELECT entity_id FROM entities WHERE entity_type = 'declared'")}
             protected |= {r[0] for r in self._conn.execute(f"SELECT entity_id FROM entity_aliases{given}")}
             old = {(r[0], r[1]) for r in self._conn.execute("SELECT fact_id, entity_id FROM fact_entities")}
+            # A name two facts held before the rebuild is no "Y" an "X aka Y" may take: fact ids stay through change
+            # and update, so "earlier id" is not "said earlier" (review 0.16.1). Not kept by this alone: junk two
+            # facts held still goes when the rules no longer guess it.
+            held = Counter(entity_id for _, entity_id in old)
+            established = {entity_id for entity_id, n in held.items() if n >= 2}
             facts = self._conn.execute("SELECT fact_id, content FROM facts ORDER BY fact_id").fetchall()
             first: set[tuple[int, int]] = set()
             named: set[int] = set()  # entities an earlier fact of this pass named
             for f in facts:
                 for left, right in self._aka_pairs(f["content"]):
                     # Y left over from the old index and not named yet: the alias adding this fact would have made
-                    if not set(self.entity_ids(right)) & (protected | named):
+                    if not set(self.entity_ids(right)) & (protected | named | established):
                         try:
                             self.add_alias(left, right, source="aka")
                         except ValueError:  # Y is another entity's alias already

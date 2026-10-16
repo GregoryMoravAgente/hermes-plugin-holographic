@@ -67,6 +67,12 @@ not the gate's job: it stays `provisional` until a second fact or a person confi
 `entity_tombstones` as keyed hashes; nothing may store a deleted name in clear, and an alias a text gave (`aka`) goes,
 with the name it brought, when the last fact saying it goes. Reads use `name_key` / `entity_aliases` whenever the file
 has them (`_keyed`), writes only after this process migrated (`_entry["migrated"]`, `_require_writer`).
+Since 0.16.1 every rule reads text the same way in three places — `_extract_entities`, `_aka_pairs` and
+`mentioned_entity_ids`: NFC (NFKC for mentions), code blanked (`_without_code`), words split at script seams
+(`_script_pieces`; marks and modifier letters belong to their word), no name across a line break, a tab or the
+separators `_mention_stretches` cuts at (but a dot inside a word or after an initial). A fix in one of them belongs
+in the others, and every fix is measured on names that must stay (Node.js, nested lists, 平凡的世界) before it ships:
+two fixes of the first 0.16.1 draft broke names that 0.16.0 found.
 
 ## Open work
 

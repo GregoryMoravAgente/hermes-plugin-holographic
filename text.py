@@ -1795,6 +1795,37 @@ def zh_phrase(span: str) -> bool:
         {w for w in words if w in ZH_PHRASE_WORDS} - {"的"}) >= _ZH_PHRASE_MIN_WORDS
 
 
+
+
+# How a Japanese or Korean sentence ends (0.16.1): polite and plain predicates, several kana or syllables long, so a
+# name that ends in one of their letters (ゆか, あやね, 캐나다, 혼다) is not taken for a sentence.
+JA_PREDICATE_ENDINGS = ("です", "ます", "ません", "ました", "でした", "ましょう", "でしょう", "ください", "だった",
+                        "ない", "なかった", "たい", "かもしれない")
+KO_PREDICATE_ENDINGS = ("니다", "세요", "어요", "아요", "해요", "에요", "예요", "까요", "네요", "군요")
+
+
+def ja_ko_phrase(span: str) -> bool:
+    """A quoted Japanese or Korean span that ends as a sentence does ("私は学生です", "明日は雨が降るかもしれません",
+    "좋아요"), not as a name."""
+    words = span.strip().rstrip("。.!?！？、,").split()
+    last = words[-1] if words else ""
+    if _KANA.search(span) and last.endswith(JA_PREDICATE_ENDINGS):
+        return True
+    return _HANGUL.search(span) is not None and last.endswith(KO_PREDICATE_ENDINGS)
+
+def zh_word_cuts(folded: str) -> frozenset:
+    """Offsets in *folded* text where a Chinese word ends and the next begins, as zh_words splits each run of Han
+    characters, the edges of every run included (0.16.1): a known name is found in Chinese text only from cut to cut,
+    so 和服 is not in 我和服务员 (和 | 服务员) while 小米科技 is in 我在小米科技工作 (小米 | 科技)."""
+    cuts = set()
+    for m in _ZH_HAN.finditer(folded):
+        pos = m.start()
+        cuts.add(pos)
+        for word in zh_words(m.group()):
+            pos += len(word)
+            cuts.add(pos)
+    return frozenset(cuts)
+
 def _zh_run_grams(run: str, query: bool) -> list[tuple[str, float]]:
     """run_grams of Chinese text with its words: a pair across a seam is written with SEAM between its characters, a
     one-character word is a gram of its own. *run* may hold other characters too (a word of analyze: "10月23日（周五）

@@ -119,14 +119,19 @@ In `config.yaml` under `plugins.hermes-memory-store`:
 - **probe**: every fact linked to a named entity, from the entity index (name or alias, any letter case).
   **reason**: facts linked to *all* of several entities; when a name is not a known entity, keyword search that still
   requires every name. Entities are linked when a fact is stored: capitalized names of two to five words in any cased
-  script (`Alice Smith`, `Мария Иванова`, `Jean-Luc Picard`), short quoted terms (`"Phoenix"`, `«Сбер Бизнес»`,
-  `“华为”`) and both sides of `X aka Y` (Y becomes X's alias only while no fact has named Y on its own); flags,
-  `key=value`, paths, URLs, IPs and commas are not names, and neither is a version number with nothing beside it that
-  names a thing ("0.17.0 installed"; "Python 3.12" is one), a quoted span all in lower case without an identifier in it
-  ('count', «быстро беги»; 'kanban.db' and 'gpt-4o' are), a quoted greeting ("Good morning", «Спасибо большое»,
+  script on one line, ending where the script changes (`Alice Smith`, `Мария Иванова`, `Jean-Luc Picard`; "Docker
+  Hub直连可用" gives `Docker Hub`), short quoted terms (`"Phoenix"`, `«Сбер Бизнес»`, `“华为”`, `「华为」`, `《平凡的世界》`,
+  straight quotes beside Chinese characters too) and both sides of `X aka Y` (Y becomes X's alias only while no fact has named Y on its own);
+  code spans and blocks give none, and a known name of several words is mentioned only as written together on one
+  line (in Chinese, never across a seam between two words); a name begins with a letter or a digit, holds no invisible
+  character, passes these checks in its NFKC form too, and flags, `key=value`, paths, URLs, IPs and commas are not names, and
+  neither is a version number with nothing beside it that names a thing ("0.17.0 installed"; "Python 3.12" is one), a
+  quoted span whose letters with case are all lower case and that holds no identifier with a letter in it ('count',
+  '14 days', «быстро беги»; 'kanban.db' and 'gpt-4o' are), a quoted greeting ("Good morning", «Спасибо большое»,
   “谢谢”), a quoted Chinese span that reads as something said — ending in a sentence-final particle (“知道了”) or with
   three or more function words besides 的 (“先去搜索再告诉我答案”; titles and brands with one or two, 平凡的世界,
-  饿了么, 有赞科技有限公司, are names) — or one of more than 16 Han characters. A one-word name is not linked; probing it
+  饿了么, 有赞科技有限公司, are names) — or one of more than 16 Han characters. A name someone gives (`entities`,
+  `alias`, `rename`) skips these rules and needs only a letter ("3M", "C++"). A one-word name is not linked; probing it
   falls back to keyword search. When these rules change, a writer rebuilds the index on its first open (up to 2,000
   facts and 500,000 characters; a larger store says so in `stats` and is rebuilt with **rebuild_entities**), reading
   the facts in the order they were stored as adding them would; declared names, aliases someone gave and their links
