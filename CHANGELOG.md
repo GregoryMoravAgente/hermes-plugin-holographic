@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Documented
+
+- **What leaves the machine**, in the README as the catalog disclosure now says it (reviewed by a Hermes maintainer,
+  NousResearch/hermes-agent#138230): fact texts also go to the endpoint after a cron job's turn while `cron_writes`
+  is on, and the key is read from `OPENAI_API_KEY` when `embedding_key_env` names no other variable, then sent as a
+  Bearer token to whatever `embedding_url` is configured.
+- 0.15.2 on a Chinese store (issue #3, bge-m3): eighteen probes live as expected, and offline 0 of 84 facts refused,
+  left out of recall or kept from the endpoint; the 310 names and the address rule cost nothing there, the vendor
+  names that store uses included.
+- **Two layers on Hermes 0.22.2.** The core masks `NAME=value` in tool-call arguments before they reach the plugin, so
+  an assignment arrives as `NAME=***`, which the placeholder rule keeps as a fact. It does not mask a password inside
+  a connection string: the plugin refuses that one itself (`postgres://app:…@db`, seen live in issue #3). The core
+  hides variable values; the plugin catches what it lets through — an address with a password, a key glued to text,
+  a credential word with its value.
+
 ## 0.15.2 — 2026-10-16
 
 ### Fixed

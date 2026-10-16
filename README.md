@@ -649,8 +649,12 @@ it — unless an index or trigger of the old deployment uses the column: drop th
   and how many facts have a vector, wait for one, or are never sent.
 
 **What leaves the machine.** To the endpoint you name: the text of every fact (once, again when it changes) and of
-every message and `fact_store search` query that passes the checks above; the key from the variable you name, in an Authorization header (a key
-with a space or a line break inside is refused, and errors are logged as categories, never with the request in them).
+every message and `fact_store search` query that passes the checks above. Fact texts go out after a cron job's turn
+too while `cron_writes` is on: a job that may write also makes missing fact vectors. The key is read from the
+variable `embedding_key_env` names — `OPENAI_API_KEY` when it names none — and sent as a Bearer token in the
+Authorization header to whatever `embedding_url` is configured, so point the URL only at a provider you mean to give
+that key to (a key with a space or a line break inside is refused, and errors are logged as categories, never with
+the request in them).
 Not sent: a fact recall would not inject (instruction-like text, markup, an image — the same check recall makes), and
 a fact or a message that looks like it holds a secret — a credential word with its value, an environment assignment
 such as `OPENAI_API_KEY=…`, an Authorization header, the prefixes of common API keys and tokens (`sk-`, `ghp_`,
