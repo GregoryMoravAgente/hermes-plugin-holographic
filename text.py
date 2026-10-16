@@ -1770,6 +1770,31 @@ def is_chinese(text: str) -> bool:
         _HANGUL.search(text) is None
 
 
+# Chinese function words, as words of their own: pronouns, particles, aspect and modal markers, a few adverbs and
+# prepositions (0.16.0). Words, not characters: 别克 (Buick), 网吧, 了解 and 他山之石 hold these characters inside one
+# word of the dictionary. Names hold one or two of them as words too — 有赞, 去哪儿, 和记黄埔, 平凡的世界, 我和我的祖国,
+# 这个杀手不太冷 — so a quoted span is a phrase someone said only with three or more different ones besides 的
+# ("先去搜索再告诉我答案": 先 去 再 我), or when its last word is a sentence-final particle ("知道了", "明天再说吧").
+ZH_PHRASE_WORDS = frozenset("""
+    我 你 您 他 她 它 我们 你们 他们 她们 咱们 的 了 着 过 吗 呢 吧 啊 呀 把 被 让 给 请 别 就 都 也 再 还 又 很 太 不 没
+    没有 要 会 能 可以 这 那 哪 这个 那个 什么 怎么 为什么 先 到 去 来 在 是 有 和 跟 向 从 对""".split())
+ZH_FINAL_PARTICLES = frozenset("了 吗 呢 吧 啊 呀 啦 哦 嘛 呗".split())  # 么 is not one: 饿了么, 什么
+_ZH_PHRASE_MIN_WORDS = 3
+
+
+def zh_phrase(span: str) -> bool:
+    """A Chinese span that reads as something said, not a name (see ZH_PHRASE_WORDS). False for text that is not
+    Chinese, and without the word list (zh_words then gives single characters, and the words would turn into a list of
+    characters)."""
+    if not is_chinese(span) or not _zh_table().words:
+        return False
+    words = [w for m in _ZH_HAN.finditer(fold(span)) for w in zh_words(m.group())]
+    if not words:
+        return False
+    return words[-1] in ZH_FINAL_PARTICLES or len(
+        {w for w in words if w in ZH_PHRASE_WORDS} - {"的"}) >= _ZH_PHRASE_MIN_WORDS
+
+
 def _zh_run_grams(run: str, query: bool) -> list[tuple[str, float]]:
     """run_grams of Chinese text with its words: a pair across a seam is written with SEAM between its characters, a
     one-character word is a gram of its own. *run* may hold other characters too (a word of analyze: "10月23日（周五）

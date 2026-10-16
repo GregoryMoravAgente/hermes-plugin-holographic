@@ -534,6 +534,8 @@ class HistoryMixin:
         named = [r[0] for r in self._conn.execute("SELECT entity_id FROM fact_entities WHERE fact_id = ?", (fact_id,))]
         if row is not None:
             texts.append(row["content"])
+        said = self._aka_alias_keys(texts)  # the "Y" of its "X aka Y", read while the text is still here (0.16.0)
+        if row is not None:
             self._delete_fact_row(fact_id, row["category"])
         # A name only the forgotten fact gave goes even if it has aliases (_drop_orphan_entities keeps those).
         for entity_id in named:
@@ -541,6 +543,10 @@ class HistoryMixin:
                 if self._entry.get("migrated"):
                     self._write("DELETE FROM entity_aliases WHERE entity_id = ?", (entity_id,))
                 self._write("DELETE FROM entities WHERE entity_id = ?", (entity_id,))
+                self._bump()  # the cached index of known names must not hand out the deleted id (review 0.16.0)
+        if said:  # an alias of unknown origin that only this fact said goes with it, as one from its text does
+            self._prune_aka_aliases(legacy_keys=said)
+            self._drop_orphan_entities()
         versions = self._write("DELETE FROM fact_versions WHERE fact_id = ?", (fact_id,)).rowcount
         if self._entry.get("migrated"):  # the row may be gone already (another writer): its vector goes regardless
             self._write("DELETE FROM fact_embeddings WHERE fact_id = ?", (fact_id,))

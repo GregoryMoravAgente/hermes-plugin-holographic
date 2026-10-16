@@ -51,6 +51,23 @@ through the word scan in `retrieval.py` (`_texts`, `_scan_candidates`), not FTS5
 whose words FTS5 splits or whose inflection is a prefix. The README "Languages" section states how every number was
 obtained; keep it that way.
 
+## Entities
+
+Names come from a fact's text (`store._extract_entities`: capitalized runs, quotes, `X aka Y`) through
+`_name_shaped`, or from someone (`entities=[...]`, `alias`, `rename`), which only `_valid_entity` checks. Any change
+of the text rules that drops what they used to take must raise `_ENTITY_RULES` in `store.py`: a writer's first open
+then rebuilds the index of every store up to `_AUTO_REBUILD_MAX_FACTS` facts (0.40 ms per fact measured, 0.16.0),
+leaving declared entities, given and legacy aliases (`entity_aliases.source` other than `aka`) and their links
+alone. The rebuild replays the facts in stored order, as adding them would: a text must never merge a name already in
+use (that was a hijack: "Mallory Jones aka Alice Smith"). A rule for a language goes into `text.py` beside its other
+data (`ZH_PHRASE_WORDS`, `ZH_FINAL_PARTICLES`), by words the language's own split gives, never by characters — a
+character rule drops names that hold the character inside one word (别克, 网吧) — and is measured on real titles and
+brands before it drops anything (平凡的世界, 我和我的祖国 hold function words). A phrase that only reads as a name is
+not the gate's job: it stays `provisional` until a second fact or a person confirms it. Deleted names live in
+`entity_tombstones` as keyed hashes; nothing may store a deleted name in clear, and an alias a text gave (`aka`) goes,
+with the name it brought, when the last fact saying it goes. Reads use `name_key` / `entity_aliases` whenever the file
+has them (`_keyed`), writes only after this process migrated (`_entry["migrated"]`, `_require_writer`).
+
 ## Open work
 
 - Unsegmented scripts use a substring scan of character n-grams; an FTS5 trigram index would scale further but needs

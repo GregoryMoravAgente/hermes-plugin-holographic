@@ -1,6 +1,7 @@
 """SQLite-backed fact store with entity resolution and trust scoring (single-user Hermes memory plugin)."""
 
 import contextlib
+import itertools
 import logging
 import os
 import re
@@ -12,7 +13,7 @@ from pathlib import Path
 from . import holographic as hrr
 from .embeddings import text_hash
 from .history import HISTORY_SCHEMA, HistoryMixin, parse_day
-from .text import UNSEGMENTED, analyze, name_keys
+from .text import UNSEGMENTED, analyze, is_greeting, is_identifier, name_keys, zh_phrase
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,23 @@ CREATE TABLE IF NOT EXISTS fact_embeddings (
 """
 
 SCHEMA_VERSION = 2  # 1 = 0.1.x-0.3.x layout, 2 = + meta, entities.name_key, entity_aliases
+# The rules entities are guessed from a fact's text by (meta.entity_rules; none recorded = 1, before 0.16.0). A store
+# indexed under older rules is rebuilt on a writer's first open (rebuild_entity_index), up to the fact count below; a
+# larger one on request. Raise it with every change of _extract_entities / _name_shaped that drops what they took.
+_ENTITY_RULES = 2
+# Where an alias came from (entity_aliases.source, 0.16.0): 'user' (alias, rename, a merge someone asked for), 'aka'
+# ("X aka Y" in a fact's text: it goes with the last fact that says it) or 'legacy' (written before 0.16.0 or by an
+# older release since: kept like a given one, and dropped only when a forgotten fact said it as "X aka Y").
+_GIVEN_ALIAS = "COALESCE(source, 'legacy') != 'aka'"
+_AUTO_REBUILD_MAX_FACTS = 2000
+_AUTO_REBUILD_MAX_CHARS = 500_000  # and in all; the work grows with the text, not the count (review 0.16.0)
+# 0.16.0: names delete_entity removed, as keyed hashes (see _name_digest). Created by a writer in _migrate().
+_ENTITY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS entity_tombstones (
+    digest     TEXT PRIMARY KEY,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+"""
 _HELPFUL_DELTA, _UNHELPFUL_DELTA = 0.05, -0.10
 _MAX_COUNTED_IDS = 500  # record_retrievals batch cap (far under SQLite's bound-parameter limit)
 
@@ -117,11 +135,16 @@ _RE_TOKEN = re.compile(r"\w+(?:-\w+)*")  # aka sides may be handles with digits
 _RE_QUOTED = (re.compile(r'(?<!\w)"([^"\n]+)"(?!\w)'), re.compile(r"(?<!\w)'([^'\n]+)'(?!\w)"),
               re.compile(r"«([^»\n]+)»"), re.compile(r"“([^”\n]+)”"),
               re.compile(r"„([^“”\n]+)[“”]"))
-_RE_AKA = re.compile(r"\s+(?:aka|a\.k\.a\.|also known as)\s+", re.IGNORECASE)
-_RE_NOT_A_NAME = re.compile(r"[=/\\@<>{}\[\]|`]|://|\b\d{1,3}(?:\.\d{1,3}){3}\b")
-# A quoted span longer than this is a quotation ("she said: 'see you on Friday'"), not a name.
-_QUOTED_MAX_WORDS, _QUOTED_MAX_CHARS = 3, 60
+_RE_AKA = re.compile(r"\s+(?:aka|a\.k\.a\.|also\s+known\s+as)\s+", re.IGNORECASE)
+# A comma too (0.16.0): the legacy aliases column is comma-separated, see _legacy_aliases.
+_RE_NOT_A_NAME = re.compile(r"[=/\\@<>{}\[\]|`,]|://|\b\d{1,3}(?:\.\d{1,3}){3}\b")
+# A quoted span longer than this is a quotation ("she said: 'see you on Friday'"), not a name. Chinese and Japanese
+# write a quotation without spaces: more Han characters than _QUOTED_MAX_HAN is one too (中国人民解放军总医院 has 10).
+_QUOTED_MAX_WORDS, _QUOTED_MAX_CHARS, _QUOTED_MAX_HAN = 3, 60, 16
+_RE_HAN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+_RE_VERSION = re.compile(r"[vV]?\d+(?:\.\d+)+")  # 0.17.0, v2.1: a release, not a name (a whole word; gpt-3.5-turbo stays)
 _PHRASE_MAX_WORDS, _ENTITY_MAX_CHARS = 5, 60
+_AKA_MAX, _AKA_WINDOW = 16, 4 * _ENTITY_MAX_CHARS  # "X aka Y" read per text, and how far from the "aka" (0.16.0)
 # Capitalized only because they open a sentence: dropped from the front of a capitalized run ("So Apple").
 _SENTENCE_STARTERS = frozenset("""
     a an and as at but by for from here if in it its my no not now of on or our so that the then there these this
@@ -205,12 +228,45 @@ def _aka_side(segment: str, *, from_end: bool) -> str | None:
     return segment[picked[0].start():picked[-1].end()]
 
 
+def _legacy_aliases(names) -> str:
+    """The legacy comma-separated entities.aliases value, which older versions resolve aliases from and every writer
+    open imports again by splitting it on commas: a name with a comma is left out of it (entity_aliases keeps it whole),
+    or "Smith, John" would come back as the aliases "Smith" and "John" (review 0.16.0)."""
+    return ",".join(dict.fromkeys(n.strip() for n in names if isinstance(n, str) and n.strip() and "," not in n))
+
+
 def _valid_entity(name: str) -> bool:
-    """Reject what is not a name: too short or long, CLI flags, key=value, paths, URLs, IPs, mostly non-letters."""
+    """Reject what is not a name: too short or long, CLI flags, key=value, paths, URLs, IPs, mostly non-letters. The
+    check for names someone gave (entities=[...], alias, rename); names guessed from text pass _name_shaped too."""
     if not 2 <= len(name) <= _ENTITY_MAX_CHARS or name[0] in "-–—" or _RE_NOT_A_NAME.search(name):
         return False
     visible = [c for c in name if not c.isspace()]
     return sum(c.isalpha() for c in visible) >= 0.6 * len(visible)
+
+
+def _name_shaped(name: str, *, quoted: bool) -> bool:
+    """_valid_entity, and for a name guessed from a fact's text (0.16.0) also not: a version number with nothing that
+    names a thing beside it ("0.17.0 installed", «версия 0.17.0»; "Python 3.12" and «1С:Предприятие 8.3» stay, for a
+    word with a capital or in an uncased script names one); in quotes, a span in a cased script all in lower case with
+    no identifier in it ('count', 'run fast', «быстро беги»; 'kanban.db', 'gpt-4o' and 'hr-ovh' stay), a greeting or
+    courtesy ("Good morning", «Спасибо большое», “谢谢”: text.is_greeting), a Chinese span that reads as something said
+    (text.zh_phrase: “先去搜索再告诉我答案”, “知道了”; 平凡的世界, 有赞科技有限公司 and 饿了么 stay), or more Han characters
+    than a name has (a quotation). A name in lower case, or a phrase that only reads as one, is what someone said;
+    the agent can still name it with entities, and what passes and is no name stays provisional."""
+    if not _valid_entity(name):
+        return False
+    tokens = [t.strip(".,;:!?()'\"«»“”„") for t in name.split()]
+    if any(_RE_VERSION.fullmatch(t) for t in tokens) and not any(
+            any(c.isupper() or (c.isalpha() and c.lower() == c.upper()) for c in t)
+            for t in tokens if not _RE_VERSION.fullmatch(t)):
+        return False
+    if not quoted:
+        return True
+    cased = [c for c in name if c.isalpha() and c.lower() != c.upper()]
+    if cased and len(cased) == sum(c.isalpha() for c in name) and not any(c.isupper() for c in cased) \
+            and not any(is_identifier(t) for t in tokens):
+        return False
+    return len(_RE_HAN.findall(name)) <= _QUOTED_MAX_HAN and not is_greeting(name) and not zh_phrase(name)
 
 
 def _restrict_permissions(db_path: Path) -> None:
@@ -272,6 +328,7 @@ class MemoryStore(HistoryMixin):
                 if migrate and not entry["migrated"]:
                     self._migrate()
                     entry["migrated"] = True
+                    self._maybe_rebuild_entities()
                     self.scrub()  # a forget whose file rewrite was blocked last time
                 elif migrate:
                     self._check_vectors()
@@ -308,9 +365,17 @@ class MemoryStore(HistoryMixin):
           ``meta``; before 0.4.0, inferred from the stored blobs), so a changed setting no longer breaks queries.
         0.8.0 adds the history tables (executescript commits, so before the transaction) and versions every fact; 0.14.0
         the vectors of search by meaning, whose rows for facts an older version deleted are dropped here; 0.15.0 the
-        origin of a version and the confirmations of a fact, whose rows an older version's forget left are dropped."""
-        self._conn.executescript(HISTORY_SCHEMA + _EMBEDDINGS_SCHEMA)
+        origin of a version and the confirmations of a fact, whose rows an older version's forget left are dropped;
+        0.16.0 where an alias came from (entity_aliases.source: older rows and an older version's writes count as given
+        by the user) and the tombstones of deleted names. The entity index is rebuilt after the migration, by
+        _maybe_rebuild_entities. An older version reads such a store as before; one that writes to it as well may
+        create a deleted name again from a new fact's text (its next open by this version does not notice that)."""
+        self._conn.executescript(HISTORY_SCHEMA + _EMBEDDINGS_SCHEMA + _ENTITY_SCHEMA)
         with self._tx():
+            if "source" not in {r[1] for r in self._conn.execute("PRAGMA table_info(entity_aliases)")}:
+                # 0.16.0. 'legacy': written before, or by an older release since; nothing says whether someone gave it
+                self._conn.execute("ALTER TABLE entity_aliases ADD COLUMN source TEXT DEFAULT 'legacy'")
+            self._entry.pop("alias_source", None)
             self._conn.execute("DELETE FROM fact_embeddings WHERE fact_id NOT IN (SELECT fact_id FROM facts)")
             if "src_origin" not in {r[1] for r in self._conn.execute("PRAGMA table_info(fact_versions)")}:
                 self._conn.execute("ALTER TABLE fact_versions ADD COLUMN src_origin TEXT")
@@ -356,10 +421,11 @@ class MemoryStore(HistoryMixin):
             else:
                 self._merge_into(r["entity_id"], keep, declared=r["entity_type"] == "declared")
 
-    def _merge_into(self, source: int, target: int, *, declared: bool | None = None) -> None:
+    def _merge_into(self, source: int, target: int, *, declared: bool | None = None, alias_source: str = "user") -> None:
         """Make entity *source* part of *target* (inside a transaction): links, aliases (both representations) and
-        the declared flag move, *source*'s own name stays findable as an alias, the vectors of every affected fact are
-        re-encoded with the surviving name, and category banks are dropped."""
+        the declared flag move, *source*'s own name stays findable as an alias (from *alias_source*: "aka" when a
+        fact's "X aka Y" merged them, 0.16.0), the vectors of every affected fact are re-encoded with the surviving
+        name, and category banks are dropped."""
         src = self._one("SELECT name, name_key, aliases, entity_type FROM entities WHERE entity_id = ?", (source,))
         tgt = self._one("SELECT name, name_key, aliases FROM entities WHERE entity_id = ?", (target,))
         if src is None or tgt is None or source == target:
@@ -374,20 +440,20 @@ class MemoryStore(HistoryMixin):
         moved = [a for a in (src["aliases"] or "").split(",") if a.strip()]
         if entity_key(src["name"]) != target_key:
             moved.append(src["name"])
-            self._conn.execute("INSERT OR IGNORE INTO entity_aliases (alias_key, entity_id, alias) VALUES (?, ?, ?)",
-                               (entity_key(src["name"]), target, src["name"]))
+            if self._alias_sources():
+                self._conn.execute("INSERT OR IGNORE INTO entity_aliases (alias_key, entity_id, alias, source) "
+                                   "VALUES (?, ?, ?, ?)", (entity_key(src["name"]), target, src["name"], alias_source))
+            else:
+                self._conn.execute("INSERT OR IGNORE INTO entity_aliases (alias_key, entity_id, alias) VALUES (?, ?, ?)",
+                                   (entity_key(src["name"]), target, src["name"]))
         legacy = [a for a in (tgt["aliases"] or "").split(",") if a.strip()]
         known = {entity_key(a) for a in legacy} | {target_key}
         legacy += [a.strip() for a in moved if entity_key(a) not in known]
-        self._conn.execute("UPDATE entities SET aliases = ? WHERE entity_id = ?", (",".join(dict.fromkeys(legacy)), target))
+        self._conn.execute("UPDATE entities SET aliases = ? WHERE entity_id = ?", (_legacy_aliases(legacy), target))
         if declared if declared is not None else src["entity_type"] == "declared":
             self._conn.execute("UPDATE entities SET entity_type = 'declared' WHERE entity_id = ?", (target,))
         self._conn.execute("DELETE FROM entities WHERE entity_id = ?", (source,))
-        for fact_id in affected:
-            row = self._one("SELECT content FROM facts WHERE fact_id = ?", (fact_id,))
-            if row is not None:
-                self._compute_hrr_vector(fact_id, row["content"])
-        self._conn.execute("DELETE FROM memory_banks")
+        self._reencode(affected)  # without numpy: emptied, not left with the old name's role (review 0.16.0)
         self._bump()
 
     def _meta(self, key: str) -> str | None:
@@ -735,7 +801,7 @@ class MemoryStore(HistoryMixin):
         if not key:
             return []
         with self._lock:
-            if not self._entry.get("migrated"):  # opened read-only on a store no writer has migrated yet
+            if not self._keyed():  # a file no writer of 0.4.0 or later has migrated: names only
                 return sorted({r[0] for r in self._conn.execute("SELECT entity_id FROM entities WHERE hfold(name) = ?", (fold(name),))})
             ids = {r[0] for r in self._conn.execute(
                 "SELECT entity_id FROM entities WHERE name_key = ? "
@@ -743,14 +809,28 @@ class MemoryStore(HistoryMixin):
                 "UNION SELECT entity_id FROM entities WHERE name_key IS NULL AND hfold(name) = ?", (key, key, fold(name)))}
         return sorted(ids)
 
-    def add_alias(self, name: str, alias: str) -> dict:
+    def add_alias(self, name: str, alias: str, *, source: str = "user") -> dict:
         """Make *alias* another name of the entity *name* (created if needed). If *alias* is already an entity of its
-        own, it is merged into *name*: links and aliases move, and its name becomes an alias."""
+        own, it is merged into *name*: links and aliases move, and its name becomes an alias; *name* stays the name
+        (rename_entity changes it). *source* (0.16.0): "user" for the alias action, "aka" for "X aka Y" found in a
+        fact's text. Only an alias someone gave makes the entity established, keeps it without facts and brings back
+        a name delete_entity removed."""
+        if not isinstance(name, str) or not isinstance(alias, str):
+            raise ValueError("an alias needs two names")
         key, alias_key = entity_key(name), entity_key(alias)
         if not key or not alias_key or key == alias_key:
             raise ValueError("an alias needs two different non-empty names")
+        for side in (name, alias):  # a name someone gives passes what every given name does (review 0.16.0)
+            if not _valid_entity(side.strip()):
+                raise ValueError(f"'{side.strip()[:80]}' cannot be a name (2-{_ENTITY_MAX_CHARS} characters, mostly "
+                                 "letters; no paths, URLs, key=value, commas or flags)")
         with self._tx():
+            if source == "user":
+                self._lift_tombstones(name, alias)
             target = self._resolve_entity(name.strip())
+            own = self._one("SELECT name FROM entities WHERE entity_id = ?", (target,))
+            if alias_key == entity_key(own["name"]):  # alias("Bob", "Alice") with Bob already Alice's: no-op (review)
+                return {"entity_id": target, "alias": alias.strip(), "merged": []}
             owner = self._one("SELECT ea.entity_id, e.name FROM entity_aliases ea JOIN entities e ON e.entity_id = ea.entity_id "
                               "WHERE ea.alias_key = ?", (alias_key,))
             if owner is not None and owner["entity_id"] != target:
@@ -758,76 +838,159 @@ class MemoryStore(HistoryMixin):
                                  f"(alias '{name.strip()}' -> '{owner['name']}') if they are the same")
             other = [r[0] for r in self._conn.execute("SELECT entity_id FROM entities WHERE name_key = ? AND entity_id != ?",
                                                       (alias_key, target))]
-            for source in other:
-                self._merge_into(source, target)
-            self._conn.execute("INSERT INTO entity_aliases (alias_key, entity_id, alias) VALUES (?, ?, ?) "
-                               "ON CONFLICT(alias_key) DO UPDATE SET entity_id = excluded.entity_id, alias = excluded.alias",
-                               (alias_key, target, alias.strip()))
+            for merged in other:
+                self._merge_into(merged, target, alias_source=source)
+            self._put_alias(alias_key, target, alias.strip(), source)
             # Older versions resolve aliases from the comma-separated column: keep it in step.
             row = self._one("SELECT aliases FROM entities WHERE entity_id = ?", (target,))
             legacy = [a for a in (row["aliases"] or "").split(",") if a.strip()]
             if alias_key not in {entity_key(a) for a in legacy}:
-                self._conn.execute("UPDATE entities SET aliases = ? WHERE entity_id = ?", (",".join(legacy + [alias.strip()]), target))
+                self._conn.execute("UPDATE entities SET aliases = ? WHERE entity_id = ?", (_legacy_aliases(legacy + [alias.strip()]), target))
             self._bump()
             return {"entity_id": target, "alias": alias.strip(), "merged": other}
 
-    def list_entities(self, limit: int = 50) -> list[dict]:
-        """Entities with their aliases and number of facts, most linked first."""
-        rows = self.read("SELECT e.entity_id, e.name, e.entity_type, COUNT(fe.fact_id) AS facts FROM entities e "
+    def _put_alias(self, alias_key: str, entity_id: int, alias: str, source: str = "user") -> None:
+        """Insert or move an alias row. An alias someone gave stays theirs when the same name is found in text later."""
+        if self._entry.get("migrated"):  # the source column is added by this version's migration
+            self._conn.execute("INSERT INTO entity_aliases (alias_key, entity_id, alias, source) VALUES (?, ?, ?, ?) "
+                               "ON CONFLICT(alias_key) DO UPDATE SET entity_id = excluded.entity_id, alias = excluded.alias, "
+                               "source = CASE WHEN entity_aliases.source = 'user' THEN 'user' ELSE excluded.source END",
+                               (alias_key, entity_id, alias, source))
+        else:
+            self._conn.execute("INSERT INTO entity_aliases (alias_key, entity_id, alias) VALUES (?, ?, ?) "
+                               "ON CONFLICT(alias_key) DO UPDATE SET entity_id = excluded.entity_id, alias = excluded.alias",
+                               (alias_key, entity_id, alias))
+
+    def _keyed(self) -> bool:
+        """Whether the file has the entity keys of 0.4.0 (name_key, and entity_aliases kept in step): a writer of 0.4.0
+        or later migrated it at some point. Reads use them in every context, also one that does not migrate — a
+        subagent found no entity by an alias before (review 0.16.0); writes still wait for this process's migration."""
+        if self._entry.get("migrated"):
+            return True
+        known = self._entry.get("keyed")
+        if known is None:
+            with self._lock:
+                known = self._entry["keyed"] = "name_key" in {
+                    r[1] for r in self._conn.execute("PRAGMA table_info(entities)")}
+        return known
+
+    def _alias_sources(self) -> bool:
+        """Whether entity_aliases says where each alias came from (a store this version migrated)."""
+        known = self._entry.get("alias_source")
+        if known is None:
+            with self._lock:
+                known = self._entry["alias_source"] = "source" in {
+                    r[1] for r in self._conn.execute("PRAGMA table_info(entity_aliases)")}
+        return known
+
+    def _entity_rows(self) -> list[dict]:
+        """Every entity with its aliases, number of facts and standing, most linked first (0.16.0). Established: someone
+        named it (declared with entities=[...], renamed, or given an alias with the alias action), or two or more
+        current facts are linked to it; provisional: a name the extraction rules guessed from one fact, nobody
+        confirmed and no other fact named. A standing, not a verdict: it drops back when the second fact goes."""
+        given = _GIVEN_ALIAS if self._alias_sources() else "1"
+        rows = self.read("SELECT e.entity_id, e.name, e.entity_type, e.created_at, COUNT(fe.fact_id) AS facts FROM entities e "
                          "LEFT JOIN fact_entities fe ON fe.entity_id = e.entity_id GROUP BY e.entity_id "
-                         "ORDER BY facts DESC, e.name LIMIT ?", (limit,))
+                         "ORDER BY facts DESC, e.name")
         aliases: dict[int, list[str]] = {}
-        for r in self.read("SELECT entity_id, alias FROM entity_aliases ORDER BY alias"):
+        named: set[int] = set()
+        for r in self.read(f"SELECT entity_id, alias, {given} AS given FROM entity_aliases ORDER BY alias"):
             aliases.setdefault(r["entity_id"], []).append(r["alias"])
-        return [{"entity_id": r["entity_id"], "name": r["name"], "facts": r["facts"], "declared": r["entity_type"] == "declared",
-                 "aliases": aliases.get(r["entity_id"], [])} for r in rows]
+            if r["given"]:
+                named.add(r["entity_id"])
+        out = []
+        for r in rows:
+            declared = r["entity_type"] == "declared"
+            out.append({"entity_id": r["entity_id"], "name": r["name"], "facts": r["facts"], "declared": declared,
+                        "aliases": aliases.get(r["entity_id"], []),
+                        "status": "established" if declared or r["entity_id"] in named or r["facts"] >= 2 else "provisional",
+                        "_since": r["created_at"] or ""})
+        return out
+
+    def list_entities(self, limit: int = 50, status: str | None = None) -> list[dict]:
+        """Entities with their aliases, number of facts and standing (see _entity_rows), most linked first. *status*
+        "established" or "provisional" keeps those only; provisional ones come oldest first, the first to clean up."""
+        if status not in (None, "all", "established", "provisional"):
+            raise ValueError("status must be 'all', 'established' or 'provisional'")
+        rows = self._entity_rows()
+        if status in ("established", "provisional"):
+            rows = [r for r in rows if r["status"] == status]
+        if status == "provisional":
+            rows.sort(key=lambda r: (r["_since"], r["entity_id"]))
+        return [{k: v for k, v in r.items() if k != "_since"} for r in rows[:limit]]
+
+    def entity_counts(self) -> dict:
+        """{"entities": all, "provisional": names guessed from one fact that nobody confirmed}."""
+        rows = self._entity_rows()
+        return {"entities": len(rows), "provisional": sum(r["status"] == "provisional" for r in rows)}
+
+    def stale_provisional_entities(self, days: int = 60, limit: int = 20) -> list[dict]:
+        """Provisional entities older than *days*, oldest first: clean-up candidates for review (0.16.0)."""
+        old = {r[0] for r in self.read("SELECT entity_id FROM entities WHERE julianday('now') - julianday(created_at) > ?",
+                                       (days,))}
+        rows = sorted((r for r in self._entity_rows() if r["status"] == "provisional" and r["entity_id"] in old),
+                      key=lambda r: (r["_since"], r["entity_id"]))
+        return [{"entity_id": r["entity_id"], "entity": r["name"], "facts": r["facts"],
+                 "reason": f"a name guessed from one fact; nobody declared it or named it again in {days}+ days"}
+                for r in rows[:limit]]
 
     def _extract_entities(self, text: str) -> list[str]:
-        """Entity candidates (see the pattern table) that pass _valid_entity, deduplicated by casefold in first-seen
-        order."""
-        raw = _capitalized_phrases(text) + [
-            m.group(1) for pattern in _RE_QUOTED for m in pattern.finditer(text)
+        """Entity candidates (see the pattern table) shaped like a name (_name_shaped) and not deleted (delete_entity),
+        deduplicated by casefold in first-seen order."""
+        found = [(n, False) for n in _capitalized_phrases(text)] + [
+            (m.group(1), True) for pattern in _RE_QUOTED for m in pattern.finditer(text)
             if len(m.group(1)) <= _QUOTED_MAX_CHARS and len(m.group(1).split()) <= _QUOTED_MAX_WORDS]
         for left, right in self._aka_pairs(text):
-            raw += [left, right]
+            found += [(left, False), (right, False)]
         uniq: dict[str, str] = {}  # casefolded key -> first-seen spelling, insertion-ordered
-        for name in filter(None, (n.strip(" .,;:!?") for n in raw if n)):
-            if _valid_entity(name):
-                uniq.setdefault(fold(name), name)
+        for raw, quoted in found:
+            name = raw.strip(" .,;:!?") if raw else ""
+            if name and fold(name) not in uniq and _name_shaped(name, quoted=quoted) and not self._tombstoned(name):
+                uniq[fold(name)] = name
         return list(uniq.values())
 
-    @staticmethod
-    def _aka_pairs(text: str) -> list[tuple[str, str]]:
-        """(name, alias) for every "X aka Y" in *text* whose sides are valid names."""
+    def _aka_pairs(self, text: str) -> list[tuple[str, str]]:
+        """(name, alias) for the first _AKA_MAX "X aka Y" in *text* whose sides are shaped like names and not deleted.
+        Each side is read within _AKA_WINDOW characters of its "aka": reading the whole text before and after every
+        "aka" made a 10,000-character chain of them take a second per fact (review 0.16.0). A name is at most
+        _ENTITY_MAX_CHARS long, far under the window, so a run the window cuts is too long to be a name anyway."""
         pairs = []
-        for m in _RE_AKA.finditer(text):
-            left, right = _aka_side(text[:m.start()], from_end=True), _aka_side(text[m.end():], from_end=False)
+        for m in itertools.islice(_RE_AKA.finditer(text), _AKA_MAX):
+            left = _aka_side(text[max(0, m.start() - _AKA_WINDOW):m.start()], from_end=True)
+            right = _aka_side(text[m.end():m.end() + _AKA_WINDOW], from_end=False)
             left, right = (n.strip(" .,;:!?") if n else "" for n in (left, right))
-            if _valid_entity(left) and _valid_entity(right) and entity_key(left) != entity_key(right):
+            if _name_shaped(left, quoted=False) and _name_shaped(right, quoted=False) and entity_key(left) != entity_key(right) \
+                    and not self._tombstoned(left) and not self._tombstoned(right):
                 pairs.append((left, right))
         return pairs
 
-    def _link_entities(self, fact_id: int, content: str, declared=()) -> None:
-        """Link the fact to its entities: names extracted from the text, names the caller declared (a one-word name
-        such as "Masha" is accepted here), and entities already known that the text mentions in any word form.
-        "X aka Y" makes Y an alias of X rather than a second entity (unless Y is already an entity)."""
+    def _text_entity_ids(self, content: str) -> set[int]:
+        """Entities *content* itself names: extracted names (created if new) and "X aka Y" (Y an alias of X rather than
+        a second entity, unless Y is already one)."""
         pairs = self._aka_pairs(content)
         alias_only = {entity_key(right) for _, right in pairs}
         ids = {self._resolve_entity(name) for name in self._extract_entities(content)
                if entity_key(name) not in alias_only or self.entity_ids(name)}
         for left, right in pairs:
             if not self.entity_ids(right):
-                ids.add(self.add_alias(left, right)["entity_id"])
-        ids |= self.mentioned_entity_ids(content)
+                ids.add(self.add_alias(left, right, source="aka")["entity_id"])
+        return ids
+
+    def _link_entities(self, fact_id: int, content: str, declared=()) -> None:
+        """Link the fact to its entities: names extracted from the text, names the caller declared (a one-word name
+        such as "Masha" is accepted here), and entities already known that the text mentions in any word form."""
+        ids = self._text_entity_ids(content) | self.mentioned_entity_ids(content)
         for entity_id in sorted(ids):
             self._write("INSERT OR IGNORE INTO fact_entities (fact_id, entity_id) VALUES (?, ?)", (fact_id, entity_id))
         self._link_declared(fact_id, declared)
 
     def _link_declared(self, fact_id: int, declared) -> None:
-        """Link names the caller declared (one-word names allowed) and mark them declared."""
+        """Link names the caller declared (one-word names allowed) and mark them declared. A declared name is someone
+        naming it: a tombstone of delete_entity on it is lifted."""
         for name in declared or ():
             name = name.strip(" .,;:!?") if isinstance(name, str) else ""
             if _valid_entity(name):
+                self._lift_tombstones(name)
                 entity_id = self._resolve_entity(name)
                 if self._write("UPDATE entities SET entity_type = 'declared' WHERE entity_id = ? AND entity_type != 'declared'",
                                (entity_id,)).rowcount:
@@ -845,8 +1008,9 @@ class MemoryStore(HistoryMixin):
             if cached is None or cached[0] != version:
                 index: dict[str, list[tuple[int, tuple]]] = {}
                 names: dict[int, list[str]] = {}
-                if self._entry.get("migrated"):
-                    for row in self._conn.execute("SELECT entity_id, alias FROM entity_aliases"):
+                if self._keyed():
+                    for row in self._conn.execute("SELECT ea.entity_id, ea.alias FROM entity_aliases ea "
+                                                  "JOIN entities e ON e.entity_id = ea.entity_id"):
                         names.setdefault(row["entity_id"], []).append(row["alias"])
                 for row in self._conn.execute("SELECT entity_id, name, aliases, entity_type FROM entities"):
                     for name in [row["name"], *((row["aliases"] or "").split(",")), *names.get(row["entity_id"], [])]:
@@ -892,16 +1056,297 @@ class MemoryStore(HistoryMixin):
             return int(self._write("INSERT INTO entities (name) VALUES (?)", (name,)).lastrowid)  # type: ignore[arg-type]
         return int(self._write("INSERT INTO entities (name, name_key) VALUES (?, ?)", (name, entity_key(name))).lastrowid)  # type: ignore[arg-type]
 
-    def _drop_orphan_entities(self, keep_aliased: bool = True) -> None:
+    def _drop_orphan_entities(self, keep_aliased: bool = True, keep_declared: bool = False) -> None:
         """Entities no fact links to go — but not one the user gave an alias (alias may come before any fact names
-        it; an unrelated rewrite used to wipe it with its aliases). Forget drops the names its fact gave itself."""
-        keep = (" AND entity_id NOT IN (SELECT entity_id FROM entity_aliases)"
+        it; an unrelated rewrite used to wipe it with its aliases). Forget drops the names its fact gave itself.
+        First, aliases "X aka Y" gave (0.16.0) go with the last current fact that says so (forget, end, a new text): an
+        alias is the text's, and a forgotten fact must not live on as one; such an alias keeps nothing. *keep_declared*:
+        a declared entity stays without facts too (the rebuild leaves what someone named as it is)."""
+        self._prune_aka_aliases()
+        keep = (f" AND entity_id NOT IN (SELECT entity_id FROM entity_aliases WHERE {_GIVEN_ALIAS})"
                 if keep_aliased and self._entry.get("migrated") else "")
+        if keep_declared:
+            keep += " AND COALESCE(entity_type, '') != 'declared'"
         if self._write("DELETE FROM entities WHERE entity_id NOT IN (SELECT entity_id FROM fact_entities)"
                        + keep).rowcount:
             self._bump()
         if self._entry.get("migrated"):
             self._write("DELETE FROM entity_aliases WHERE entity_id NOT IN (SELECT entity_id FROM entities)")
+
+    def _aka_backing(self, entity_ids) -> set[tuple[int, str]]:
+        """(entity_id, alias key) of every "X aka Y" that a current fact linked to one of *entity_ids* says."""
+        out: set[tuple[int, str]] = set()
+        for entity_id in sorted(set(entity_ids)):
+            for row in self._conn.execute(
+                    "SELECT f.content FROM facts f JOIN fact_entities fe ON fe.fact_id = f.fact_id WHERE fe.entity_id = ? "
+                    "AND (f.content LIKE '%aka%' OR f.content LIKE '%a.k.a.%' OR f.content LIKE '%also%known%as%')",
+                    (entity_id,)).fetchall():
+                for left, right in self._aka_pairs(row["content"]):
+                    if entity_id in self.entity_ids(left):
+                        out.add((entity_id, entity_key(right)))
+        return out
+
+    def _prune_aka_aliases(self, legacy_keys=frozenset()) -> None:
+        """Drop aliases "X aka Y" gave that no current fact says any more, from both representations; with
+        *legacy_keys* (the "Y" a forgotten fact said), also aliases of unknown origin ('legacy') with those keys. The
+        facts the alias linked are linked again from their text, so a name only the gone text gave (the "X") does not
+        stay on them either: it then goes as an entity without facts (review 0.16.0)."""
+        if not self._entry.get("migrated"):
+            return
+        rows = self._conn.execute("SELECT alias_key, entity_id, alias, source FROM entity_aliases WHERE source = 'aka'"
+                                  + (f" OR (source = 'legacy' AND alias_key IN ({','.join('?' * len(legacy_keys))}))"
+                                     if legacy_keys else ""), tuple(sorted(legacy_keys))).fetchall()
+        if not rows:
+            return
+        backed = self._aka_backing(r["entity_id"] for r in rows)
+        gone = [r for r in rows if (r["entity_id"], r["alias_key"]) not in backed]
+        for r in gone:
+            self._write("DELETE FROM entity_aliases WHERE alias_key = ? AND entity_id = ?", (r["alias_key"], r["entity_id"]))
+            row = self._one("SELECT aliases FROM entities WHERE entity_id = ?", (r["entity_id"],))
+            if row is not None and row["aliases"]:
+                kept = [a for a in row["aliases"].split(",") if a.strip() and entity_key(a) != r["alias_key"]]
+                self._write("UPDATE entities SET aliases = ? WHERE entity_id = ?", (_legacy_aliases(kept), r["entity_id"]))
+        if gone:
+            self._bump()
+            self._relink({f for r in gone for f, in self._conn.execute(
+                "SELECT fact_id FROM fact_entities WHERE entity_id = ?", (r["entity_id"],)).fetchall()})
+
+    def _aka_alias_keys(self, texts) -> set[str]:
+        """Keys of the "Y" of every "X aka Y" in *texts* (what a forgotten fact said; see _prune_aka_aliases)."""
+        return {entity_key(right) for text in texts if text for _, right in self._aka_pairs(text)}
+
+    def _relink(self, fact_ids) -> None:
+        """Link facts to their entities again from their own text, as a new text does (declared links stay)."""
+        for fact_id in sorted(set(fact_ids)):
+            row = self._one("SELECT content FROM facts WHERE fact_id = ?", (fact_id,))
+            if row is None:
+                continue
+            kept = [r[0] for r in self._conn.execute(
+                "SELECT e.name FROM fact_entities fe JOIN entities e ON e.entity_id = fe.entity_id "
+                "WHERE fe.fact_id = ? AND e.entity_type = 'declared'", (fact_id,))]
+            self._write("DELETE FROM fact_entities WHERE fact_id = ?", (fact_id,))
+            self._link_entities(fact_id, row["content"], kept)
+        self._reencode(fact_ids)
+
+    # -- names someone removed, renamed or wants indexed again (0.16.0) ------------------------------------------------
+
+    def _require_writer(self) -> None:
+        """delete_entity, rename_entity and rebuild_entity_index write what only a migrated store holds (tombstones,
+        where an alias came from, the scrub mark): a store opened without migrating refuses them (review 0.16.0: it
+        answered "scrub": "done" for a file it had not rewritten)."""
+        if not self._entry.get("migrated"):
+            raise ValueError("this store was opened read-only (without migrating); entity changes need the main agent")
+
+    def _name_digest(self, name: str) -> str:
+        """A deleted name is kept as a keyed hash, as the text of a forgotten fact is: the file never says it."""
+        return self.digest("entity " + entity_key(name))
+
+    def _tombstoned(self, name: str) -> bool:
+        """Whether delete_entity removed this name: text never creates it again."""
+        if not self._entry.get("migrated") or not entity_key(name) \
+                or self._one("SELECT 1 FROM entity_tombstones LIMIT 1") is None:
+            return False
+        return self._one("SELECT 1 FROM entity_tombstones WHERE digest = ?", (self._name_digest(name),)) is not None
+
+    def _lift_tombstones(self, *names: str) -> None:
+        """Someone named it (entities=[...], alias, rename): a deleted name may be created from text again."""
+        if not self._entry.get("migrated") or self._one("SELECT 1 FROM entity_tombstones LIMIT 1") is None:
+            return
+        for name in names:
+            if entity_key(name or ""):
+                self._write("DELETE FROM entity_tombstones WHERE digest = ?", (self._name_digest(name),))
+
+    def _reencode(self, fact_ids) -> int:
+        """Vectors of facts whose entities changed: computed again; without numpy emptied, so that the next writer that
+        has it computes them (_check_vectors) instead of keeping roles of names that are gone. Banks go too."""
+        done = 0
+        for fact_id in sorted(set(fact_ids)):
+            row = self._one("SELECT content FROM facts WHERE fact_id = ?", (fact_id,))
+            if row is None:
+                continue
+            if self._hrr_available:
+                self._compute_hrr_vector(fact_id, row["content"])
+            else:
+                self._write("UPDATE facts SET hrr_vector = NULL WHERE fact_id = ?", (fact_id,))
+            done += 1
+        self._write("DELETE FROM memory_banks")
+        return done
+
+    def delete_entity(self, name: str) -> dict:
+        """Delete an entity by its name or an alias: the name, its aliases and its links to facts. The facts stay as
+        they are: this cleans the index of names and forgets nothing (fact_store forget does that). The name and its
+        aliases get a tombstone, so a fact's text never creates them again; an explicit name (entities=[...], alias,
+        rename) lifts it. The file is rewritten afterwards, as after forget, so freed pages keep no copy of a name no
+        fact says ("scrub": "pending" when another process blocked it; the next open retries). KeyError when no entity
+        has that name or alias."""
+        result = self._delete_entity(name)
+        result["scrub"] = "done" if self.scrub() else "pending"
+        return result
+
+    def _delete_entity(self, name: str) -> dict:
+        self._require_writer()
+        with self._tx():
+            ids = self.entity_ids(name or "")
+            if not ids:
+                raise KeyError(f"no entity is named '{(name or '').strip()}'")
+            names: list[str] = []
+            facts: set[int] = set()
+            aliases = 0
+            for entity_id in ids:
+                row = self._one("SELECT name, aliases FROM entities WHERE entity_id = ?", (entity_id,))
+                own = [r[0] for r in self._conn.execute("SELECT alias FROM entity_aliases WHERE entity_id = ?", (entity_id,))]
+                legacy = [a.strip() for a in (row["aliases"] or "").split(",") if a.strip()]
+                names += [row["name"], *own, *legacy]
+                aliases += len({entity_key(a) for a in (*own, *legacy)} - {entity_key(row["name"])})
+                facts |= {r[0] for r in self._conn.execute("SELECT fact_id FROM fact_entities WHERE entity_id = ?", (entity_id,))}
+                self._write("DELETE FROM fact_entities WHERE entity_id = ?", (entity_id,))
+                self._write("DELETE FROM entity_aliases WHERE entity_id = ?", (entity_id,))
+                self._write("DELETE FROM entities WHERE entity_id = ?", (entity_id,))
+            if self._entry.get("migrated"):
+                for digest in sorted({self._name_digest(n) for n in names if entity_key(n)}):
+                    self._write("INSERT OR IGNORE INTO entity_tombstones (digest) VALUES (?)", (digest,))
+                self._write("INSERT INTO meta (key, value) VALUES ('scrub_pending', '1') "
+                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+            self._reencode(facts)
+            self._bump()
+            return {"entity": names[0], "deleted": True, "facts_unlinked": len(facts), "aliases_dropped": aliases,
+                    "facts_deleted": 0}
+
+    def rename_entity(self, name: str, new_name: str) -> dict:
+        """Give an entity another name; its id, links and aliases stay, the old name becomes an alias, and the entity
+        counts as declared (someone named it). Only another spelling ("phoenix" -> "Phoenix") changes the name alone;
+        the entity's own alias swaps places with its name. A name another entity has, as its name or an alias, is
+        refused: two entities become one only through alias, never through a rename (a typo would merge two people).
+        KeyError for an unknown name; ValueError for an empty or unusable new name, or one that names two entities."""
+        self._require_writer()
+        new = new_name.strip(" .,;:!?") if isinstance(new_name, str) else ""
+        new_key = entity_key(new)
+        if not new_key or not _valid_entity(new):
+            raise ValueError(f"'{str(new_name)[:80]}' cannot be a name (2-{_ENTITY_MAX_CHARS} characters, mostly letters; "
+                             "no paths, URLs, key=value, commas or flags)")
+        with self._tx():
+            ids = self.entity_ids(name or "")
+            if not ids:
+                raise KeyError(f"no entity is named '{(name or '').strip()}'")
+            if len(ids) > 1:
+                raise ValueError(f"'{name.strip()}' names {len(ids)} entities; rename one by a name only it has")
+            entity_id = ids[0]
+            others = [i for i in self.entity_ids(new) if i != entity_id]
+            if others:
+                other = self._one("SELECT name FROM entities WHERE entity_id = ?", (others[0],))["name"]
+                raise ValueError(f"'{new}' already names the entity '{other}'. If both are one, alias {{entity: '{other}', "
+                                 f"content: '{name.strip()}'}} makes them one and keeps '{other}' as the name; rename "
+                                 "after that if the other name should stay.")
+            row = self._one("SELECT name, aliases FROM entities WHERE entity_id = ?", (entity_id,))
+            old = row["name"]
+            old_key = entity_key(old)
+            legacy = [a.strip() for a in (row["aliases"] or "").split(",") if a.strip()]
+            self._lift_tombstones(new)
+            if new_key != old_key:
+                self._write("DELETE FROM entity_aliases WHERE alias_key = ? AND entity_id = ?", (new_key, entity_id))
+                self._put_alias(old_key, entity_id, old)
+                legacy = [a for a in legacy if entity_key(a) != new_key]
+                if old_key not in {entity_key(a) for a in legacy}:
+                    legacy.append(old)
+            self._write("UPDATE entities SET name = ?, aliases = ?, entity_type = 'declared' WHERE entity_id = ?",
+                        (new, _legacy_aliases(legacy), entity_id))
+            if self._entry.get("migrated"):
+                self._write("UPDATE entities SET name_key = ? WHERE entity_id = ?", (new_key, entity_id))
+            self._reencode([r[0] for r in self._conn.execute("SELECT fact_id FROM fact_entities WHERE entity_id = ?",
+                                                             (entity_id,))])
+            self._bump()
+            aliases = [r[0] for r in self._conn.execute("SELECT alias FROM entity_aliases WHERE entity_id = ? ORDER BY alias",
+                                                        (entity_id,))]
+            return {"entity_id": entity_id, "name": new, "previous": old, "aliases": aliases}
+
+    def entity_rules(self) -> int:
+        """The extraction rules the store's entity index was built with (1: before 0.16.0, which recorded none)."""
+        try:
+            return int(self._meta("entity_rules") or 1)
+        except ValueError:
+            return 1
+
+    def rebuild_entity_index(self) -> dict:
+        """Link every fact to its entities again under this release's extraction rules: names an older release
+        guessed that these rules do not, and links only they gave, go. What someone named stays as it is: declared
+        entities, entities with an alias someone gave (or of unknown origin), and their links. First pass: the facts
+        in the order they were stored, each read as adding it would read it — so "X aka Y" makes Y an alias of X only
+        while no earlier fact has named Y and nobody gave Y; a text never merges a name already in use into another
+        (review 0.16.0: a stored "Mallory Jones aka Alice Smith" must not take over the facts about Alice Smith).
+        Second pass: the known names each fact mentions, against the whole index the first left, so an earlier fact
+        gets a name a later one brought. Entities that stay keep their id and age; vectors are made again only for
+        facts whose entities changed. Records the rules. ValueError when a newer release indexed the store."""
+        self._require_writer()
+        with self._tx():
+            if self.entity_rules() > _ENTITY_RULES:
+                raise ValueError(f"a newer release indexed this store's entities (rules {self.entity_rules()}, this one "
+                                 f"knows {_ENTITY_RULES}); it is left as it is")
+            before = self._one("SELECT COUNT(*) FROM entities")[0]
+            given = f" WHERE {_GIVEN_ALIAS}" if self._alias_sources() else ""
+            protected = {r[0] for r in self._conn.execute("SELECT entity_id FROM entities WHERE entity_type = 'declared'")}
+            protected |= {r[0] for r in self._conn.execute(f"SELECT entity_id FROM entity_aliases{given}")}
+            old = {(r[0], r[1]) for r in self._conn.execute("SELECT fact_id, entity_id FROM fact_entities")}
+            facts = self._conn.execute("SELECT fact_id, content FROM facts ORDER BY fact_id").fetchall()
+            first: set[tuple[int, int]] = set()
+            named: set[int] = set()  # entities an earlier fact of this pass named
+            for f in facts:
+                for left, right in self._aka_pairs(f["content"]):
+                    # Y left over from the old index and not named yet: the alias adding this fact would have made
+                    if not set(self.entity_ids(right)) & (protected | named):
+                        try:
+                            self.add_alias(left, right, source="aka")
+                        except ValueError:  # Y is another entity's alias already
+                            pass
+                ids = self._text_entity_ids(f["content"])
+                named |= ids
+                first |= {(f["fact_id"], e) for e in ids}
+            current = {(r[0], r[1]) for r in self._conn.execute("SELECT fact_id, entity_id FROM fact_entities")}
+            kept = {link for link in current if link[1] in protected}
+            for link in sorted(current - first - kept):  # merges above moved links: diff against the table, not *old*
+                self._write("DELETE FROM fact_entities WHERE fact_id = ? AND entity_id = ?", link)
+            for link in sorted(first - current):
+                self._write("INSERT OR IGNORE INTO fact_entities (fact_id, entity_id) VALUES (?, ?)", link)
+            self._drop_orphan_entities(keep_declared=True)  # entities only a dropped link held
+            self._bump()
+            second = {(f["fact_id"], e) for f in facts for e in self.mentioned_entity_ids(f["content"])}
+            for link in sorted(second - first - kept):
+                self._write("INSERT OR IGNORE INTO fact_entities (fact_id, entity_id) VALUES (?, ?)", link)
+            new = {(r[0], r[1]) for r in self._conn.execute("SELECT fact_id, entity_id FROM fact_entities")}
+            vectors = self._reencode({fact_id for fact_id, _ in old ^ new})
+            self._write("INSERT INTO meta (key, value) VALUES ('entity_rules', ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(_ENTITY_RULES),))
+            self._bump()
+            return {"facts": len(facts), "entities_before": before,
+                    "entities_after": self._one("SELECT COUNT(*) FROM entities")[0],
+                    "links_removed": len(old - new), "links_added": len(new - old), "vectors": vectors}
+
+    def entity_index_state(self) -> str:
+        """"current", or what a store indexed under older rules (too large to rebuild on open) needs."""
+        rules = self.entity_rules()
+        if rules >= _ENTITY_RULES:
+            return "current"
+        return f"built with extraction rules {rules} of {_ENTITY_RULES}: run fact_store rebuild_entities"
+
+    def _maybe_rebuild_entities(self) -> None:
+        """On a writer's first open: a store indexed under older rules is rebuilt, up to _AUTO_REBUILD_MAX_FACTS facts
+        (the write lock is held throughout, and other processes wait at most 10 s for it); a larger one says so in
+        stats and is rebuilt on request. A failure leaves the old index and is logged: the store works as before."""
+        if self.entity_rules() >= _ENTITY_RULES:
+            return
+        facts, chars = self._one("SELECT COUNT(*), COALESCE(SUM(LENGTH(content)), 0) FROM facts")
+        if facts > _AUTO_REBUILD_MAX_FACTS or chars > _AUTO_REBUILD_MAX_CHARS:
+            logger.info("holographic: %d facts, %d characters; the entity index is rebuilt on request "
+                        "(fact_store rebuild_entities)", facts, chars)
+            return
+        try:
+            result = self.rebuild_entity_index()
+        except Exception as exc:  # noqa: BLE001 - the old index works; never fail an open over it
+            logger.warning("holographic: entity index not rebuilt (%s); the old one stays", exc)
+            return
+        if result["links_removed"] or result["links_added"]:
+            logger.info("holographic: entity index rebuilt under rules %d: %d -> %d entities, %d links removed, %d added",
+                        _ENTITY_RULES, result["entities_before"], result["entities_after"], result["links_removed"],
+                        result["links_added"])
 
     def _compute_hrr_vector(self, fact_id: int, content: str) -> None:
         """Compute and store the HRR vector for a fact (linked entities as roles). No-op without numpy."""

@@ -1,6 +1,130 @@
 # Changelog
 
-## Unreleased
+## 0.16.0 — 2026-10-16
+
+Which names are entities (issue #4: on a Chinese store of ~150 facts, about 40 of 89 entities were regex fragments,
+version numbers, words like `count` and short phrases from the chat).
+
+### Fixed
+
+- **Names guessed from a fact's text had to be shaped like names.** Since 0.2.1 the extractor drops flags, paths,
+  `key=value`, URLs, IPs and spans that are mostly not letters; much of the reported junk (`^\s*\d+\|`, `...`, paths,
+  `reply exactly <ACK>`) was left by the core's copy before the fork, which had no such check, and goes in the
+  rebuild below. What still passed now does not (`_name_shaped`):
+  - a version number with nothing beside it that names a thing ("0.17.0 installed", «версия 0.17.0»; "Python 3.12",
+    "Ubuntu 24.04 LTS" and «1С:Предприятие 8.3» stay: a word with a capital, or in a script without case, names one);
+  - in quotes, a span all in lower case in a script with letter case and no identifier in it ('count', 'max', 'run
+    fast', «быстро беги»; 'kanban.db', 'gpt-4o', 'hr-ovh' stay);
+  - in quotes, a greeting or a courtesy ("Good morning", «Спасибо большое», “谢谢”; "Good Morning America" and
+    "Hello Kitty" stay);
+  - in quotes, a Chinese span that reads as something said (`text.zh_phrase`): its last word is a sentence-final
+    particle (“知道了”, “明天再说吧”), or it has three or more different function words besides 的
+    (“先去搜索再告诉我答案”: 先 去 再 我). Words as the dictionary splits them, never characters, so 别克, 网吧 and 了解
+    stay; and one or two function words are what titles and brands hold (平凡的世界, 后来的我们, 我和我的祖国,
+    这个杀手不太冷, 饿了么, 有赞科技有限公司), so they stay. Without the Chinese word list the rule is off;
+  - a quoted span of more than 16 Han characters (a sentence, not a name).
+
+  Names given with `entities=[...]`, `alias` or `rename` skip these rules. Known losses: a name in lower case in quotes
+  ('nginx', «авито») looks like any word, and the agent names it with `entities`; short phrases no rule tells from a
+  name (“手动巡检”, “没问题”, «Давай Потом») pass and stay provisional (below).
+- **A forgotten fact's "X aka Y" lived on.** Forgetting (or ending, or rewording) the only fact that said "Robert Brown
+  aka Secret Alias" left the alias on an entity other facts kept, in `entity_aliases`, the legacy `entities.aliases`
+  column and `entities` output; and when the claim came first, a later fact about Y was linked to X, so X — a name
+  only the forgotten text gave — stayed on it and in the file. An alias from a fact's text now goes with the last
+  current fact that says it, and the facts it linked are linked again from their own text, so X goes too.
+- **After forget, the next fact could be linked to a deleted entity.** Forget removed an entity that had an alias
+  without invalidating the cached index of known names (shared by every instance on the file), so a later fact
+  mentioning the name got a link to an id that no longer existed. Present since 0.4.0.
+- **A context that does not migrate found no entity by its alias.** Subagents and cron jobs open the store without
+  migrating it; they matched entity names only, though the file had keys and aliases, so `probe` on an alias fell back
+  to keyword search. Reads now use the keys whenever the file has them. Present since 0.4.0.
+- **A merge without numpy kept the old name in the vectors.** `alias` merging two entities recomputed the HRR vectors
+  of their facts only with numpy; without it a vector kept the merged name's role at the right size, and no later
+  writer could tell. They are emptied now, and the next writer with numpy makes them.
+- **`alias` skipped the check every given name passes** (a path, `key=value`, 200 characters became names), and could
+  make an entity an alias of itself (`alias {entity: "Bob", content: "Robert Smith"}` with Bob already Robert's).
+- **A name with a comma split into aliases on the next open**: "Smith, John" in the comma-separated legacy column
+  came back as the aliases "Smith" and "John". A comma is no longer part of a name, and an older name with one is
+  left out of the legacy column (`entity_aliases` keeps it whole).
+- "X also  known as Y" with more than one space between the words is read as "also known as".
+
+### Added
+
+- **Standing of a name.** `entities` shows each name as `established` (someone named it: `entities=[...]`, `alias`,
+  `rename`; or two or more current facts name it) or `provisional` (guessed from one fact, nobody confirmed), takes
+  `status` to list one kind (provisional ones oldest first) and says how many provisional names the store holds, apart
+  from `limit`. Some phrases read as names in any language (“手动巡检” is a phrase, “北京大学” a name; both are four
+  Han characters): no rule tells them apart, the standing does. It drops back when the second fact goes. `review`
+  lists provisional names older than 60 days under `entity_candidates`, apart from the facts in `candidates`; `stats`
+  adds `provisional_entities`.
+- **`delete_entity {entity}`** (by the name or an alias): the name, its aliases and links go; every fact stays as it
+  was (text, history, trust, vectors of search by meaning), so this is not `forget`, and `probe` on the name answers
+  by keyword search. The name and its aliases get a tombstone, a keyed hash like a forgotten fact's: no fact's text,
+  quoted or `X aka Y`, creates it again. The file is rewritten afterwards, as after forget, so freed pages keep no
+  copy of a name no fact says (`scrub`: `done`, or `pending` when another process blocked it). Naming it explicitly
+  lifts the tombstone (`add` / `update` with `entities`, `alias`, `rename`).
+- **`rename {entity, content}`**: a new name for the same entity — id, links and aliases stay, the old name becomes
+  an alias, the entity counts as declared. Another spelling ("phoenix" → "Phoenix") changes the name only; the
+  entity's own alias swaps places with its name. A name another entity already has is refused with the way to merge:
+  two entities become one only through `alias`, never through a rename, where a typo would merge two people. With
+  `alias` (which keeps `entity` as the name) this settles which name survives a merge.
+- **The index is rebuilt under the new rules** (`rebuild_entity_index`; `meta.entity_rules`, 2 now, none recorded =
+  1): on a writer's first open of a store with up to 2,000 facts and 500,000 characters of them, otherwise with
+  `fact_store rebuild_entities` (and `stats` says so in `entity_index`). First the facts in the order they were
+  stored, each read as adding it would read it: "X aka Y" makes Y an alias of X only while no earlier fact has named
+  Y and nobody gave Y, so a stored sentence never takes over a name already in use — "Mallory Jones aka Alice Smith"
+  does not get the facts about Alice Smith. Then the known names each fact mentions, against the whole index, so an
+  earlier fact gets a name a later one brought. What someone named stays as it is: declared entities (with or without
+  facts), entities with an alias someone gave or of unknown origin, and their links. Entities that stay keep their id
+  and age; vectors are made again only for facts whose names changed (without numpy they are emptied). A store a
+  newer release indexed is left alone. A failed rebuild leaves the old index and the store opens. Raise
+  `_ENTITY_RULES` with every change of the rules that drops what they took.
+
+### Changed
+
+- **Where an alias came from** (`entity_aliases.source`): `user` from `alias`, `rename` or a merge someone asked for;
+  `aka` from "X aka Y" in a fact's text, which goes with the last fact that says it and keeps nothing; `legacy` for an
+  alias written before 0.16.0, or by an older release since. Nothing tells an old alias someone gave from one a text
+  gave, so a `legacy` alias is kept and protected like a given one, survives a rewording of the fact, and goes only
+  when a forgotten fact said it as "X aka Y" and no current fact does.
+- "X aka Y" is read within 240 characters of each "aka", 16 of them per text at most: reading the whole text before
+  and after every "aka" made a 10,000-character chain of them take a second per fact, and the rebuild of three such
+  facts twelve seconds under the write lock. A name is at most 60 characters, so no name is lost.
+- `alias` says in the tool description that `entity` stays the name; the description lists the new actions;
+  `rename`, `delete_entity` and `rebuild_entities` are writes (refused in a read-only context, and by a store opened
+  without migrating), and a refused entity change says why and that nothing changed.
+
+### Compatibility
+
+Additive: a column with a default and a table, added by a writer; a read-only open adds neither and rebuilds
+nothing (it still creates the base tables in an empty file, as every release did). An older release reads such a
+store as before. One that also writes to it may create a deleted name again from a new fact's text, and the next open
+of 0.16.0 does not notice; run `rebuild_entities` after going back and forth.
+
+### Reviewed
+
+Before release the code went through three reviews in throwaway copies: Codex CLI (gpt-6-astra) after one of the
+plan, then Codex CLI (gpt-6.1-sol) and Antigravity CLI with full access. What they found is under Fixed and Changed
+beyond the gate — the first round: `delete_entity` left a removed alias's bytes in freed pages, the rebuild dropped a
+declared entity without facts and depended on the order of the facts, the Chinese rule dropped 有道, 去哪儿, 饿了么,
+and the tests built the "old" store with this release's schema; the second: a stored "X aka Y" let the rebuild take
+over an established name, the name a forgotten claim gave stayed on other facts, the unbounded "aka" reading, the
+merge without numpy, a guess at migration that turned given aliases into the text's, commas, `alias` without checks,
+names read by key only after migrating, titles of five or more characters (平凡的世界, 有赞科技有限公司), versions beside
+a name ("Ubuntu 24.04 LTS"), greetings. Each one is fixed and has a test that fails on the code reviewed (48 for the
+second round). Not taken: rejecting more chat phrases by form (“没问题”, «Давай Потом») — they stay provisional.
+
+### Measured
+
+- **A family store** (58 facts, Russian and English), rebuilt on open: no link removed, 10 added. Six names in
+  Cyrillic got their facts: all nine facts behind them were written June–August, by the core's extractor, which read
+  capitalized names in ASCII letters and straight quotes only (no «», “”). Two entities without facts went; declared
+  entities, aliases and fact versions unchanged. 5 of 11 names are provisional. Open with the rebuild 339 ms; a
+  second rebuild changes nothing (8 ms).
+- **5,000 synthetic facts**: 2.2 s, 0.45 ms per fact (Hermes host, 4 cores), under the 10 s other processes wait for
+  the write lock; hence the bounds for a rebuild on open.
+- Tests: 166 new in `tests/test_holographic_v0160.py`, every rule in Chinese, English and Russian; the suite 1683
+  passed on Hermes 0.22.2.
 
 ### Documented
 

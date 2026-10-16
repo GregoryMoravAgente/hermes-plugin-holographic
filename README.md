@@ -75,7 +75,7 @@ In `config.yaml` under `plugins.hermes-memory-store`:
 
 | Tool | Description |
 |------|-------------|
-| `fact_store` | add, search, probe, related, reason, contradict, change, end, correct, revert, forget, history, update, remove, list, stats, export, review, entities, alias, enrich |
+| `fact_store` | add, search, probe, related, reason, contradict, change, end, correct, revert, forget, history, update, remove, list, stats, export, review, entities, alias, rename, delete_entity, rebuild_entities, enrich |
 | `fact_feedback` | Rate a fact helpful or unhelpful (moves its trust score), or record that the person confirmed it (0.15.0) |
 
 - **search**: keyword candidates in any word form (`Маши` finds `Маша`, `deploys` finds `deploy`, `kucingnya` finds
@@ -103,14 +103,34 @@ In `config.yaml` under `plugins.hermes-memory-store`:
 - **stats** (what is stored and how much of it was ever recalled), **export** (Markdown view), **review**
   (clean-up candidates: low trust, never recalled for 60 days, near-duplicates), **enrich** (facts without keywords,
   most recalled first, to give keywords with `update`).
-- **entities** lists names with their aliases and fact counts; **alias** gives an entity a second name (or merges
-  two entities). Spelling variants are one entity (`Hermes Agent` = `hermes-agent`), and `X aka Y` makes `Y` an alias.
+- **entities** lists names with their aliases, fact counts and standing (0.16.0): `established` when someone named
+  it (`entities=[...]`, `alias`, `rename`) or two or more facts name it, `provisional` when the rules below guessed it
+  from one fact and nobody confirmed it; `status` lists one kind, and the answer says how many provisional names the
+  store holds. **alias** gives an entity a second name (or merges two entities; `entity` stays the name).
+  **rename** gives it another name (the old one becomes an alias; a name another entity has is refused, so a typo
+  never merges two). **delete_entity** removes a name that is not one — a phrase, a command — with its aliases and
+  links; every fact stays, a tombstone (a keyed hash, not the name) keeps text from creating it again until someone
+  names it explicitly, and the file is rewritten as after forget. An alias "X aka Y" in a fact's text gave goes with
+  the last fact that says it, and so does X on the facts only that alias linked; an alias written before 0.16.0 is of
+  unknown origin, kept like a given one and dropped only when a forgotten fact said it. A name with a comma is no
+  name (the legacy aliases column is comma-separated). **review** lists provisional names older than 60 days under
+  `entity_candidates`.
+  Spelling variants are one entity (`Hermes Agent` = `hermes-agent`), and `X aka Y` makes `Y` an alias.
 - **probe**: every fact linked to a named entity, from the entity index (name or alias, any letter case).
   **reason**: facts linked to *all* of several entities; when a name is not a known entity, keyword search that still
   requires every name. Entities are linked when a fact is stored: capitalized names of two to five words in any cased
-  script (`Alice Smith`, `Мария Иванова`, `Jean-Luc Picard`), short quoted terms (`"Phoenix"`, `«Сбер Бизнес»`)
-  and both sides of `X aka Y`; flags, `key=value`, paths, URLs and IPs are not names. A one-word name is not linked;
-  probing it falls back to keyword search.
+  script (`Alice Smith`, `Мария Иванова`, `Jean-Luc Picard`), short quoted terms (`"Phoenix"`, `«Сбер Бизнес»`,
+  `“华为”`) and both sides of `X aka Y` (Y becomes X's alias only while no fact has named Y on its own); flags,
+  `key=value`, paths, URLs, IPs and commas are not names, and neither is a version number with nothing beside it that
+  names a thing ("0.17.0 installed"; "Python 3.12" is one), a quoted span all in lower case without an identifier in it
+  ('count', «быстро беги»; 'kanban.db' and 'gpt-4o' are), a quoted greeting ("Good morning", «Спасибо большое»,
+  “谢谢”), a quoted Chinese span that reads as something said — ending in a sentence-final particle (“知道了”) or with
+  three or more function words besides 的 (“先去搜索再告诉我答案”; titles and brands with one or two, 平凡的世界,
+  饿了么, 有赞科技有限公司, are names) — or one of more than 16 Han characters. A one-word name is not linked; probing it
+  falls back to keyword search. When these rules change, a writer rebuilds the index on its first open (up to 2,000
+  facts and 500,000 characters; a larger store says so in `stats` and is rebuilt with **rebuild_entities**), reading
+  the facts in the order they were stored as adding them would; declared names, aliases someone gave and their links
+  stay as they are.
 - **related**: facts structurally tied to an entity in their HRR vector, above a noise floor.
 - Every recall action honours `min_trust` (default `min_trust_threshold`).
 - **contradict**: candidate conflicts, i.e. pairs about the same subject that make a similar but not identical
@@ -752,6 +772,13 @@ files stay untouched (no leak), but new facts would land in the shared store.
 read by older versions. A fact an older version deletes leaves its vector until this version next opens the file for
 writing (a subagent or another read-only context does not drop it); a text an older version changes no longer matches its vector's hash and is never compared until a
 new vector is made.
+
+0.16.0 adds `entity_aliases.source` (with the default `legacy`: an alias written before, or by an older version
+since, is of unknown origin) and `entity_tombstones`, both created by a writer, and records the extraction rules in
+`meta.entity_rules`. A context that does not migrate still reads names by their keys and aliases once any writer of
+0.4.0 or later has migrated the file. An older
+version reads the file as before; one that also writes to it may create a name `delete_entity` removed again from a
+new fact's text, and this version's next open does not notice: run `rebuild_entities` after going back and forth.
 
 ## Development
 

@@ -68,8 +68,10 @@ FACT_STORE_SCHEMA = {
         "• history {fact_id} · update {fact_id, keywords/tags/category} · list {as_of?} · stats · export · review "
         "(clean-up candidates) · related · contradict.\n"
         "• enrich — facts stored without keywords: give each some with update {fact_id, keywords}.\n"
-        "• entities — known names and aliases · alias {entity, content=<other name>} — one entity, two names "
-        "(merges them if both exist).\n"
+        "• entities {status?} — known names with aliases; 'provisional' = guessed from one fact, nobody confirmed · "
+        "alias {entity, content=<other name>} — one entity, two names; entity stays the name (merges them if both "
+        "exist) · rename {entity, content=<new name>} · delete_entity {entity} — a name that is not one (a phrase, a "
+        "command): drops the name from the index, keeps every fact, and text never creates it again.\n"
         "Recalled facts show their id as #N: pass it to fact_feedback; '(inferred)' marks a conclusion nobody "
         "confirmed."
     ),
@@ -78,16 +80,21 @@ FACT_STORE_SCHEMA = {
         "properties": {
             "action": {"type": "string", "enum": ["add", "search", "probe", "related", "reason", "contradict", "update",
                                                   "change", "end", "correct", "revert", "forget", "history", "remove",
-                                                  "list", "stats", "export", "review", "entities", "alias", "enrich"]},
+                                                  "list", "stats", "export", "review", "entities", "alias", "rename",
+                                                  "delete_entity", "rebuild_entities", "enrich"]},
             "content": {"type": "string", "description": "Fact text for 'add' / 'change' / 'correct': one short "
-                                                         "standalone sentence."},
+                                                         "standalone sentence. 'alias': the other name; 'rename': the "
+                                                         "new name."},
             "query": {"type": "string", "description": "Search query (required for 'search')."},
             "valid_from": {"type": "string", "description": "'add' / 'change' / 'correct': the date (YYYY-MM-DD) it "
                                                             "started to hold, only when the message says so."},
             "valid_to": {"type": "string", "description": "'end': the date (YYYY-MM-DD) from which it no longer held, "
                                                           "only when the message says so."},
             "as_of": {"type": "string", "description": "'search' / 'list': a date (YYYY-MM-DD); what held then."},
-            "entity": {"type": "string", "description": "Entity name for 'probe'/'related'."},
+            "entity": {"type": "string", "description": "Entity name (or an alias) for 'probe' / 'related' / 'alias' / "
+                                                        "'rename' / 'delete_entity'."},
+            "status": {"type": "string", "enum": ["all", "established", "provisional"],
+                       "description": "'entities': which names to list (default all)."},
             "entities": {"type": "array", "items": {"type": "string"},
                          "description": "'reason': the entities to join. 'add'/'update': who or what the fact is about; "
                                         "needed for one-word names (e.g. a first name), so later facts link to them."},
@@ -727,7 +734,8 @@ def _results(items: list, key: str = "results") -> str:
 _MAX_LIMIT = 100
 # Agent contexts that may write (contract: skip writes for subagent / cron / flush contexts).
 _WRITER_CONTEXTS = frozenset({"", "primary"})
-_WRITE_ACTIONS = frozenset({"add", "update", "remove", "alias", "change", "end", "correct", "revert", "forget"})
+_WRITE_ACTIONS = frozenset({"add", "update", "remove", "alias", "change", "end", "correct", "revert", "forget", "rename",
+                            "delete_entity", "rebuild_entities"})
 # Context fields Hermes passes to initialize() that a version's source keeps (chat names are not kept: they change).
 _IDENTITY = ("chat_id", "chat_type", "thread_id", "user_id", "user_name")
 # Keywords (document expansion, as doc2query does for lexical search): words a person might ask with that the fact
@@ -1571,6 +1579,41 @@ class HolographicMemoryProvider(MemoryProvider):
                                   f"Keep it only if they asked to remember it again; otherwise forget {{fact_id: {fact_id}}}.")
         return json.dumps(result)
 
+    @staticmethod
+    def _entity_call(a: dict, needs: tuple, call) -> str:
+        """Run an entity action (0.16.0); a name no entity has is an answer, not a 'missing argument'."""
+        for arg in needs:
+            a[arg]  # noqa: B018 - a missing argument is reported as one (handle_tool_call)
+        try:
+            return json.dumps(call())
+        except KeyError as exc:
+            return tool_error(f"{exc.args[0] if exc.args else exc}; fact_store entities lists the names. Nothing was "
+                              "changed.")
+        except ValueError as exc:  # an unusable or taken name: the reason, and that nothing happened (review 0.16.0)
+            return tool_error(f"{exc}. Nothing was changed.")
+
+    def _list_entities(self, a: dict) -> str:
+        """Names with aliases, fact counts and standing; how many are provisional in the whole store (0.16.0)."""
+        rows = self._store.list_entities(limit=_limit(a), status=a.get("status") or None)
+        counts = self._store.entity_counts()
+        result = {"entities": rows, "count": len(rows), "provisional_entities": counts["provisional"]}
+        if counts["provisional"] and a.get("status") != "provisional":
+            result["hint"] = ("'provisional' names were guessed from one fact and nobody confirmed them. A phrase or a "
+                              "command is not a name: delete_entity {entity} removes it (the facts stay); a misspelt "
+                              "one: rename. A real one becomes established when a second fact names it or when you "
+                              "pass it in entities.")
+        return json.dumps(result)
+
+    def _review(self, a: dict) -> str:
+        """Clean-up candidates: facts (low trust, never recalled, unconfirmed inferences, near-duplicates) and, apart
+        from them, names guessed from one fact that nobody confirmed in 60 days (0.16.0)."""
+        facts = self._retriever.review(limit=_limit(a))
+        names = self._store.stale_provisional_entities(limit=_limit(a))
+        result = {"candidates": facts, "count": len(facts), "entity_candidates": names}
+        if names:
+            result["hint"] = "entity_candidates: delete_entity {entity} if it is not a name (the facts stay)."
+        return json.dumps(result)
+
     def _fact_call(self, a: dict, call, missing: str = ""):
         """Run a history action on a{fact_id}; a fact that does not exist is an answer, not a 'missing argument'."""
         fact_id = int(a["fact_id"])
@@ -1736,6 +1779,8 @@ class HolographicMemoryProvider(MemoryProvider):
         by_category = {r[0] or "general": r[1] for r in read("SELECT category, COUNT(*) FROM facts GROUP BY category")}
         return json.dumps({
             "facts": self._store.count_facts(), "entities": read("SELECT COUNT(*) FROM entities")[0][0],
+            "provisional_entities": self._store.entity_counts()["provisional"],
+            "entity_index": self._store.entity_index_state(),
             "by_category": by_category,
             "recalled_at_least_once": read("SELECT COUNT(*) FROM facts WHERE retrieval_count > 0")[0][0],
             "without_keywords": read("SELECT COUNT(*) FROM facts WHERE COALESCE(tags, '') NOT LIKE ? AND COALESCE(tags, '') "
@@ -1803,9 +1848,14 @@ class HolographicMemoryProvider(MemoryProvider):
             "list": lambda self, a: self._list(a),
             "stats": lambda self, a: self._stats(a),
             "export": lambda self, a: self._export(a),
-            "review": lambda self, a: _results(self._retriever.review(limit=_limit(a)), key="candidates"),
-            "entities": lambda self, a: _results(self._store.list_entities(limit=_limit(a)), key="entities"),
-            "alias": lambda self, a: json.dumps(self._store.add_alias(a["entity"], a["content"])),
+            "review": lambda self, a: self._review(a),
+            "entities": lambda self, a: self._list_entities(a),
+            "alias": lambda self, a: self._entity_call(a, ("entity", "content"),
+                                                       lambda: self._store.add_alias(a["entity"], a["content"])),
+            "rename": lambda self, a: self._entity_call(a, ("entity", "content"),
+                                                        lambda: self._store.rename_entity(a["entity"], a["content"])),
+            "delete_entity": lambda self, a: self._entity_call(a, ("entity",), lambda: self._store.delete_entity(a["entity"])),
+            "rebuild_entities": lambda self, a: json.dumps(self._store.rebuild_entity_index()),
             "enrich": lambda self, a: self._enrich(a),
         }),
         "fact_feedback": lambda self, a: self._feedback(a),
