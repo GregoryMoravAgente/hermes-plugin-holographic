@@ -124,15 +124,19 @@ In `config.yaml` under `plugins.hermes-memory-store`:
   and `probe Y` find X's facts — but no action someone takes with a name is resolved through it: a name declared
   (`entities=[...]` in add, update, change, correct) that is only such an alias becomes an entity of its own, and the
   answer says so under `split`, with the `alias` call that makes them one again; `alias`, `rename` and `delete_entity`
-  by it are refused. Until 0.16.3, "Alice Smith aka Bob Brown" after facts about Alice made a later
+  by it are refused, and so is `rename` of someone else into it (its hint would have merged the two). Deleting X
+  drops such aliases without keeping Y from being found again (`text_aliases_dropped`). Until 0.16.3, "Alice Smith aka Bob Brown" after facts about Alice made a later
   `entities=["Bob Brown"]` file the second person's facts under her, and `rename` or `delete_entity` by "Bob Brown"
   renamed or deleted her. `alias {entity: X, content: Y}` confirms such a name; **split** `{entity: <an alias>}` makes
   any alias an entity of its own. Facts whose text names Y then go to Y; one whose text names neither stays with X if
   someone declared X on it, and the answer lists it under `facts_to_check` — why a declared link exists the file does
-  not record. `entities` shows such names as `text_aliases`, `review` all of them under `alias_candidates`, `stats`
-  their number. What this does not do: a text that says Y still links to X, so recall can bring X's facts for a
-  message about Y until someone splits them; and it guards what this version writes — an older version writing the
-  same file still resolves a declared name through such an alias. A name declared with a text already stored (an
+  not record. If someone gave X the alias (`alias`), X stays an entity after the split even without facts; otherwise
+  the answer says `from_dropped` when X went with its last fact. `entities` shows such names as `text_aliases`,
+  `review` lists them under `alias_candidates` however old (up to its `limit`), `stats` gives their number. What this
+  does not do: a text that says Y still links to X, so recall can bring X's facts for a message about Y until someone
+  splits them; it guards what this version writes — an older version writing the same file still resolves a declared
+  name through such an alias; and an alias written before 0.16.0 is of unknown origin even if a text gave it: it is
+  shown under `aliases`, not refused, and `split` separates it. A name declared with a text already stored (an
   `add` of the same text, a `correct` of the date only, a `change` into another fact's text) now counts too; until
   0.16.3 it was dropped.
 - **probe**: every fact linked to a named entity, from the entity index (name or alias, any letter case).
@@ -307,10 +311,15 @@ A word matches another when they share its plain form or its stem in the languag
   words that look splittable, 4 are still split (`Plattform`, `Tablette`, `Kommode`, `Zoophobie`). Compounds whose
   meaning is not their parts' are never split (0.12.0: `Hochzeit` is no `Zeit`, `Frühstück` no `Stück`,
   `Weihnachten` no `Nacht`, `Augenblick`, `Verstand`, `Reisende`, `Wochenende`, `Flugzeug` …, nor their forms;
-  `Tablette` is in that list too), and the build no longer cuts a noun by the splitter's own judgement — only
-  Wikidata's analysis does, from the next rebuild of the table. A real ambiguity
+  `Tablette` is in that list too), in the table as well since its rebuild (0.17.0): the build keeps those words
+  whole and cuts the other nouns as before, by Wikidata's analysis where it has one and else by the splitter's own
+  judgement with stricter limits (0.12.0 had made every noun without an analysis one word; the table it would have
+  built no longer split 15 of 33 everyday compounds, and was never shipped). The table of 0.17.0 was built without
+  the verb forms and lacked 1,530 verbs that keep their forms whole: it cut 1,515 forms (`gehörte` as `geh|orte`,
+  `stelltest` as `stell|test`); 0.17.1 is built with them, and verbs, adjectives and verb forms are read as in 0.16.3
+  again. A real ambiguity
   stays: `Kopfschuppen` (dandruff) is `Kopf` + `Schuppen`, and `Schuppen` is also a shed. `de_compounds.tsv.gz`
-  (207 KB, rebuilt 2026-10-17), loaded on the first German word (0.15 s, 7 MB); `_DE_COMPOUNDS = False` turns it off.
+  (212 KB, rebuilt 2026-10-17), loaded on the first German word (0.15 s, 7 MB); `_DE_COMPOUNDS = False` turns it off.
 - **German and Spanish verb forms** (0.11.0): Snowball keeps `ging` apart from `gehen`, `fue` from `ir` and `ser`,
   `hizo` from `hacer`. A table of such forms from Wikidata's lexemes (the 2,000 German and 4,000 Spanish verbs a
   stand-in for frequency ranks first) gives a form its lemmas' stems, in text of that language only (not in a tie
@@ -835,7 +844,7 @@ new fact's text, and this version's next open does not notice: run `rebuild_enti
 
 0.17.0 changes no schema. An older version reads and writes the file as before, but does not keep the rule of 0.17.0:
 it resolves a declared name through an alias a fact's text gave, as 0.16.x did. After going back and forth, read
-`review` (`alias_candidates`) and `entities` (`text_aliases`).
+`review` (`alias_candidates`) and `entities` (`text_aliases`). 0.17.1 changes no schema either.
 
 ## Development
 

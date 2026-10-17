@@ -10,14 +10,17 @@ between requests; QUERIES below, verbatim). Wikidata's structured data, lexemes 
 (https://creativecommons.org/publicdomain/zero/1.0/, Wikidata:Licensing): no attribution is required, it is given
 anyway (LICENSES/Wikidata-CC0.txt). Counts of that date: German 242,105 lexemes (189,032 nouns, 26,873 adjectives,
 20,429 verbs; 583,649 verb forms), 7,767 German lexemes with "combines lexemes" (P5238); Spanish 68,285 lexemes (8,574
-verbs with 573,450 forms). de_compounds.tsv.gz was rebuilt from a run of 2026-10-17 (0.16.4: the German lemma, parts
-and derived queries only; 242,083 German lexemes, 189,034 nouns, 8,402 with P5238); de_es_forms.tsv.gz is of
-2026-10-12. Each table's header gives the date its queries ran.
+verbs with 573,450 forms). de_compounds.tsv.gz was rebuilt from a run of 2026-10-17 (0.17.1: the German lemma, verb
+form, parts and derived queries; 242,083 German lexemes, 189,034 nouns, 8,402 with P5238; 0.17.0 was built without the
+verb forms and lacked 1,530 verbs); de_es_forms.tsv.gz is of
+2026-10-12. A table's header gives the date of the newest download it was built from (the files' time, UTC).
 
 Changes (de_compounds.tsv.gz): German noun, adjective and verb lemmas, folded as text.py folds them (accents dropped,
-lower case); every noun of the dictionary is one word unless Wikidata's P5238 analysis says it is a compound (two
-readings of one spelling, "Wachstube": left whole) — until 0.11.0 the build also cut nouns with text.py's own
-splitter, which read "Tablette" as Tab|Lette and "Weihnachten" as Weih|Nachten —, lexemes derived from another one (P5191) or built with an affix
+lower case); every noun of the dictionary judged a compound or one word: Wikidata's P5238 analysis where it has
+one (two readings of one spelling, "Wachstube": left whole), the lexicalised compounds text.py keeps whole
+(_DE_ONE_WORD: "Hochzeit", "Tablette") one word, the rest judged with text.py's splitter under stricter limits than at
+run time (0.17.0; 0.12.0 made every noun without an analysis one word instead, and that table split 15 of 33 everyday
+compounds no more), lexemes derived from another one (P5191) or built with an affix
 kept whole, and so are an agent noun of a verb ("Sauger") and the weekdays; for each word a class of how often it is a
 part of the other nouns and the linking elements seen after it; compounds whose cuts the splitter would not find by
 itself written with their cuts; words the run-time splitter needs neither as a part nor to keep a word (or one of its
@@ -301,7 +304,7 @@ def build_compounds(dl: Path, exclude=frozenset(), log=print) -> tuple[dict, dic
     # judged with text.py's splitter under stricter limits than at run time. 0.12.0 made every noun without an analysis
     # one word instead, to keep lexicalised compounds whole; the table it built was never shipped: Wikidata lists most
     # compounds without an analysis, and 15 of 33 everyday ones were no longer split (Zahnarzttermin, Schulbus,
-    # Mietvertrag, Elternabend; 0.16.4).
+    # Mietvertrag, Elternabend; 0.17.0).
     judge = T._DeSplitter(table(prod, links, nouns), {}, **JUDGE)
     cuts, atoms, why = {}, set(), collections.Counter()
     for w in nouns:
@@ -357,7 +360,11 @@ def build_compounds(dl: Path, exclude=frozenset(), log=print) -> tuple[dict, dic
         if (runtime.cuts(got) if got else frozenset()) != c:
             over[w] = tuple(sorted(c))
     runtime.cuts_of = over
-    # 3. leave out what the run-time splitter needs neither as a part nor to keep a word or its forms whole
+    # 3. leave out what the run-time splitter needs neither as a part nor to keep a word or its forms whole. Without
+    # the verb forms a verb whose forms only it keeps whole (gehörte, not geh|orte) went: 0.17.0 was built so and lost
+    # about 1,500 verbs (review 0.17.0, Fable; fixed in 0.17.1)
+    if not any(dl.glob("forms_de_*.csv")):
+        raise SystemExit(f"no German verb forms (forms_de_*.csv) in {dl}: the table needs them; run fetch first")
     forms = collections.defaultdict(set)
     for lemmas, fs in verb_forms(dl, "de").values():
         for lemma in lemmas:
@@ -483,8 +490,11 @@ HEAD = ("# {what}, derived from Wikidata Lexemes (https://www.wikidata.org/wiki/
 
 
 def queried(dl: Path) -> str:
-    """The date the downloads in *dl* were made (UTC), for a table's header."""
-    return time.strftime("%Y-%m-%d", time.gmtime(max(f.stat().st_mtime for f in dl.glob("*.csv"))))
+    """The date of the newest download in *dl* (its file's time, UTC), for a table's header."""
+    files = list(dl.glob("*.csv"))
+    if not files:
+        raise SystemExit(f"no downloads (*.csv) in {dl}: run fetch first")
+    return time.strftime("%Y-%m-%d", time.gmtime(max(f.stat().st_mtime for f in files)))
 
 
 def write(path: Path, header: str, lines: list[str]) -> int:

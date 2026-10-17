@@ -50,6 +50,10 @@ also decide which Latin language a text is), its stemmer, greetings and negators
 through the word scan in `retrieval.py` (`_texts`, `_scan_candidates`), not FTS5; keep that in mind for any script
 whose words FTS5 splits or whose inflection is a prefix. The README "Languages" section states how every number was
 obtained; keep it that way.
+A rebuilt German table is compared with the shipped one over every German noun, adjective, verb lemma and verb form
+of the run (de_parts with both), not nouns alone: 0.17.0 was built without `forms_de_*.csv`, lost 1,530 verbs and cut
+1,515 verb forms (`gehörte` as `geh|orte`), and a nouns-only comparison showed nothing (review 0.17.0, Fable; the
+build now stops without the forms).
 
 ## Entities
 
@@ -85,7 +89,10 @@ that is how the verb rule of 0.16.2 was dropped (2.8 % of the names lost in its 
   delete_entity by one are refused, `split` separates any alias. Left open on purpose: a text that says Y still links
   to X (recall through the hint until someone splits); a known multi-word name a text mentions links a namesake's fact
   (`mentioned_entity_ids`); `entity_key` folds spellings together (`Bob-Brown` = `bob brown`); should automatic
-  extraction (someone else's words) give aka aliases at all — watch a week of a real store first.
+  extraction (someone else's words) give aka aliases at all — watch a week of a real store first. Also open (0.17.1,
+  review Fable): an entity row without `name_key` that an older version wrote beside an aka alias with the same key
+  makes `entity_ids` give two ids, and a declared name then resolves to the smaller one; only with an older version
+  writing the same file. An alias of unknown origin (`legacy`, before 0.16.0) that a text gave is not refused.
 
 - Fact vectors after a turn on a slow endpoint (0.16.3, issue #5): batches follow the measured speed, checked with
   the reporter's numbers and a fake endpoint only, never against a real local model here. The catch-up runs on the

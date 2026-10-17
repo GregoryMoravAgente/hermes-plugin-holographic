@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.17.1 — 2026-10-17
+
+What two code reviews of 0.17.0 found: the German table lost its verbs, and splitting an alias "X aka Y" gave did not
+follow a chain to its end.
+
+### Fixed
+
+- **German verb forms were cut as compounds.** The table of 0.17.0 was built without Wikidata's verb forms; the build
+  keeps a verb only if it is a part of other words or keeps one of its forms whole, and without the forms it could not
+  tell, so 1,530 verbs went (3,462 → 1,932). 1,515 forms were then cut — `gehörte` as `geh|orte`, `stelltest`,
+  `bautest`, `pinkelten` —, so "Das Haus gehörte Oma" answered questions about `Orte`; 10,618 more forms, 365 verbs
+  and 113 adjectives were no longer known. The table is rebuilt with them (212 KB, same run of 2026-10-17 plus its
+  verb forms): verbs, adjectives and 138,874 of 138,892 forms read as in 0.16.3 (the other 18, forms of `weihnachten`,
+  `frühstücken`, `hochzeiten`, stay whole as unknown words), nouns as in 0.17.0. The build now stops when the verb
+  forms are missing instead of building without them.
+- **Splitting the middle of a chain** ("Alice aka Bob", "Bob aka Carl", "Carl aka Dan", split Bob) left Dan with Alice,
+  and a fact "Bob aka Carl" stayed on Alice when she was declared. The split now drops every alias no current fact
+  backs any more, again until none is left, links the facts again (those that say "X aka Y" first), and no longer
+  keeps a declared owner on a fact whose text names a name the owner lost. The answer is read at the end (it described
+  a state in between) and is reported once the transaction commits: kept when a later step of the call fails
+  (`saved_before_the_error`), absent when it rolls back.
+- **A name declared with a text already stored** left the fact's vector and the banks as they were. It is encoded again.
+- **`update` with `entities` and nothing else** dropped the names when it did not touch the fact.
+- **`split` of a deleted name** left its tombstone: declared, it was never found in text again. A split lifts it.
+- **`delete_entity` by X put a tombstone on an alias Y a text gave X**: after deleting Alice, "Bob Brown lives in
+  Berlin" linked no entity at all. Such aliases now go without a tombstone, listed under `text_aliases_dropped`.
+- **`rename` into an alias a text gave someone else** was refused with a hint whose `alias` call merged the two. It is
+  refused with the `split` way out instead.
+- **`split` of an alias someone gave** dropped its owner when the owner had no fact of its own, and the answer named an
+  entity that was gone. The owner counts as declared (someone named it); otherwise the answer says `from_dropped`.
+- **The fact declaring both X and Y** was listed under its own `facts_to_check`.
+- **`correct` that changes nothing** answered `unchanged` and hid that it linked names: `entities_linked` says so.
+
+### Reviewed
+
+0.17.0 by Codex CLI (gpt-6.1-sol, "release after fixes": chains, the report, re-encoding, tombstones, `update`, the
+German table's documentation) and by an agent on Claude Fable 5.1 (the lost verbs, measured over every German lemma
+and verb form of the run; `delete_entity`, `rename`, `split` of a given alias). 18 new tests (14 fail on 0.17.0); the
+comparison of the tables covers nouns, adjectives, verbs and verb forms now, not nouns alone. 2100 pass on the
+server's core.
+
 ## 0.17.0 — 2026-10-17
 
 An alias "X aka Y" in a fact's text gave no longer decides who a name someone gives belongs to (HANDOFF open work,

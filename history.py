@@ -456,7 +456,10 @@ class HistoryMixin:
             if new_text == fact["content"]:  # the text stays: names given with it still count (0.17.0)
                 self._declare(fact_id, entities)
             if new_text == fact["content"] and new_start == cur["valid_from"]:
-                return {"fact_id": fact_id, "status": "unchanged"}
+                out = {"fact_id": fact_id, "status": "unchanged"}
+                if entities:  # the text and date stay, the names were linked all the same (review 0.17.0, Fable)
+                    out["entities_linked"] = [n for n in entities if isinstance(n, str) and n.strip()]
+                return out
             seq = self._replace_current(fact_id, "corrected", new_text, fact["category"], fact["tags"],
                                         valid_from=new_start, source=self._with_origin(source, cur),
                                         trust=fact["trust_score"])

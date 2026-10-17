@@ -800,8 +800,10 @@ def _with_splits(answer: str, splits: dict) -> str:
         result = json.loads(answer)
     except ValueError:
         return answer
-    if not isinstance(result, dict) or "error" in result:
+    if not isinstance(result, dict):
         return answer
+    if "error" in result:  # committed before a later step failed (review 0.17.0): the split happened all the same
+        result["saved_before_the_error"] = "the names below were split off and stored before this error"
     result["split"] = {
         name: (f"was only another name of '{info['from']}' that a fact's text gave ('X aka Y'); now an entity of its "
                f"own. If it is the same one: alias {{entity: '{info['from']}', content: '{info['entity']}'}}"
@@ -1388,11 +1390,15 @@ class HolographicMemoryProvider(MemoryProvider):
         if not self._tool_writable and (tool_name == "fact_feedback" or args.get("action") in _WRITE_ACTIONS):
             return tool_error("The fact store is read-only in this context (subagent, flush, or cron with "
                               "cron_writes off); only the main agent writes facts.")
+        if tool_name == "fact_store" and args.get("action") in _DECLARING_ACTIONS and args.get("entities"):
+            # what a declared name split off is reported once committed, also when a later step fails (0.17.1)
+            with self._store.collect_splits() as splits:
+                answer = self._run_tool(tool_name, args)
+            return _with_splits(answer, splits)
+        return self._run_tool(tool_name, args)
+
+    def _run_tool(self, tool_name: str, args: dict) -> str:
         try:
-            if tool_name == "fact_store" and args.get("action") in _DECLARING_ACTIONS and args.get("entities"):
-                with self._store.collect_splits() as splits:
-                    answer = self._TOOL_HANDLERS[tool_name](self, args)
-                return _with_splits(answer, splits)
             return self._TOOL_HANDLERS[tool_name](self, args)
         except KeyError as exc:
             return tool_error(f"Missing required argument: {exc}")

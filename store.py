@@ -905,7 +905,12 @@ class MemoryStore(HistoryMixin):
             try:
                 yield
                 self._conn.execute("COMMIT")
+                if getattr(_SPLITS, "pending", None):  # committed: what collect_splits reports (0.17.1)
+                    _SPLITS.found.update(_SPLITS.pending)
+                    _SPLITS.pending = []
             except BaseException:
+                if getattr(_SPLITS, "pending", None):
+                    _SPLITS.pending = []  # rolled back: it never happened
                 if self._conn.in_transaction:
                     try:
                         self._conn.execute("ROLLBACK")
@@ -1000,10 +1005,11 @@ class MemoryStore(HistoryMixin):
                 "trust_score": _clamp_trust(row["trust_score"] + trust_delta) if trust_delta is not None else None,
             }.items() if val is not None}
             assignments = ", ".join((["updated_at = CURRENT_TIMESTAMP"] if touch else []) + [f"{col} = ?" for col in changes])
-            if not assignments:
+            if not assignments and not entities:
                 return True
             try:
-                self._write(f"UPDATE facts SET {assignments} WHERE fact_id = ?", [*changes.values(), fact_id])
+                if assignments:  # entities alone (touch=False) change no column (review 0.17.0: they were dropped)
+                    self._write(f"UPDATE facts SET {assignments} WHERE fact_id = ?", [*changes.values(), fact_id])
             except sqlite3.IntegrityError:
                 other = self._one("SELECT fact_id FROM facts WHERE content = ?", (content,))
                 raise DuplicateContentError(int(other["fact_id"]) if other else -1) from None
@@ -1319,53 +1325,103 @@ class MemoryStore(HistoryMixin):
         this operation split off (0.17.0). Read it only after the operation succeeded; nested in one thread, the
         outer one collects."""
         outer = getattr(_SPLITS, "found", None)
-        found = outer if outer is not None else {}
-        _SPLITS.found = found
+        if outer is not None:
+            yield outer
+            return
+        found: dict = {}
+        _SPLITS.found, _SPLITS.pending = found, []
         try:
             yield found
         finally:
-            _SPLITS.found = outer
+            _SPLITS.found, _SPLITS.pending = None, []
 
-    def _detach_alias(self, row, *, declared: bool = True) -> dict:
-        """Make the alias *row* (see _alias_row) an entity of its own, inside the caller's transaction (0.17.0). The
-        facts of the entity it belonged to are linked again from their text: one whose text names the alias and not
-        the old entity leaves the old entity; one whose text names neither stays with the old entity when it was
-        declared there, and is listed under "facts_to_check" — why a declared link exists the file does not record,
-        so which of the two such a fact is about only a person can tell (review 0.17.0). Aliases "X aka Y" that now
-        hang on the detached name (a chain: "Bob aka Carl") follow it, by _drop_orphan_entities' pruning."""
+    def _drop_alias_row(self, alias_key: str, entity_id: int) -> None:
+        """Remove one alias from both representations (the entity_aliases row and the legacy column)."""
+        self._write("DELETE FROM entity_aliases WHERE alias_key = ? AND entity_id = ?", (alias_key, entity_id))
+        row = self._one("SELECT aliases FROM entities WHERE entity_id = ?", (entity_id,))
+        if row is not None and row["aliases"]:
+            kept = [a for a in row["aliases"].split(",") if a.strip() and entity_key(a) != alias_key]
+            self._write("UPDATE entities SET aliases = ? WHERE entity_id = ?", (_legacy_aliases(kept), entity_id))
+
+    def _detach_alias(self, row, *, declared: bool = True, declaring: int | None = None) -> dict:
+        """Make the alias *row* (see _alias_row) an entity of its own, inside the caller's transaction (0.17.0).
+
+        1. The alias leaves the entity it belonged to (both representations) and becomes an entity (declared).
+        2. Aliases "X aka Y" gave that no current fact backs any more are dropped, again and again until none is
+           left: in a chain "Alice aka Bob", "Bob aka Carl", "Carl aka Dan", Carl hung on Bob and Dan on Carl; one
+           pass left Dan with Alice (review 0.17.0, Codex P1.2). Only aliases are dropped here, no link yet.
+        3. The facts of every entity that lost an alias are linked again from their text, the facts that say
+           "X aka Y" first (so a chain is given again to whoever its text now names: "Bob aka Carl" makes Carl Bob's
+           before "Carl likes tea" is read). A link to such an entity stays when the text names it; when it does not,
+           a declared one stays unless the text names one of the names it lost (that name is now someone else's:
+           "Bob aka Carl" no longer keeps Alice, review 0.17.0 Codex P1.1), and a fact it stays on whose text names it
+           not is listed under "facts_to_check": why a declared link exists the file does not record. Not the fact
+           *declaring* when it is being declared on the owner too ("They met", entities=[Alice, Bob]).
+        An owner someone gave the alias to (alias {entity: X, content: Y}) was named by that person: it counts as
+        declared from here, so it does not go when Y takes its facts (review 0.17.0, Fable: X vanished with its alias).
+        The answer is read from the links at the end (review 0.17.0: it described a state in between); "from_dropped"
+        says the old entity went with its last fact."""
         owner, alias, alias_key = row["entity_id"], row["alias"], row["alias_key"]
-        self._write("DELETE FROM entity_aliases WHERE alias_key = ? AND entity_id = ?", (alias_key, owner))
-        own = self._one("SELECT aliases, entity_type FROM entities WHERE entity_id = ?", (owner,))
-        kept = [a for a in (own["aliases"] or "").split(",") if a.strip() and entity_key(a) != alias_key]
-        self._write("UPDATE entities SET aliases = ? WHERE entity_id = ?", (_legacy_aliases(kept), owner))
+        lost: dict[int, set[str]] = {owner: {alias}}  # entity -> names it lost
+        self._drop_alias_row(alias_key, owner)
+        if row["source"] == "user":
+            self._write("UPDATE entities SET entity_type = 'declared' WHERE entity_id = ?", (owner,))
         new = self._resolve_entity(alias)
         if declared:
             self._write("UPDATE entities SET entity_type = 'declared' WHERE entity_id = ?", (new,))
         self._bump()
-        owner_declared = own["entity_type"] == "declared"
-        moved, shared, check = [], [], []
-        facts = [r[0] for r in self._conn.execute(
-            "SELECT fact_id FROM fact_entities WHERE entity_id = ? ORDER BY fact_id", (owner,)).fetchall()]
-        for fact_id in facts:
-            content = self._one("SELECT content FROM facts WHERE fact_id = ?", (fact_id,))["content"]
+        for _ in range(self._one("SELECT COUNT(*) FROM entity_aliases")[0] + 1):
+            rows = self._conn.execute("SELECT alias_key, entity_id, alias FROM entity_aliases WHERE source = 'aka'").fetchall()
+            backed = self._aka_backing(r["entity_id"] for r in rows) if rows else set()
+            gone = [r for r in rows if (r["entity_id"], r["alias_key"]) not in backed]
+            if not gone:
+                break
+            for r in gone:
+                self._drop_alias_row(r["alias_key"], r["entity_id"])
+                lost.setdefault(r["entity_id"], set()).add(r["alias"])
+            self._bump()
+        kinds = {r[0]: r[1] for r in self._conn.execute(
+            f"SELECT entity_id, entity_type FROM entities WHERE entity_id IN ({','.join('?' * len(lost))})",
+            tuple(lost)).fetchall()}
+        affected = sorted({r[0] for r in self._conn.execute(
+            f"SELECT fact_id FROM fact_entities WHERE entity_id IN ({','.join('?' * len(lost))})", tuple(lost)).fetchall()})
+        texts = {r[0]: r[1] for r in self._conn.execute(
+            f"SELECT fact_id, content FROM facts WHERE fact_id IN ({','.join('?' * len(affected))})",
+            tuple(affected)).fetchall()} if affected else {}
+        before = {f: {r[0] for r in self._conn.execute("SELECT entity_id FROM fact_entities WHERE fact_id = ?", (f,))}
+                  for f in affected}
+        check: set[int] = set()
+        for fact_id in sorted(affected, key=lambda f: (not self._aka_pairs(texts.get(f) or ""), f)):
+            content = texts.get(fact_id)
+            if content is None:
+                continue
             current = {r[0]: r[1] for r in self._conn.execute(
                 "SELECT fe.entity_id, e.entity_type FROM fact_entities fe JOIN entities e ON e.entity_id = fe.entity_id "
                 "WHERE fe.fact_id = ?", (fact_id,)).fetchall()}
             named = self._text_entity_ids(content) | self.mentioned_entity_ids(content)
-            links = named | {e for e, kind in current.items() if kind == "declared" and e != owner}
-            if owner not in named and new not in named and owner_declared:
-                links.add(owner)  # declared there, and the text cannot say for whom
-                check.append(fact_id)
+            links = set(named) | {e for e, kind in current.items() if kind == "declared" and e not in lost}
+            for entity_id in lost:
+                if entity_id not in current or entity_id in named or kinds.get(entity_id) != "declared":
+                    continue
+                moved_to = {i for name in lost[entity_id] for i in self.entity_ids(name)} - {entity_id}
+                if not named & moved_to:
+                    links.add(entity_id)  # declared there, and the text says nothing about the names it lost
+                    check.add(fact_id)
             self._write("DELETE FROM fact_entities WHERE fact_id = ?", (fact_id,))
             for entity_id in sorted(links):
                 self._write("INSERT OR IGNORE INTO fact_entities (fact_id, entity_id) VALUES (?, ?)", (fact_id, entity_id))
-            if new in links:
-                (shared if owner in links else moved).append(fact_id)
-        self._reencode(facts)
+        self._reencode(affected)
         self._drop_orphan_entities(keep_declared=True)
         self._bump()
-        return {"entity": alias, "entity_id": new, "from": row["owner"], "was": row["source"],
-                "facts_moved": moved, "facts_shared": shared, "facts_to_check": check}
+        after = {f: {r[0] for r in self._conn.execute("SELECT entity_id FROM fact_entities WHERE fact_id = ?", (f,))}
+                 for f in affected}
+        out = {"entity": alias, "entity_id": new, "from": row["owner"], "was": row["source"],
+               "facts_moved": [f for f in affected if owner in before[f] and owner not in after[f]],
+               "facts_shared": [f for f in affected if owner in after[f] and new in after[f]],
+               "facts_to_check": sorted(f for f in check if owner in after.get(f, ()) and f != declaring)}
+        if self._one("SELECT 1 FROM entities WHERE entity_id = ?", (owner,)) is None:
+            out["from_dropped"] = True
+        return out
 
     def split_alias(self, name: str) -> dict:
         """Make an alias an entity of its own (the split action, 0.17.0): one a fact's text gave, one someone gave or
@@ -1384,6 +1440,7 @@ class MemoryStore(HistoryMixin):
             if row is None or row["entity_id"] != ids[0]:
                 raise ValueError(f"'{name.strip()}' is the name of an entity, not an alias; rename or delete_entity "
                                  "changes a name")
+            self._lift_tombstones(name)  # someone named it, as a declaration does (review 0.17.0)
             return self._detach_alias(row)
 
     def unconfirmed_text_aliases(self, limit: int = 20) -> list[dict]:
@@ -1589,9 +1646,7 @@ class MemoryStore(HistoryMixin):
         if not declared:
             return
         self._link_declared(fact_id, declared)
-        row = self._one("SELECT content FROM facts WHERE fact_id = ?", (fact_id,))
-        if row is not None:
-            self._compute_hrr_vector(fact_id, row["content"])
+        self._reencode([fact_id])  # its roles changed: the vector again (emptied without numpy), banks go (0.17.1)
 
     def _link_declared(self, fact_id: int, declared) -> None:
         """Link names the caller declared (one-word names allowed) and mark them declared. A declared name is someone
@@ -1607,10 +1662,11 @@ class MemoryStore(HistoryMixin):
                 self._lift_tombstones(name)
                 row = self._text_alias(name) if self._entry.get("migrated") else None
                 if row is not None:
-                    detached = self._detach_alias(row)
-                    found = getattr(_SPLITS, "found", None)
-                    if found is not None:
-                        found[name] = detached
+                    also = any(row["entity_id"] in self.entity_ids(_clean_given(other))
+                               for other in declared if _clean_given(other) != name)
+                    detached = self._detach_alias(row, declaring=fact_id if also else None)
+                    if getattr(_SPLITS, "found", None) is not None:  # reported once the transaction commits
+                        _SPLITS.pending.append((name, detached))
                 entity_id = self._resolve_entity(name)
                 if self._write("UPDATE entities SET entity_type = 'declared' WHERE entity_id = ? AND entity_type != 'declared'",
                                (entity_id,)).rowcount:
@@ -1828,7 +1884,8 @@ class MemoryStore(HistoryMixin):
         """Delete an entity by its name or an alias: the name, its aliases and its links to facts. The facts stay as
         they are: this cleans the index of names and forgets nothing (fact_store forget does that). The name and its
         aliases get a tombstone, so a fact's text never creates them again; an explicit name (entities=[...], alias,
-        rename) lifts it. The file is rewritten afterwards, as after forget, so freed pages keep no copy of a name no
+        rename) lifts it. Aliases "X aka Y" gave go without one ("text_aliases_dropped", 0.17.1): a text decided they
+        were X's, and Y may be someone else. The file is rewritten afterwards, as after forget, so freed pages keep no copy of a name no
         fact says ("scrub": "pending" when another process blocked it; the next open retries). KeyError when no entity
         has that name or alias."""
         result = self._delete_entity(name)
@@ -1895,13 +1952,21 @@ class MemoryStore(HistoryMixin):
             if textual is not None:
                 raise ValueError(self._text_alias_refusal(name, textual))
             names: list[str] = []
+            textual_names: list[str] = []  # aliases "X aka Y" gave: they go with the entity, without a tombstone
             facts: set[int] = set()
             aliases = 0
+            source = "COALESCE(source, 'legacy')" if self._alias_sources() else "'legacy'"
             for entity_id in ids:
                 row = self._one("SELECT name, aliases FROM entities WHERE entity_id = ?", (entity_id,))
-                own = [r[0] for r in self._conn.execute("SELECT alias FROM entity_aliases WHERE entity_id = ?", (entity_id,))]
+                rows = self._conn.execute(f"SELECT alias, {source} FROM entity_aliases WHERE entity_id = ?",
+                                          (entity_id,)).fetchall()
+                own = [r[0] for r in rows]
                 legacy = [a.strip() for a in (row["aliases"] or "").split(",") if a.strip()]
-                names += [row["name"], *own, *legacy]
+                # A text decided that "Y" is X's, not someone: deleting X must not keep Y from ever being found again
+                # (review 0.17.0, Fable: "Bob Brown lives in Berlin" then linked no entity at all).
+                text_keys = {entity_key(r[0]) for r in rows if r[1] == "aka"} - {entity_key(row["name"])}
+                textual_names += [a for a in dict.fromkeys(a for a in (*own, *legacy) if entity_key(a) in text_keys)]
+                names += [n for n in (row["name"], *own, *legacy) if entity_key(n) not in text_keys]
                 aliases += len({entity_key(a) for a in (*own, *legacy)} - {entity_key(row["name"])})
                 facts |= {r[0] for r in self._conn.execute("SELECT fact_id FROM fact_entities WHERE entity_id = ?", (entity_id,))}
                 self._write("DELETE FROM fact_entities WHERE entity_id = ?", (entity_id,))
@@ -1914,8 +1979,11 @@ class MemoryStore(HistoryMixin):
                             "ON CONFLICT(key) DO UPDATE SET value = excluded.value")
             self._reencode(facts)
             self._bump()
-            return {"entity": names[0], "deleted": True, "facts_unlinked": len(facts), "aliases_dropped": aliases,
-                    "facts_deleted": 0}
+            result = {"entity": names[0], "deleted": True, "facts_unlinked": len(facts), "aliases_dropped": aliases,
+                      "facts_deleted": 0}
+            if textual_names:
+                result["text_aliases_dropped"] = sorted({entity_key(n): n for n in textual_names}.values())
+            return result
 
     def rename_entity(self, name: str, new_name: str) -> dict:
         """Give an entity another name; its id, links and aliases stay, the old name becomes an alias, and the entity
@@ -1939,6 +2007,9 @@ class MemoryStore(HistoryMixin):
             if textual is not None:
                 raise ValueError(self._text_alias_refusal(name, textual))
             entity_id = ids[0]
+            taken = self._text_alias(new)  # the hint below would merge two people a text tied (review 0.17.0, Fable)
+            if taken is not None and taken["entity_id"] != entity_id:
+                raise ValueError(self._text_alias_refusal(new, taken))
             others = [i for i in self.entity_ids(new) if i != entity_id]
             if others:
                 other = self._one("SELECT name FROM entities WHERE entity_id = ?", (others[0],))["name"]
