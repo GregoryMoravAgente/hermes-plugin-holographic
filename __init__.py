@@ -68,10 +68,11 @@ FACT_STORE_SCHEMA = {
         "• history {fact_id} · update {fact_id, keywords/tags/category} · list {as_of?} · stats · export · review "
         "(clean-up candidates) · related · contradict.\n"
         "• enrich — facts stored without keywords: give each some with update {fact_id, keywords}.\n"
-        "• entities {status?} — known names with aliases; 'provisional' = guessed from one fact, nobody confirmed · "
-        "alias {entity, content=<other name>} — one entity, two names; entity stays the name (merges them if both "
-        "exist) · rename {entity, content=<new name>} · delete_entity {entity} — a name that is not one (a phrase, a "
-        "command): drops the name from the index, keeps every fact, and text never creates it again.\n"
+        "• entities {status?} — known names with aliases; 'provisional' = guessed from one fact (or, without "
+        "capitals, only ever in quotes), nobody confirmed · alias {entity, content=<other name>} — one entity, two "
+        "names; entity stays the name (merges them if both exist) · rename {entity, content=<new name>} · "
+        "delete_entity {entity} or {entities: [...]} — names that are not names (a phrase, a command, a label): drops "
+        "them from the index, keeps every fact, and text never creates them again.\n"
         "Recalled facts show their id as #N: pass it to fact_feedback; '(inferred)' marks a conclusion nobody "
         "confirmed."
     ),
@@ -97,7 +98,8 @@ FACT_STORE_SCHEMA = {
                        "description": "'entities': which names to list (default all)."},
             "entities": {"type": "array", "items": {"type": "string"},
                          "description": "'reason': the entities to join. 'add'/'update': who or what the fact is about; "
-                                        "needed for one-word names (e.g. a first name), so later facts link to them."},
+                                        "needed for one-word names (e.g. a first name), so later facts link to them. "
+                                        "'delete_entity': several names at once (up to 100)."},
             "supersedes": {"type": "integer", "description": "'add': the same as change on that id (older prompts)."},
             "origin": {"type": "string", "enum": ["said", "confirmed", "inferred"],
                        "description": "'add' / 'change' / 'correct': who stands behind it. 'said': the person said it; "
@@ -1592,16 +1594,29 @@ class HolographicMemoryProvider(MemoryProvider):
         except ValueError as exc:  # an unusable or taken name: the reason, and that nothing happened (review 0.16.0)
             return tool_error(f"{exc}. Nothing was changed.")
 
+    def _delete_entity(self, a: dict) -> str:
+        """delete_entity {entity}, or {entities: [...]} for several in one call (0.16.2; the store checks the list
+        whole before it changes anything, review 0.16.2)."""
+        if "entities" in a and a["entities"] is not None:
+            names = a["entities"]
+            if isinstance(names, str):
+                names = [names]
+            if isinstance(names, (list, tuple)) and a.get("entity"):
+                names = [*names, a["entity"]]
+            return self._entity_call(a, (), lambda: self._store.delete_entities(names))
+        return self._entity_call(a, ("entity",), lambda: self._store.delete_entity(a["entity"]))
+
     def _list_entities(self, a: dict) -> str:
         """Names with aliases, fact counts and standing; how many are provisional in the whole store (0.16.0)."""
         rows = self._store.list_entities(limit=_limit(a), status=a.get("status") or None)
         counts = self._store.entity_counts()
         result = {"entities": rows, "count": len(rows), "provisional_entities": counts["provisional"]}
         if counts["provisional"] and a.get("status") != "provisional":
-            result["hint"] = ("'provisional' names were guessed from one fact and nobody confirmed them. A phrase or a "
-                              "command is not a name: delete_entity {entity} removes it (the facts stay); a misspelt "
-                              "one: rename. A real one becomes established when a second fact names it or when you "
-                              "pass it in entities.")
+            result["hint"] = ("'provisional' names were guessed from one fact, or (letters without case) only ever found "
+                              "in quotes, and nobody confirmed them. A phrase, a command or a label is not a name: "
+                              "delete_entity {entities: [...]} removes them (the facts stay); a misspelt one: rename. A "
+                              "real one becomes established when a second fact uses it as a name or when you pass it "
+                              "in entities.")
         return json.dumps(result)
 
     def _review(self, a: dict) -> str:
@@ -1611,7 +1626,8 @@ class HolographicMemoryProvider(MemoryProvider):
         names = self._store.stale_provisional_entities(limit=_limit(a))
         result = {"candidates": facts, "count": len(facts), "entity_candidates": names}
         if names:
-            result["hint"] = "entity_candidates: delete_entity {entity} if it is not a name (the facts stay)."
+            result["hint"] = ("entity_candidates: delete_entity {entities: [...]} for those that are not names (the "
+                              "facts stay).")
         return json.dumps(result)
 
     def _fact_call(self, a: dict, call, missing: str = ""):
@@ -1854,7 +1870,7 @@ class HolographicMemoryProvider(MemoryProvider):
                                                        lambda: self._store.add_alias(a["entity"], a["content"])),
             "rename": lambda self, a: self._entity_call(a, ("entity", "content"),
                                                         lambda: self._store.rename_entity(a["entity"], a["content"])),
-            "delete_entity": lambda self, a: self._entity_call(a, ("entity",), lambda: self._store.delete_entity(a["entity"])),
+            "delete_entity": lambda self, a: self._delete_entity(a),
             "rebuild_entities": lambda self, a: json.dumps(self._store.rebuild_entity_index()),
             "enrich": lambda self, a: self._enrich(a),
         }),

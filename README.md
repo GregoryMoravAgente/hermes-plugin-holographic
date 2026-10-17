@@ -106,10 +106,14 @@ In `config.yaml` under `plugins.hermes-memory-store`:
 - **entities** lists names with their aliases, fact counts and standing (0.16.0): `established` when someone named
   it (`entities=[...]`, `alias`, `rename`) or two or more facts name it, `provisional` when the rules below guessed it
   from one fact and nobody confirmed it; `status` lists one kind, and the answer says how many provisional names the
-  store holds. **alias** gives an entity a second name (or merges two entities; `entity` stays the name).
+  store holds. A name whose letters have no case (Chinese, Japanese, Thai, Arabic...) that the facts only ever put in plain quotes stays
+  provisional however many facts quote it (0.16.2): in Chinese a button or a step goes in quotes as readily as a name.
+  Then it takes a person naming it, or two facts of which one uses it in title marks 《》, in "X aka Y" or in
+  running text where mentions are found (a name of several words, or one a person declared: a one-word Chinese name
+  nobody declared is not looked up in running text, where a quoted label is written bare as often). **alias** gives an entity a second name (or merges two entities; `entity` stays the name).
   **rename** gives it another name (the old one becomes an alias; a name another entity has is refused, so a typo
-  never merges two). **delete_entity** removes a name that is not one — a phrase, a command — with its aliases and
-  links; every fact stays, a tombstone (a keyed hash, not the name) keeps text from creating it again until someone
+  never merges two). **delete_entity** removes a name that is not one — a phrase, a command, a label — with its aliases and
+  links (`entities: [...]` for up to 100 in one call, 0.16.2); every fact stays, a tombstone (a keyed hash, not the name) keeps text from creating it again until someone
   names it explicitly, and the file is rewritten as after forget. An alias "X aka Y" in a fact's text gave goes with
   the last fact that says it, and so does X on the facts only that alias linked; an alias written before 0.16.0 is of
   unknown origin, kept like a given one and dropped only when a forgotten fact said it. A name with a comma is no
@@ -128,7 +132,8 @@ In `config.yaml` under `plugins.hermes-memory-store`:
   neither is a version number with nothing beside it that names a thing ("0.17.0 installed"; "Python 3.12" is one), a
   quoted span whose letters with case are all lower case and that holds no identifier with a letter in it ('count',
   '14 days', «быстро беги»; 'kanban.db' and 'gpt-4o' are), a quoted greeting ("Good morning", «Спасибо большое»,
-  “谢谢”), a quoted Chinese span that reads as something said — ending in a sentence-final particle (“知道了”) or with
+  “谢谢”), a count ("3个月", "15分钟", "1 小时": an Arabic number and units; 360安全卫士 and 115网盘 are names),
+  a quoted Chinese span that reads as something said — ending in a sentence-final particle (“知道了”) or with
   three or more function words besides 的 (“先去搜索再告诉我答案”; titles and brands with one or two, 平凡的世界,
   饿了么, 有赞科技有限公司, are names) — or one of more than 16 Han characters. A name someone gives (`entities`,
   `alias`, `rename`) skips these rules and needs only a letter ("3M", "C++"). A one-word name is not linked; probing it

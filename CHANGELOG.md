@@ -1,5 +1,101 @@
 # Changelog
 
+## 0.16.2 — 2026-10-17
+
+What 0.16.1 showed on the same Chinese store (issue #4: 49 entities → 44 on the rebuild, both holes closed, no
+tombstone broken — and 22 new provisional names, every one a span in quotes that 0.16.0 could not read, plus one
+operation phrase that two facts quoting it made established). The extraction rules are now 4 (`_ENTITY_RULES`), so a
+store 0.16.1 indexed is rebuilt again on a writer's first open.
+
+### Fixed
+
+- **Two facts quoting a label made it an established name.** Chinese puts a button, a menu item, a step or a word in
+  passing in quotes as readily as a name (“自动添加任务并解析元数据”, 面板「变量」页), and 0.16.1 began to read the
+  quotes beside Han characters. A name whose letters have no case (Chinese, Japanese, Thai, Arabic...) that the facts
+  only ever put in plain quotes now stays provisional however many facts quote it. It takes a person naming it
+  (`entities=[...]`, `alias`, `rename`), or two linked facts of which one names it outside plain quotes: in title marks
+  《》〈〉, which hold titles, in "X aka Y", or in running text as mentions are found. "Outside" is read strictly
+  (`_outside_plain_quotes`): a quote of any length, a quote nested in one of its own kind («a «b» c»), a quote never
+  closed (to the end of its line), single and curly single quotes (not an apostrophe inside a word: don't, O'Brien)
+  and full-width quotes all count as quotes, since that only keeps a name provisional. The evidence comes from the
+  same readers as linking (`mentioned_entity_ids`, `_extract_entities`), so it never disagrees with what the fact is
+  linked to, and an alias with case counts as a word where it stands, compared as keys compare (Straße = STRASSE,
+  "新的HUAWEI手机"). A one-word Chinese name nobody declared is not found in running text (a quoted label such as 变量 would attach
+  itself to every fact that says the word), so for those the way to established is a person or a title mark. Names
+  with a letter with case keep the rule of 0.16.0 (two facts), mixed ones included ("华为mate60", "变量x"). `review`
+  gives such names the reason "found only in quotes".
+- **Chinese names that begin with a number were refused, and some counts passed.** The rule that a guessed name is
+  mostly letters counts a Han character as one letter, though it is a word: it refused 360安全卫士, 115网盘, 36氪,
+  1905电影网 and 2345好压, and let "3个月" and "2小时" through while "15分钟" was refused — the Chinese form of the
+  "14 days" of 0.16.1. A Chinese name that begins with an Arabic number is now judged by what follows it
+  (`text.zh_count`): one or more parts of a number, its multipliers 十 百 千 万 亿 and units, measure words or the
+  words that qualify a count make a count ("3个月", "15分钟", "2天后", "100多人", "5号楼", "1 小时", "３个月",
+  "2小时30分钟", "1万2千人", "3万年", "1000万"), anything else a name (101次求婚: 次 is a unit, 求婚 is not; 360百科). A count
+  someone gives (`entities`) is still accepted.
+
+### Added
+
+- **`delete_entity {entities: [...]}`** deletes several names in one call, one transaction and one rewrite of the
+  file (up to 100; the reporter's clean-up after the rebuild took 23 calls). The list is checked whole before
+  anything changes: a list of 1 to 100 non-empty strings, each naming at most one entity (`entity` given beside it
+  joins the list; a string alone is a list of one). Unknown names come back
+  under `not_found` and the others are still deleted; an alias of an entity the call already deleted comes back under
+  `covered`; when none is known, nothing changes. `delete_entity {entity}` answers as before, but refuses a name
+  that belongs to two entities (in a store an older version wrote), which it used to delete both of.
+
+### Not taken
+
+- **A verb as the sign of a phrase.** jieba's dictionary tags parts of speech (the bundled table keeps only the tags of
+  person names). Measured on the sets below with jieba 0.42.1's dict.txt, every rule built on them lost real names:
+  "a verb in the span" lost 27 % of the titles and brands that pass the gate to catch 66 % of the interface strings
+  that pass it; the best variant (two or more verbs in four or more words) 2.8 % (716 names, 让子弹飞 and 寻梦环游记
+  among them) for 14 %. By form alone a label and a title are one thing; the standing above is what tells them apart.
+- **Counts in Chinese numerals** ("三个月"): the same rule, tried on them, took 五月天 (a band), 三人行 and 半次元 for
+  counts. They pass the gate and stay provisional.
+- **An alias "X aka Y" gives without asking** (review 0.16.2, P2, as before 0.16.2): after two facts about Alice
+  Smith, "Alice Smith aka Bob Brown" makes Bob Brown her alias, and a later `entities=["Bob Brown"]` links to her.
+  Not new here; open work in HANDOFF.md.
+
+### Reviewed
+
+By Codex CLI (gpt-6.1-sol) on a throwaway copy, verdict "release after fixes". Confirmed and fixed, each with a test:
+the standing read every fact again for every name (1,000 names on two long facts took 11.6 s; now each fact's text
+is read once and what it names is kept, for the current facts, until an entity changes); `delete_entity {entities}` dropped non-strings, read a
+dict's keys and checked the limit after removing duplicates, so a malformed list still deleted; a long, nested or
+unclosed quote, or a full-width one, counted as a use outside quotes; the evidence used its own matching (an Arabic
+name with a prefix was missed, Han elsewhere in a fact switched an Arabic name to substring matching); counts of
+several parts and with 万 / 亿 passed ("2小时30分钟" was refused in 0.16.1); a name that is one entity's name and
+another's alias deleted both; the measurement mixed the shipped `zh_count` with an experimental one. The numbers
+below are the shipped code's.
+
+A second round, Codex CLI (gpt-6.1-sol) and Antigravity CLI on throwaway copies of the fixed tree: a quote nested in
+its own kind closed at the inner mark, and a single quote never closed was not blanked; an alias with case outside
+quotes was not seen (Straße / STRASSE); the refusal of a batch with a name of two entities advised the single call,
+which deleted both — it refuses too now; `_without_code` looked at every later line from every ~~~ fence (80,000
+lines of "~~~" took 23 s; older than 0.16.2, now linear); the caches kept the text of facts forgotten since (one
+process-wide, one per connection; now one per connection, of the current facts only); "1万2千人" was no count. Antigravity
+also found an apostrophe inside single quotes ('it's fine: …') and an edit of a fact in the same connection, which
+the cache keyed by fact and text now reads.
+
+### Measured
+
+Two sets, kept outside the repository: 26,308 Chinese labels of real names from Wikidata (films 5,057, games 4,632,
+companies 3,982, series 3,800, anime 2,691, websites 1,776, books 1,234, brands 959, universities 845, software 628,
+apps 270 and smaller classes; no people), and 6,584 Chinese interface strings from the zh-Hans translations of
+Grafana and Obsidian (short, without placeholders or sentence punctuation: what someone quotes in a chat about a
+tool).
+
+- The gate passes 25,299 of the names (25,243 in 0.16.1: 56 more names that begin with a number). The 1,009 it refuses
+  are names with "/", "#", brackets or other symbols that are no part of a name it guesses, and the 5 counts below
+  (644); titles that are sentences (188: 你是我的答案, 咱们结婚吧); titles of more than 16 Han characters (130); names
+  with emoji or symbols (38); quoted lower-case Latin (8: "true tears"); a greeting (1: 你好).
+- It passes 6,201 of the interface strings (94.2 %, as in 0.16.1): 5,630 without a letter with case, which the
+  standing above keeps provisional while the facts only quote them, and 571 with one, which keep the two-fact rule.
+- `text.zh_count` reads 5 of the names as counts (100号, 21克拉, 361度, 76天, 15分鐘) and all 176 counts in Arabic
+  digits it was tried on (22 forms, several with two parts or 万 / 亿, eight numbers).
+- A copy of the maintainer's store (58 facts, rules 3): no entity or link changed on the rebuild to rules 4, 5 of 11
+  provisional as before; the open with the rebuild 319 ms. 5,000 synthetic facts: 0.61 ms per fact.
+
 ## 0.16.1 — 2026-10-16
 
 What the 0.16.0 rebuild showed on a Chinese store (issue #4: 49 entities → 26, every removal junk, no declared name

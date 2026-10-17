@@ -73,8 +73,18 @@ Since 0.16.1 every rule reads text the same way in three places — `_extract_en
 separators `_mention_stretches` cuts at (but a dot inside a word or after an initial). A fix in one of them belongs
 in the others, and every fix is measured on names that must stay (Node.js, nested lists, 平凡的世界) before it ships:
 two fixes of the first 0.16.1 draft broke names that 0.16.0 found.
+Since 0.16.2 a rule for the gate is measured on real names before it ships, not on a list from memory: Chinese labels
+of films, series, games, books, companies, brands, apps and sites from Wikidata (26,308 in 0.16.2) against interface
+strings from the zh-Hans translations of Grafana and Obsidian (6,584). A rule that loses real names to catch labels
+goes to the standing instead (`_entity_rows`: a name whose letters have no case, only ever in plain quotes, stays provisional) —
+that is how the verb rule of 0.16.2 was dropped (2.8 % of the names lost in its best form).
 
 ## Open work
+
+- "X aka Y" gives an alias without asking (review 0.16.2, P2; older than 0.16.0): after facts about Alice Smith,
+  "Alice Smith aka Bob Brown" makes Bob Brown her alias, and a later `entities=["Bob Brown"]` then links the second
+  person's facts to her. A fix would keep an alias from text as an unconfirmed relation, or warn when a declared name
+  meets an aka alias, and let the agent split it again.
 
 - Unsegmented scripts use a substring scan of character n-grams; an FTS5 trigram index would scale further but needs
   a sync story for older versions writing the file (no triggers: they would fail on SQLite builds without trigram).

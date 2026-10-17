@@ -209,7 +209,9 @@ def test_aka_sides_pass_the_gate_without_the_quoted_rules(store, text, expected)
 # --- standing: established and provisional -----------------------------------------------------------------------
 
 @pytest.mark.parametrize("first,second,name", [
-    ("他在“华为”工作", "“华为”在深圳", "华为"),
+    # 0.16.2: a name without capitals in plain quotes stays provisional however many facts quote it; a title in
+    # title marks is used as a name (test_holographic_v0162)
+    ("他读了《平凡的世界》", "《平凡的世界》很长", "平凡的世界"),
     ('Code name "Phoenix"', '"Phoenix" ships in May', "Phoenix"),
     ("Счёт в «Сбер Бизнес»", "«Сбер Бизнес» закрыли", "Сбер Бизнес"),
 ])

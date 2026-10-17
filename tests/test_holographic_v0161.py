@@ -111,7 +111,7 @@ def test_a_store_indexed_under_the_0160_rules_is_rebuilt(tmp_path):
     s._write("UPDATE meta SET value = '2' WHERE key = 'entity_rules'")
     s.close()
     s = MemoryStore(str(path), hrr_dim=DIM)
-    assert s.entity_rules() == store_module._ENTITY_RULES == 3
+    assert s.entity_rules() == store_module._ENTITY_RULES >= 3
     assert sorted(r["name"] for r in s.list_entities()) == ["Docker Hub", "Phoenix"]
     s.close()
 
@@ -127,7 +127,7 @@ def test_a_model_name_and_its_alias_survive_the_rebuild_from_0160(tmp_path):
     s._write("UPDATE meta SET value = '2' WHERE key = 'entity_rules'")
     s.close()
     s = MemoryStore(str(path), hrr_dim=DIM)
-    assert s.entity_rules() == 3 and s.entity_ids("Huawei") == s.entity_ids("华为mate60") != []
+    assert s.entity_rules() == store_module._ENTITY_RULES and s.entity_ids("Huawei") == s.entity_ids("华为mate60") != []
     s.close()
 
 

@@ -1,5 +1,6 @@
 """SQLite-backed fact store with entity resolution and trust scoring (single-user Hermes memory plugin)."""
 
+import bisect
 import contextlib
 import itertools
 from collections import Counter
@@ -16,7 +17,7 @@ from .embeddings import text_hash
 from .history import HISTORY_SCHEMA, HistoryMixin, parse_day
 from .text import UNSEGMENTED, _script, analyze, is_greeting, is_identifier, name_keys, zh_phrase
 from .text import fold as text_fold
-from .text import STOPWORDS, is_chinese, ja_ko_phrase, zh_word_cuts
+from .text import STOPWORDS, is_chinese, ja_ko_phrase, zh_count, zh_word_cuts
 
 logger = logging.getLogger(__name__)
 
@@ -113,12 +114,14 @@ SCHEMA_VERSION = 2  # 1 = 0.1.x-0.3.x layout, 2 = + meta, entities.name_key, ent
 # The rules entities are guessed from a fact's text by (meta.entity_rules; none recorded = 1, before 0.16.0). A store
 # indexed under older rules is rebuilt on a writer's first open (rebuild_entity_index), up to the fact count below; a
 # larger one on request. Raise it with every change of _extract_entities / _name_shaped that drops what they took.
-_ENTITY_RULES = 3  # 2: 0.16.0; 3: 0.16.1 (script seams, line breaks, leading symbols, counts in quotes)
+_ENTITY_RULES = 4  # 2: 0.16.0; 3: 0.16.1 (script seams, line breaks, leading symbols, counts in quotes);
+# 4: 0.16.2 (Chinese names that begin with a number, Chinese counts)
 # Where an alias came from (entity_aliases.source, 0.16.0): 'user' (alias, rename, a merge someone asked for), 'aka'
 # ("X aka Y" in a fact's text: it goes with the last fact that says it) or 'legacy' (written before 0.16.0 or by an
 # older release since: kept like a given one, and dropped only when a forgotten fact said it as "X aka Y").
 _GIVEN_ALIAS = "COALESCE(source, 'legacy') != 'aka'"
 _AUTO_REBUILD_MAX_FACTS = 2000
+_DELETE_MAX = 100  # names in one delete_entity call
 _AUTO_REBUILD_MAX_CHARS = 500_000  # and in all; the work grows with the text, not the count (review 0.16.0)
 # 0.16.0: names delete_entity removed, as keyed hashes (see _name_digest). Created by a writer in _migrate().
 _ENTITY_SCHEMA = """
@@ -274,17 +277,88 @@ def _straight_quoted(text: str) -> list[str]:
     """Spans between straight double quotes on one line, as a regex with lookarounds would pair them: an opening quote
     not right after a digit or a letter with case, the next quote closing it unless a digit or such a letter follows
     (0.16.1: the old word-character lookarounds missed 用"Docker Hub"直连, and character ranges missed full-width letters)."""
+    return [text[i + 1:j - 1] for i, j in _straight_quote_spans(text)]
+
+
+def _straight_quote_spans(text: str) -> list[tuple[int, int]]:
+    """(start, end) of each span _straight_quoted finds, its quotes included."""
     quotes = [i for i, c in enumerate(text) if c == '"']
     out, k = [], 0
     while k < len(quotes) - 1:
         i, j = quotes[k], quotes[k + 1]
         if not _hugs(text, i - 1) and i + 1 < j <= i + 1 + _QUOTED_MAX_CHARS and "\n" not in text[i + 1:j] \
                 and not _hugs(text, j + 1):
-            out.append(text[i + 1:j])
+            out.append((i, j + 1))
             k += 2
         else:
             k += 1
     return out
+
+
+# Quotes that hold what someone said, a label or a word in passing as often as a name — the title marks 《》〈〉 hold
+# titles and are not among them (0.16.2). An opening mark and its closing ones.
+_PLAIN_QUOTE_PAIRS = {"«": "»", "“": "”", "„": "“”", "「": "」", "『": "』", '"': '"', "'": "'", "‘": "’"}
+_APOSTROPHES = "'’"  # quotes, and apostrophes inside a word: don't, O'Brien, don’t
+_RE_LINE_BREAK = re.compile("[\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
+
+
+def _word_char(c: str) -> bool:
+    return c.isalnum() or c == "_"
+
+
+def _cased_word_in(text: str, word: str) -> bool:
+    """Whether *word* (letters with case) stands in *text* as a word: no digit or letter with case right beside it, so
+    a word glued to Chinese counts ("新的huawei手机": the seam of _script_pieces), "huaweis" does not."""
+    def joins(c: str) -> bool:
+        return c.isdigit() or c == "_" or (c.isalpha() and c.lower() != c.upper())
+    i = text.find(word) if word else -1
+    while i >= 0:
+        j = i + len(word)
+        if not (i > 0 and joins(text[i - 1])) and not (j < len(text) and joins(text[j])):
+            return True
+        i = text.find(word, i + 1)
+    return False
+
+
+def _uncased(name: str) -> bool:
+    """A name with letters and none of them with case: Chinese, Japanese, Thai, Arabic... (0.16.2). Text finds such a
+    name only in quotes (or in "X aka Y"): it has no capitals to stand out by. One Latin letter gives it case ("变量x"):
+    such a name keeps the two-fact rule of the names with capitals."""
+    letters = [c for c in name if c.isalpha()]
+    return bool(letters) and all(c.lower() == c.upper() for c in letters)
+
+
+def _outside_plain_quotes(text: str) -> str:
+    """*text* with code and everything in plain quotes blanked (line breaks, so no name runs across), read in NFKC as
+    mentions are ("＂" is a quote too); the title marks stay (0.16.2). Stricter than the extractor on purpose — a quote
+    of any length, quotes nested in one of their own kind («a «b» c»), a quote never closed (to the end of its line),
+    single quotes (but not an apostrophe inside a word: don't, O'Brien) — since what is blanked here only keeps a name
+    provisional. Each character is looked at once or twice. Not cached: the store keeps what it needs per fact
+    (_used_outside_quotes), and a process-wide cache would keep forgotten text in memory (review 0.16.2)."""
+    text = unicodedata.normalize("NFKC", _without_code(unicodedata.normalize("NFC", text or "")))
+    chars, i, n = list(text), 0, len(text)
+    ends = [m.start() for m in _RE_LINE_BREAK.finditer(text)] + [n]  # any line break (str.splitlines)
+    while i < n:
+        opener = text[i]
+        closers = _PLAIN_QUOTE_PAIRS.get(opener)
+        if closers is None or (opener in _APOSTROPHES and i > 0 and _word_char(text[i - 1])):
+            i += 1
+            continue
+        eol = ends[bisect.bisect_right(ends, i)]  # the end of its line
+        depth, close, k = 1, eol - 1, i + 1
+        while k < eol:
+            c = text[k]
+            if c in closers and not (c in _APOSTROPHES and k + 1 < n and _word_char(text[k + 1])):
+                depth -= 1
+                if depth == 0:
+                    close = k
+                    break
+            elif c == opener and opener not in closers:
+                depth += 1
+            k += 1
+        chars[i:close + 1] = "\n" * (close + 1 - i)
+        i = close + 1
+    return "".join(chars)
 
 
 _RE_FENCE = re.compile(r"[ ]{0,3}(`{3,}|~{3,})")
@@ -303,12 +377,14 @@ def _without_code(text: str) -> str:
     chars = list(text)
     lines = text.splitlines(keepends=True)
     fences = [_RE_FENCE.match(line) for line in lines]
+    # the last line that is a ~~~ fence: one opens a block only if another comes after it (review 0.16.2: looking
+    # at every later line from every fence took 23 s on 80,000 lines of "~~~")
+    last_tilde = max((n for n, f in enumerate(fences) if f is not None and f.group(1)[0] == "~"), default=-1)
     pos, fence = 0, None
     for n, (line, m) in enumerate(zip(lines, fences)):
         if m is not None and fence is None:
             mark = m.group(1)[0]
-            opens = "`" not in line[m.end():] if mark == "`" else any(
-                f is not None and f.group(1)[0] == "~" for f in fences[n + 1:])
+            opens = "`" not in line[m.end():] if mark == "`" else last_tilde > n
             if opens:
                 fence = mark * 3
                 chars[pos:pos + len(line)] = "\0" * len(line)
@@ -500,6 +576,11 @@ def _valid_entity(name: str, *, given: bool = False) -> bool:
     visible = [c for c in name if not c.isspace()]
     if given:  # someone named it: "3M", "O2", "C++" are names; a letter is enough
         return any(c.isalpha() for c in visible)
+    if name[0].isdigit() and is_chinese(name):
+        # 0.16.2 (issue #4): a Han character is a word, so the share of letters below dropped half the Chinese names
+        # that begin with a number (360安全卫士, 115网盘, 36氪) and kept some counts ("3个月" yes, "15分钟" no). A
+        # number and units is a count (text.zh_count); anything else after the number makes a name.
+        return not zh_count(name) and any(c.isalpha() for c in visible)
     # vowel signs and other marks count with their letters (review 0.16.1: "श्री" fell under the bar)
     return sum(c.isalpha() or unicodedata.category(c)[0] == "M" for c in visible) >= 0.6 * len(visible)
 
@@ -1192,7 +1273,12 @@ class MemoryStore(HistoryMixin):
         """Every entity with its aliases, number of facts and standing, most linked first (0.16.0). Established: someone
         named it (declared with entities=[...], renamed, or given an alias with the alias action), or two or more
         current facts are linked to it; provisional: a name the extraction rules guessed from one fact, nobody
-        confirmed and no other fact named. A standing, not a verdict: it drops back when the second fact goes."""
+        confirmed and no other fact named. A standing, not a verdict: it drops back when the second fact goes.
+        A name without capitals (Chinese, Japanese, Thai...) that the facts only ever put in quotes stays provisional
+        however many facts quote it (0.16.2, issue #4): Chinese quotes a button, a menu item or a step as readily as a
+        name, and two facts quoting "自动添加任务并解析元数据" made it established. Then it takes a person naming it, or
+        two linked facts of which one names it outside plain quotes — in title marks 《》, in "X aka Y", or in
+        running text as mentions are found (_used_outside_quotes)."""
         given = _GIVEN_ALIAS if self._alias_sources() else "1"
         rows = self.read("SELECT e.entity_id, e.name, e.entity_type, e.created_at, COUNT(fe.fact_id) AS facts FROM entities e "
                          "LEFT JOIN fact_entities fe ON fe.entity_id = e.entity_id GROUP BY e.entity_id "
@@ -1203,14 +1289,65 @@ class MemoryStore(HistoryMixin):
             aliases.setdefault(r["entity_id"], []).append(r["alias"])
             if r["given"]:
                 named.add(r["entity_id"])
+        outside = self._used_outside_quotes({
+            r["entity_id"]: aliases.get(r["entity_id"], []) for r in rows
+            if r["facts"] >= 2 and r["entity_id"] not in named and r["entity_type"] != "declared" and _uncased(r["name"])})
         out = []
         for r in rows:
             declared = r["entity_type"] == "declared"
+            established = declared or r["entity_id"] in named or (
+                r["facts"] >= 2 and (not _uncased(r["name"]) or r["entity_id"] in outside))
             out.append({"entity_id": r["entity_id"], "name": r["name"], "facts": r["facts"], "declared": declared,
                         "aliases": aliases.get(r["entity_id"], []),
-                        "status": "established" if declared or r["entity_id"] in named or r["facts"] >= 2 else "provisional",
+                        "status": "established" if established else "provisional",
                         "_since": r["created_at"] or ""})
         return out
+
+    def _used_outside_quotes(self, candidates: dict) -> set[int]:
+        """Of *candidates* ({entity_id: its aliases}), those a linked current fact names outside plain quotes (see
+        _entity_rows): on the fact's text with plain quotes blanked (_outside_plain_quotes), what the linking readers
+        find — mentioned_entity_ids, and the names _extract_entities finds (title marks, "X aka Y") resolved by
+        entity_ids — or an alias with case written there as a word, compared as entity keys compare (Straße =
+        STRASSE: a one-word alias is not looked up in running text, review 0.16.2). Each fact's text is read once
+        and kept, with what it names, for the current facts only and until an entity changes (review 0.16.2: 1,000
+        names on two long facts took 11 s; a forgotten fact's text must not stay in memory)."""
+        if not candidates:
+            return set()
+        with self._lock:
+            version = (self._entry.get("generation", 0), self._one("PRAGMA data_version")[0])
+            cached = self._entry.get("outside")
+            previous = cached[1] if cached is not None and cached[0] == version else {}
+            current: dict[int, tuple] = {}
+            links: dict[int, list[int]] = {}
+            ordered = sorted(candidates)
+            for k in range(0, len(ordered), _MAX_COUNTED_IDS):
+                chunk = ordered[k:k + _MAX_COUNTED_IDS]
+                for row in self._conn.execute(
+                        f"SELECT entity_id, fact_id FROM fact_entities WHERE entity_id IN ({','.join('?' * len(chunk))})",
+                        chunk):
+                    links.setdefault(row["fact_id"], []).append(row["entity_id"])
+            fact_ids = sorted(links)
+            for k in range(0, len(fact_ids), _MAX_COUNTED_IDS):
+                chunk = fact_ids[k:k + _MAX_COUNTED_IDS]
+                for row in self._conn.execute(
+                        f"SELECT fact_id, content FROM facts WHERE fact_id IN ({','.join('?' * len(chunk))})", chunk):
+                    content = row["content"] or ""
+                    seen = previous.get(row["fact_id"])
+                    if seen is None or seen[0] != content:
+                        bare = _outside_plain_quotes(content)
+                        ids = set(self.mentioned_entity_ids(bare))
+                        for name in self._extract_entities(bare):
+                            ids.update(self.entity_ids(name))
+                        seen = (content, bare.casefold(), frozenset(ids))
+                    current[row["fact_id"]] = seen
+            self._entry["outside"] = (version, current)
+            found: set[int] = set()
+            for fact_id, (_, bare, ids) in current.items():
+                for entity_id in links[fact_id]:
+                    if entity_id in ids or any(not _uncased(a) and _cased_word_in(
+                            bare, unicodedata.normalize("NFKC", a).casefold()) for a in candidates[entity_id]):
+                        found.add(entity_id)
+            return found
 
     def list_entities(self, limit: int = 50, status: str | None = None) -> list[dict]:
         """Entities with their aliases, number of facts and standing (see _entity_rows), most linked first. *status*
@@ -1225,7 +1362,7 @@ class MemoryStore(HistoryMixin):
         return [{k: v for k, v in r.items() if k != "_since"} for r in rows[:limit]]
 
     def entity_counts(self) -> dict:
-        """{"entities": all, "provisional": names guessed from one fact that nobody confirmed}."""
+        """{"entities": all, "provisional": guessed names nobody confirmed (see _entity_rows)}."""
         rows = self._entity_rows()
         return {"entities": len(rows), "provisional": sum(r["status"] == "provisional" for r in rows)}
 
@@ -1236,7 +1373,10 @@ class MemoryStore(HistoryMixin):
         rows = sorted((r for r in self._entity_rows() if r["status"] == "provisional" and r["entity_id"] in old),
                       key=lambda r: (r["_since"], r["entity_id"]))
         return [{"entity_id": r["entity_id"], "entity": r["name"], "facts": r["facts"],
-                 "reason": f"a name guessed from one fact; nobody declared it or named it again in {days}+ days"}
+                 "reason": (f"a name guessed from one fact; nobody declared it or named it again in {days}+ days"
+                            if r["facts"] < 2 else
+                            f"found only in quotes, in {r['facts']} facts; nobody declared it or used it as a name in "
+                            f"{days}+ days")}
                 for r in rows[:limit]]
 
     def _extract_entities(self, text: str) -> list[str]:
@@ -1532,12 +1672,57 @@ class MemoryStore(HistoryMixin):
         result["scrub"] = "done" if self.scrub() else "pending"
         return result
 
+    def delete_entities(self, names) -> dict:
+        """delete_entity for several names in one transaction and one rewrite of the file (0.16.2, issue #4: cleaning
+        up 23 provisional names took 23 calls). *names*: a list of 1 to _DELETE_MAX non-empty strings, checked whole
+        before anything changes (review 0.16.2: a list with a number in it, or a dict, deleted the names it held).
+        Each name must name one entity: one that names two (a name of one and an alias of another, in a store an older
+        version wrote) refuses the call, as an unknown name alone does not. Answer: "deleted" (as delete_entity),
+        "covered" (names of an entity this call deleted already: an alias given after its name), "not_found"; KeyError
+        when none is known, ValueError for input that is no such list or for a name of two entities."""
+        if not isinstance(names, (list, tuple)) or not names:
+            raise ValueError("entities must be a list of names")
+        if len(names) > _DELETE_MAX:
+            raise ValueError(f"at most {_DELETE_MAX} names at once, {len(names)} were given")
+        if not all(isinstance(n, str) and n.strip() for n in names):
+            raise ValueError("every name in entities must be a non-empty string")
+        wanted = list(dict.fromkeys(n.strip() for n in names))
+        self._require_writer()
+        deleted, covered, missing = [], [], []
+        with self._tx():
+            plan, ambiguous = [], []
+            for name in wanted:
+                ids = self.entity_ids(name)
+                if not ids:
+                    missing.append(name)
+                elif len(ids) > 1:
+                    ambiguous.append(name)
+                else:
+                    plan.append((name, ids[0]))
+            if ambiguous:
+                raise ValueError("these names belong to more than one entity: " + ", ".join(f"'{n}'" for n in ambiguous)
+                                 + "; fact_store entities shows them — delete each by a name or alias only it has")
+            if not plan:
+                raise KeyError("no entity is named " + ", ".join(f"'{n}'" for n in missing))
+            done: set[int] = set()
+            for name, entity_id in plan:
+                if entity_id in done:
+                    covered.append(name)
+                    continue
+                deleted.append(self._delete_entity(name))
+                done.add(entity_id)
+        return {"deleted": deleted, "covered": covered, "not_found": missing,
+                "scrub": "done" if self.scrub() else "pending"}
+
     def _delete_entity(self, name: str) -> dict:
         self._require_writer()
         with self._tx():
             ids = self.entity_ids(name or "")
             if not ids:
                 raise KeyError(f"no entity is named '{(name or '').strip()}'")
+            if len(ids) > 1:  # one entity's name and another's alias, in a store an older version wrote (review 0.16.2)
+                raise ValueError(f"'{name.strip()}' belongs to more than one entity; fact_store entities shows them — "
+                                 "delete each by a name or alias only it has")
             names: list[str] = []
             facts: set[int] = set()
             aliases = 0

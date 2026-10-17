@@ -1796,6 +1796,56 @@ def zh_phrase(span: str) -> bool:
 
 
 
+# A count in Chinese (0.16.2, issue #4): a number in Arabic digits followed only by units and measure words and the
+# words that qualify a count — "3个月", "15分钟", "2天后", "100多人", "5号楼", "1 小时" — is no name, as "14 days" is none.
+# Anything else that begins with a number is one: 360安全卫士, 115网盘, 36氪, 1905电影网, 101次求婚 (次 is a unit, 求婚
+# is not). Measured on 26,308 Chinese labels of films, series, games, books, companies, brands, apps and sites in
+# Wikidata: 5 of them read as a count (100号, 21克拉, 361度, 76天, 15分鐘), and every one of 176 counts did. Arabic
+# digits only: with Chinese numerals the same rule took 五月天 (a band), 三人行 and 半次元 for counts.
+ZH_UNITS = frozenset("""
+    个 元 块 角 分 次 岁 克 度 米 斤 两 吨 升 秒 年 月 日 号 天 周 点 页 本 张 条 位 名 人 只 件 台 辆 层 楼 期 届 集 章 节 部
+    首 场 遍 倍 成 折 帧 行 列 字 篇 份 套 组 项 款 种 家 间 座 户 头 匹 根 片 瓶 杯 碗 盒 包 箱 袋 分钟 小时 公里 千米 厘米 毫米
+    公斤 千克 毫升 公升 星期 礼拜 个月 周年 克拉 英寸 英尺 英里 美元 港元 欧元 日元 块钱 毛钱 平米 平方米 毫秒 微秒 年代 世纪
+    季度 天后 年前""".split())
+ZH_COUNT_WORDS = frozenset("前 后 以上 以下 左右 内 之内 以内 以后 以前 多 余 来 半 整 左 右 后的 前的 里 间 中 起".split())
+_ZH_COUNT_PIECES = sorted(ZH_UNITS | ZH_COUNT_WORDS, key=len, reverse=True)  # the longest first: 分钟 before 分
+_LEADING_NUMBER = re.compile(r"[0-9]+(?:[.,:/][0-9]+)*")
+_ZH_MULTIPLIERS = frozenset("十百千万亿")
+
+
+def zh_count(span: str) -> bool:
+    """A Chinese span that is a count, not a name (see ZH_UNITS): one or more parts of a number in Arabic digits, the
+    multipliers 十 百 千 万 亿 after it ("3万年", "1亿人"), then units and the words that qualify a count, each part
+    with a unit ("2小时30分钟", review 0.16.2) unless a multiplier joins it to the next ("1万2千人"), or the number alone
+    ("1000万"). Read in NFKC ("３个月") and folded (15分鐘), spaces left out ("1 小时")."""
+    span = unicodedata.normalize("NFKC", span or "")
+    if not is_chinese(span):
+        return False
+    s = fold("".join(span.split()))
+    i = 0
+    while i < len(s):
+        m = _LEADING_NUMBER.match(s, i)
+        if m is None:
+            return False
+        i = start = m.end()
+        while i < len(s) and s[i] in _ZH_MULTIPLIERS:
+            i += 1
+        if i == len(s) and i > start:  # a number alone: "1000万", "3亿"
+            return True
+        if i > start and s[i].isdigit():  # the number goes on: "1万2千人" (review 0.16.2)
+            continue
+        unit = False
+        while i < len(s) and not s[i].isdigit():
+            piece = next((p for p in _ZH_COUNT_PIECES if s.startswith(p, i)), None)
+            if piece is None:
+                return False
+            unit = unit or piece in ZH_UNITS
+            i += len(piece)
+        if not unit:
+            return False
+    return True
+
+
 
 # How a Japanese or Korean sentence ends (0.16.1): polite and plain predicates, several kana or syllables long, so a
 # name that ends in one of their letters (ゆか, あやね, 캐나다, 혼다) is not taken for a sentence.
