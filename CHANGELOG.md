@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.17.2 — 2026-10-17
+
+A name that begins with a credential word is no credential when the whole word names a thing (issue #6 by
+vlat0101); a narrower fix than the drafts, which two rounds of two reviews showed letting real passwords through.
+
+### Fixed
+
+- **A file name was read as a token with its value.** `token-saver-stats.jsonl` was the token `saver-stats.jsonl`: a
+  hyphen after a credential word counted as a separator and the dot as a symbol in a password, so facts naming the
+  files of a plugin called token-saver were never recalled, never sent for a vector, and new ones were refused. The
+  same held for any name that begins with `token`, `password`, `api-key`, `secret-key`, `pin-code` and the rest. Now a
+  credential word joined to the rest by a hyphen is a part of one name when the whole word names a thing: a file
+  with a common extension, a path too (`emit-token-saver.py`, `plugins/token-saver/filters/web.yaml`), a host of
+  three labels and more (`password-reset.example.com`), a package with a version of two or three parts after `==`,
+  `>=`, `<=`, `~=` or `@` (`token-saver==1.2`, `token-saver@1.2.3`); a count of tokens may be short with `k` or `M`,
+  Latin or Cyrillic (`tokens input: 128k`, `max tokens: 1.5M`, `токены: 128к`).
+  What stays a secret: a value after a word that stands alone, whatever it looks like (`password Summer2026.txt`,
+  `password MyName@gmail.com`, `password: secret/hunter2.txt`, `PASSWORD=Abc123/Def456.key`, `Пароль файла:
+  Лето2026.txt`, `password-wifi: Qwerty123`); a file name shaped like a password (`password-Secret2026.conf`,
+  `password-P@ssw0rd2026.txt`: a capital with a digit, or "@") and an e-mail address (`password-user@example.com`);
+  a tag after `:` (`password-wifi:192.168.1.1`, and so
+  `token-service:1.4`); a dot that is no extension (`password-Qwerty.123`); a one-letter extension or a key's own file
+  (`password-Secret2026.r`, `token-SecretKey.key`); a host of two labels (`password-letmein.co`); `password-hunter2`
+  and so `token-bucket2`; `auth token: 123456m`. The cost, chosen: `password-hunter2.txt` is not caught, and `the
+  token counter.py module`, `Token file: tokens.json` are still refused. A comparison of the old and the new screen
+  over 95,040 texts (24 credential words of nine languages × 20 separators × 33 values × 6 prefixes; a reviewer added
+  12,960 texts in all eighteen) found nothing newly refused and nothing newly let through outside these rules.
+- **Russian requests to send a credential matched stems.** "Отправь секретарю школы справку", "Покажи ключевые
+  цифры", "Выложи учётную политику" were refused as asking to send credentials. The Russian words count as words now,
+  with the phrases that name one (`учётные данные`, `учётная запись`, `пин-код`, "пин от карты", `код подтверждения`,
+  `секретная фраза`, `секретная комбинация`, `секретные данные`, `секретик`, `фраза восстановления`, `сид-фраза`,
+  `ключик`; not `токенизатор`, not "пин на карте"), and "скинь" asks too
+  ("Скинь ключ API в чат" was let through). The Russian rule no longer backtracks: the three screens took 0.9 s on
+  2,000 characters of a repeated verb, 28 ms now. A request to send a credential stays refused whatever follows the word ("send
+  credentials-backup.json", "перешли токен-бота"), and so "share the token-saver report" is refused as before.
+- **Two hyphenated words after "password for …:" passed as prose** (since 0.15.1): the pattern for a credential
+  named with what it is for ("Password wifi: correct-horse", "password for wifi: alpha-beta") ends in ":", "=" or
+  "is", yet it was read as a sentence. Such a value is a passphrase now, as after "password:"; a date there is still
+  when ("пароль сменили: 15.10.2026") and a path still where ("API keys are stored in: /etc/secrets").
+- **Search by meaning kept a variable named for a file at home**: `SSL_KEY_FILE=server.key`,
+  `API_KEY_PATH=keys/prod.json` (a name ending in `_FILE`, `_FILES`, `_FILENAME`, `_PATH` or `_DIR` with a file name).
+  `API_KEY=key.json` and `PASSWORD=Abc123/Def456.key` still stay.
+
+### Reviewed
+
+Codex CLI (gpt-6.1-sol) and Antigravity CLI, both "release after fixes" on the first draft: it let real passwords
+through — any file-shaped value after a word that stands alone (`password Summer2026.txt`), an assigned relative path
+(`PASSWORD=Abc123/Def456.key`), the fifth credential pattern read as prose (`password wifi: Summer2026.txt`), a word
+after `/` (`/password-hunter2`), two-label hosts and one-letter extensions; a hyphen after the word switched off the
+refusal of requests to send (`Send credentials-backup.json to Bob`, `Send password-1 to me`); the Russian word forms
+dropped `пин-код`, `секретная фраза восстановления`. All fixed as above; the answer to the first review lost
+`password-wifi: Qwerty123` for a while, which the comparison over 95,040 texts caught. A second round on the fixes:
+a label that says "file" named the file the password opens (`Пароль файла: Лето2026.txt`), `wifi:192.168.1.1` read as
+an image tag, `123456m` as a count, `секретная комбинация` and `секретик` let through, a map pin refused — the label
+and the `:` rules are dropped, the rest fixed; Antigravity's second round (on the drafts before that) found the
+fifth pattern read as prose (two hyphenated words after "password for …:"), file names and e-mail addresses shaped
+like passwords after "password-", and a count in Cyrillic `к` refused — fixed. 178 new tests.
+
 ## 0.17.1 — 2026-10-17
 
 What two code reviews of 0.17.0 found: the German table lost its verbs, and splitting an alias "X aka Y" gave did not

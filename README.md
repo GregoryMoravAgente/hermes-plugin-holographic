@@ -94,7 +94,21 @@ In `config.yaml` under `plugins.hermes-memory-store`:
   to Chinese text (0.15.1); an environment variable that holds a key, a token or a password, by its name — any in
   capitals ending like `…_KEY` or `…_TOKEN` and 310 popular ones of model and service providers — and an address
   with a password in it (0.15.2) —, an image (markdown or
-  HTML), invisible characters, long blobs, >1000 characters) is refused with the reason. Recall
+  HTML), invisible characters, long blobs, >1000 characters) is refused with the reason. A name that begins with a
+  credential word joined to the rest by a hyphen is no credential when the whole word names a thing (0.17.2, issue
+  #6): a file with a common extension (`token-saver-stats.jsonl`, `plugins/token-saver/filters/web.yaml`), a host of
+  three labels and more (`password-reset.example.com`), a package with a version after `==` or `@`
+  (`token-saver==1.2`, `token-saver@1.2.3`); a file name shaped like a password is none (`password-Secret2026.conf`,
+  `password-P@ssw0rd.txt`: a capital with a digit, or "@"), nor is an e-mail address. A credential word that stands alone is followed by its value,
+  whatever it looks like: `password Summer2026.txt`, `password: secret/hunter2.txt`, `Пароль файла: Лето2026.txt`,
+  `password-wifi: Qwerty123`, `Password wifi: correct-horse`, and `the token counter.py module` and `Token file:
+  tokens.json` too; so is a dot that is
+  no extension (`password-Qwerty.123`), a one-letter or a key file's extension (`token-Secret.key`), a two-label host
+  (`password-letmein.co`), a tag after `:` (`password-wifi:192.168.1.1`, and so `token-service:1.4`). The cost,
+  chosen: `password-hunter2.txt` is not caught. A request to send a credential stays refused whatever follows the word ("send credentials-backup.json",
+  and so "share the token-saver report" too); a Russian credential word counts as a word, not as the start of one
+  (`секретарю`, `ключевые цифры`, `учётная политика`, `токенизатор`, "пин на карте" are none; `пин-код`, "пин от
+  карты", `секретная фраза`, `фраза восстановления` are). Recall
   checks a stored fact again before it goes into a prompt (0.13.0): one an older release, or another program, wrote
   past today's rules (markup, instructions, credentials, invisible characters, images) is left out of recall
   and logged once; `search`, `list` and `history` still show it, so it can be changed or forgotten. A quoted
@@ -739,7 +753,8 @@ that key to (a key with a space or a line break inside is refused, and errors ar
 the request in them).
 Not sent: a fact recall would not inject (instruction-like text, markup, an image — the same check recall makes), and
 a fact or a message that looks like it holds a secret — a credential word with its value, an environment assignment
-such as `OPENAI_API_KEY=…`, an Authorization header, the prefixes of common API keys and tokens (`sk-`, `ghp_`,
+such as `OPENAI_API_KEY=…` (not a variable named for a file that holds a file name: `SSL_KEY_FILE=server.key`,
+`API_KEY_PATH=keys/prod.json`; 0.17.2), an Authorization header, the prefixes of common API keys and tokens (`sk-`, `ghp_`,
 `AKIA`, `ASIA`, `AIza`, `xox…-`, `glpat-`), a Telegram bot token, a JWT, a PEM private key, a long encoded blob; of a message, only the first 2,000
 characters are checked — and sent. That check is by pattern, so best effort: a secret in a shape
 it does not know goes out with the message. `forget` deletes the vector, but the provider has seen the text: what it

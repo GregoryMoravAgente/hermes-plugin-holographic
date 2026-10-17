@@ -85,6 +85,14 @@ that is how the verb rule of 0.16.2 was dropped (2.8 % of the names lost in its 
 
 ## Open work
 
+- Credential screen (0.17.2, issue #6): a name counts only when the credential word is glued to it by a hyphen and the
+  whole word names a thing; a word that stands alone keeps its value whatever it looks like. Known false positives
+  left on purpose (each fix loosens a security screen; review first): "the token counter.py module" (a file after a
+  standalone word), "share the token-saver report" (any send request with a credential word), "перешли ключ от
+  дачи" (a physical key; the dream skips it on its side), "Share grandma's secret pie recipe" (`secret` as an
+  adjective), "fix/token-refresh-2". The dream (hermes-dreaming, skills/dreaming/scripts/holo_screen.py) carries a
+  verbatim copy of the screen: after any change here run its tools/vendor_screen.py, or its test and smoke go red.
+
 - "X aka Y" (0.17.0): a declared name never resolves through an alias a text gave (split), alias / rename /
   delete_entity by one are refused, `split` separates any alias. Left open on purpose: a text that says Y still links
   to X (recall through the hint until someone splits); a known multi-word name a text mentions links a namesake's fact
