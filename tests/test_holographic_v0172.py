@@ -157,3 +157,18 @@ def test_a_long_message_is_screened_quickly():
     start = time.perf_counter()
     _RE_EXFILTRATION.search(text)
     assert time.perf_counter() - start < 0.1
+
+
+
+def test_the_screen_compiles_without_possessive_quantifiers():
+    """The dream (hermes-dreaming) runs a verbatim copy of this screen on Python 3.9 and up; "*+", "++", "?+", "}+" need
+    3.11 (0.17.3: the copy of 0.17.2 failed to load there)."""
+    import re as _re
+
+    import hermes_plugin_holographic as H
+    for name, value in vars(H).items():
+        patterns = value if isinstance(value, tuple) else (value,)
+        for rx in patterns:
+            if isinstance(rx, _re.Pattern):
+                bare = _re.sub(r"\[[^\]]*\]", "x", _re.sub(r"\\.", "x", rx.pattern))  # an escape, a class: one atom
+                assert not any(q in bare for q in ("*+", "++", "?+", "}+")), name

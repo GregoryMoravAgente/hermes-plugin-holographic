@@ -92,6 +92,8 @@ that is how the verb rule of 0.16.2 was dropped (2.8 % of the names lost in its 
   дачи" (a physical key; the dream skips it on its side), "Share grandma's secret pie recipe" (`secret` as an
   adjective), "fix/token-refresh-2". The dream (hermes-dreaming, skills/dreaming/scripts/holo_screen.py) carries a
   verbatim copy of the screen: after any change here run its tools/vendor_screen.py, or its test and smoke go red.
+  That copy runs on Python 3.9 and up: no possessive quantifiers or other 3.11 regex syntax in the screen (0.17.2
+  used `\w*+` and the dream's copy failed to load there; 0.17.3, a test checks it).
 
 - "X aka Y" (0.17.0): a declared name never resolves through an alias a text gave (split), alias / rename /
   delete_entity by one are refused, `split` separates any alias. Left open on purpose: a text that says Y still links

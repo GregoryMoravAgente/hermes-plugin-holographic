@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.17.3 — 2026-10-17
+
+The screen of 0.17.2 without possessive quantifiers (`\w*+`): they need Python 3.11, which the plugin requires, but
+the dream (hermes-dreaming) runs a verbatim copy of this screen on Python 3.9 and up, and its copy of 0.17.2 failed to
+load there. The Russian verb rule takes the whole verb another way (`\w*(?!\w)`); what the screen matches is
+unchanged (the tests of 0.17.2, and the comparison over 95,040 texts, give the same results), and so is its speed
+(28 ms on the worst 2,000 characters).
+
 ## 0.17.2 — 2026-10-17
 
 A name that begins with a credential word is no credential when the whole word names a thing (issue #6 by
