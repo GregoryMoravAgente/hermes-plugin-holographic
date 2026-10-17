@@ -14,11 +14,13 @@ users who have `memory.provider: holographic` keep their facts. See [CHANGELOG.m
 ## How it works
 
 ![Architecture: before each turn Hermes core sends the message through the relevance gate and search; writes pass a
-validator and land in one SQLite transaction; recall tools read the same file](diagram/architecture.svg)
+validator that refuses instructions and credentials and land in one SQLite transaction with the fact's history; recall
+and history tools read the same file; search by meaning is an optional online add-on](diagram/architecture.svg)
 
-![Recall before a turn: greetings recall nothing; the message's words become keys; candidates come from FTS5, character
-n-grams or a word scan; a relevance gate and a repeat window decide; up to five facts plus entity facts go into the
-turn as data](diagram/recall.svg)
+![Recall before a turn: greetings recall nothing; the message's words become keys; 15 candidates come from FTS5,
+character n-grams or a word scan, reordered by meaning if that is on; a relevance gate, a repeat window and the screen
+decide; up to five facts by their words, one by meaning alone and two of named entities go into the turn as
+data](diagram/recall.svg)
 
 ## Install
 
@@ -255,8 +257,9 @@ tombstone's id. Use hermes-dreaming 2.4.0 or later with this release: cron jobs 
 
 ## Languages
 
-![How a word is matched across languages: words, language, function words, keys, match, with examples that match and
-examples that do not](diagram/languages.svg)
+![How a word is matched across languages: words, language, function words, keys, match; examples in eighteen languages
+that match (German compounds, Russian and English spellings of one word, Traditional and Simplified Chinese, Japanese
+spelling variants) and examples that do not](diagram/languages.svg)
 
 A word matches another when they share its plain form or its stem in the language of the text:
 
@@ -631,7 +634,7 @@ negation counts for the whole clause up to a "but" ("likes cats but not dogs" is
 single word. `auto_extract` recognises English, Russian and Chinese phrasing. The refusal of instruction-like text, of a
 credential with its value and of a request to send one covers all eighteen languages (0.15.1; English and Russian
 before). The
-main sets of all fourteen languages run in CI (`tests/test_holographic_languages.py`).
+main sets of all eighteen languages run in CI (`tests/test_holographic_languages.py`).
 
 ## Search by meaning (optional, online)
 
