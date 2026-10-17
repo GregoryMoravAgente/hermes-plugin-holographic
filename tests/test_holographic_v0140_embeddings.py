@@ -168,6 +168,8 @@ def test_a_paraphrase_is_recalled_before_the_turn_marked_and_alone(tmp_path, end
     assert _by_meaning(block) == [line for line in block.splitlines() if f"#{backup} " in line]
     assert p.recall_status().count == 1
     stats = json.loads(p.handle_tool_call("fact_store", {"action": "stats"}))["search_by_meaning"]
+    after_turn = stats.pop("after_turn")  # 0.16.3
+    assert after_turn["seconds"] == 8.0 and " facts in " in after_turn["last_batch"]
     assert stats == {"status": "ready", "model": "https://embeddings.example.net/v1/fake-1",
                      "facts_with_vector": len(FILLERS) + 2, "waiting": 0,
                      "never_sent": 0}
