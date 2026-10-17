@@ -75,7 +75,7 @@ In `config.yaml` under `plugins.hermes-memory-store`:
 
 | Tool | Description |
 |------|-------------|
-| `fact_store` | add, search, probe, related, reason, contradict, change, end, correct, revert, forget, history, update, remove, list, stats, export, review, entities, alias, rename, delete_entity, rebuild_entities, enrich |
+| `fact_store` | add, search, probe, related, reason, contradict, change, end, correct, revert, forget, history, update, remove, list, stats, export, review, entities, alias, rename, delete_entity, split, rebuild_entities, enrich |
 | `fact_feedback` | Rate a fact helpful or unhelpful (moves its trust score), or record that the person confirmed it (0.15.0) |
 
 - **search**: keyword candidates in any word form (`Маши` finds `Маша`, `deploys` finds `deploy`, `kucingnya` finds
@@ -120,6 +120,21 @@ In `config.yaml` under `plugins.hermes-memory-store`:
   name (the legacy aliases column is comma-separated). **review** lists provisional names older than 60 days under
   `entity_candidates`.
   Spelling variants are one entity (`Hermes Agent` = `hermes-agent`), and `X aka Y` makes `Y` an alias.
+- **An alias a fact's text gave is a hint, not a decision** (0.17.0). "X aka Y" lets later texts that say Y link to X,
+  and `probe Y` find X's facts — but no action someone takes with a name is resolved through it: a name declared
+  (`entities=[...]` in add, update, change, correct) that is only such an alias becomes an entity of its own, and the
+  answer says so under `split`, with the `alias` call that makes them one again; `alias`, `rename` and `delete_entity`
+  by it are refused. Until 0.16.3, "Alice Smith aka Bob Brown" after facts about Alice made a later
+  `entities=["Bob Brown"]` file the second person's facts under her, and `rename` or `delete_entity` by "Bob Brown"
+  renamed or deleted her. `alias {entity: X, content: Y}` confirms such a name; **split** `{entity: <an alias>}` makes
+  any alias an entity of its own. Facts whose text names Y then go to Y; one whose text names neither stays with X if
+  someone declared X on it, and the answer lists it under `facts_to_check` — why a declared link exists the file does
+  not record. `entities` shows such names as `text_aliases`, `review` all of them under `alias_candidates`, `stats`
+  their number. What this does not do: a text that says Y still links to X, so recall can bring X's facts for a
+  message about Y until someone splits them; and it guards what this version writes — an older version writing the
+  same file still resolves a declared name through such an alias. A name declared with a text already stored (an
+  `add` of the same text, a `correct` of the date only, a `change` into another fact's text) now counts too; until
+  0.16.3 it was dropped.
 - **probe**: every fact linked to a named entity, from the entity index (name or alias, any letter case).
   **reason**: facts linked to *all* of several entities; when a name is not a known entity, keyword search that still
   requires every name. Entities are linked when a fact is stored: capitalized names of two to five words in any cased
@@ -295,7 +310,7 @@ A word matches another when they share its plain form or its stem in the languag
   `Tablette` is in that list too), and the build no longer cuts a noun by the splitter's own judgement — only
   Wikidata's analysis does, from the next rebuild of the table. A real ambiguity
   stays: `Kopfschuppen` (dandruff) is `Kopf` + `Schuppen`, and `Schuppen` is also a shed. `de_compounds.tsv.gz`
-  (212 KB), loaded on the first German word (0.15 s, 7 MB); `_DE_COMPOUNDS = False` turns it off.
+  (207 KB, rebuilt 2026-10-17), loaded on the first German word (0.15 s, 7 MB); `_DE_COMPOUNDS = False` turns it off.
 - **German and Spanish verb forms** (0.11.0): Snowball keeps `ging` apart from `gehen`, `fue` from `ir` and `ser`,
   `hizo` from `hacer`. A table of such forms from Wikidata's lexemes (the 2,000 German and 4,000 Spanish verbs a
   stand-in for frequency ranks first) gives a form its lemmas' stems, in text of that language only (not in a tie
@@ -817,6 +832,10 @@ since, is of unknown origin) and `entity_tombstones`, both created by a writer, 
 0.4.0 or later has migrated the file. An older
 version reads the file as before; one that also writes to it may create a name `delete_entity` removed again from a
 new fact's text, and this version's next open does not notice: run `rebuild_entities` after going back and forth.
+
+0.17.0 changes no schema. An older version reads and writes the file as before, but does not keep the rule of 0.17.0:
+it resolves a declared name through an alias a fact's text gave, as 0.16.x did. After going back and forth, read
+`review` (`alias_candidates`) and `entities` (`text_aliases`).
 
 ## Development
 

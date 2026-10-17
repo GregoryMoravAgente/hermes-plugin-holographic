@@ -81,10 +81,11 @@ that is how the verb rule of 0.16.2 was dropped (2.8 % of the names lost in its 
 
 ## Open work
 
-- "X aka Y" gives an alias without asking (review 0.16.2, P2; older than 0.16.0): after facts about Alice Smith,
-  "Alice Smith aka Bob Brown" makes Bob Brown her alias, and a later `entities=["Bob Brown"]` then links the second
-  person's facts to her. A fix would keep an alias from text as an unconfirmed relation, or warn when a declared name
-  meets an aka alias, and let the agent split it again.
+- "X aka Y" (0.17.0): a declared name never resolves through an alias a text gave (split), alias / rename /
+  delete_entity by one are refused, `split` separates any alias. Left open on purpose: a text that says Y still links
+  to X (recall through the hint until someone splits); a known multi-word name a text mentions links a namesake's fact
+  (`mentioned_entity_ids`); `entity_key` folds spellings together (`Bob-Brown` = `bob brown`); should automatic
+  extraction (someone else's words) give aka aliases at all — watch a week of a real store first.
 
 - Fact vectors after a turn on a slow endpoint (0.16.3, issue #5): batches follow the measured speed, checked with
   the reporter's numbers and a fake endpoint only, never against a real local model here. The catch-up runs on the

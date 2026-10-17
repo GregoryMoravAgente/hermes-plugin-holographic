@@ -371,6 +371,7 @@ class HistoryMixin:
             other = self._one("SELECT fact_id FROM facts WHERE content = ? AND fact_id != ?", (content, fact_id))
             if other is not None:  # what it changed into is already a fact of its own
                 self._end(fact, cur, end, exact)
+                self._declare(int(other["fact_id"]), entities)  # names given with it still count (0.17.0)
                 return {"fact_id": int(other["fact_id"]), "status": "exists", "ended": fact_id}
             new_category = category or fact["category"]
             new_tags = fact["tags"] if tags is None else tags
@@ -392,6 +393,7 @@ class HistoryMixin:
         _check_after_end(start, last)
         other = self._one("SELECT fact_id FROM facts WHERE content = ?", (content,))
         if other is not None:  # what it holds as again is already a fact of its own
+            self._declare(int(other["fact_id"]), entities)  # names given with it still count (0.17.0)
             return {"fact_id": int(other["fact_id"]), "status": "exists"}
         new = self._insert_version(fact_id, content, category or last["category"], last["tags"] if tags is None else tags,
                                    valid_from=start, source=source, supersedes=last["version_id"])
@@ -451,6 +453,8 @@ class HistoryMixin:
                 _check_after_end(start, self._ended_before(cur))
             new_text = text if text is not None else fact["content"]
             new_start = start if start is not None else cur["valid_from"]
+            if new_text == fact["content"]:  # the text stays: names given with it still count (0.17.0)
+                self._declare(fact_id, entities)
             if new_text == fact["content"] and new_start == cur["valid_from"]:
                 return {"fact_id": fact_id, "status": "unchanged"}
             seq = self._replace_current(fact_id, "corrected", new_text, fact["category"], fact["tags"],

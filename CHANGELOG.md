@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.17.0 — 2026-10-17
+
+An alias "X aka Y" in a fact's text gave no longer decides who a name someone gives belongs to (HANDOFF open work,
+review 0.16.2). The German compound table is rebuilt from Wikidata, with a build that reproduces what shipped.
+
+### Fixed
+
+- **"X aka Y" in a text filed a second person under the first.** After facts about Alice Smith, "Alice Smith aka
+  Bob Brown" made Bob Brown her alias (as it should for a text), and everything someone then did with "Bob Brown" went
+  to her: `entities=["Bob Brown"]` linked the second person's facts to Alice and marked her declared, `rename` by
+  "Bob Brown" renamed Alice, `delete_entity` by it deleted Alice and kept her name from being found again. The same
+  with `a.k.a.`, `also known as`, any script, a chain ("Alice aka Bob", "Bob aka Carl", then Carl), automatic
+  extraction, and after forgetting the "aka" fact. Now a name that is only such an alias is never the target of an
+  action with a name: declared, it becomes an entity of its own and the answer says so under `split`, with the `alias`
+  call that makes them one if they are; `alias {entity: Y}`, `rename` and `delete_entity` by it (a list included,
+  checked whole) are refused with both ways out. Declared with the very fact that says "X aka Y", Y gets no alias.
+- **Declarations with a text already stored were dropped.** `entities` with an `add` of a text the store holds, a
+  `correct` that changes no text (or only the date), a `change` or resume into a text another fact holds — the names
+  were not linked (review 0.17.0, Codex). They are now.
+
+### Added
+
+- **`split {entity: <an alias>}`**: any alias — one a text gave, one someone gave, one of unknown origin — becomes an
+  entity of its own (declared). The facts of the old entity are linked again from their text: one whose text names
+  the alias and not the old entity moves; one whose text names neither stays where someone declared it and is listed
+  under `facts_to_check` (why a declared link exists the file does not record); aliases that hang on the split name
+  (a chain) follow it. The answer: `from`, `was` (`aka`, `user`, `legacy`), `facts_moved`, `facts_shared`,
+  `facts_to_check`.
+- **`text_aliases`** on each entity of `entities` (and their number in `entities` and `stats`), **`alias_candidates`**
+  in `review` — every such alias with the facts that say it, however old — and **`confirmed: true`** when `alias
+  {entity: X, content: Y}` confirms one.
+
+### Changed
+
+- **German compounds** (`dictionaries/de_compounds.tsv.gz`, 207 KB): rebuilt from a Wikidata run of 2026-10-17 (the
+  German lemma, P5238 and P5191 queries; 242,083 German lexemes, 189,034 nouns, 8,402 with an analysis). The build in
+  this repository could not reproduce the shipped table: 0.12.0 made every noun without an analysis of Wikidata's
+  one word, to keep lexicalised compounds whole, and since Wikidata lists most compounds without one, a table built
+  that way stopped splitting 15 of 33 everyday ones (Zahnarzttermin, Schulbus, Mietvertrag, Elternabend). The build
+  judges those nouns again, as the shipped table was made, and keeps the lexicalised words text.py keeps whole
+  (`_DE_ONE_WORD`). Over the 183,866 German nouns of the run: 183,633 split as before, 219 better — a lexicalised word
+  inside a compound stays one part (Kultur|Verständnis, not Kultur|Vers|Tändnis; Tabletten|Schachtel, Flugzeug|Halle,
+  Rucksack|Reisende) —, Fließgewässer is now one word and Bürgermeisterin Bürger|Meisterin, and 12 rare words Wikidata
+  dropped are no longer known. A table's header now gives the date its queries ran; `de_es_forms.tsv.gz` is unchanged.
+
+### Compatibility
+
+No schema change; `_ENTITY_RULES` stays 4 (what text gives is unchanged, and a rebuild could not tell an old hijack
+from an honest second name anyway: `review` and `entities` show them for a person to decide). An older version writing
+the same file keeps resolving a declared name through such an alias. Existing "aka" aliases follow the new rules from
+the first open.
+
+### Reviewed
+
+The design by an agent on Claude Fable 5.1 (15 variants reproduced on 0.16.3), reviewed by Codex CLI (gpt-6.1-sol,
+"implement after changes"): a split must not promise to separate facts linked by a declaration it cannot attribute
+(`facts_to_check`); splitting the middle of a chain must move what hangs on it in the same transaction; declarations
+with an unchanged text were dropped; the split report must belong to one operation (`collect_splits`, read only after
+the call succeeded), not to the store; the promise is that a text never picks the target of an action with a name —
+recall through such an alias stays until someone splits it. 24 new tests (23 fail on 0.16.3); 2082 pass on the
+server's core.
+
 ## 0.16.3 — 2026-10-17
 
 Search by meaning on a slow local endpoint (issue #5 by sprd-tmu: qwen3-embedding-4b on a local NPU server, 0.23 s

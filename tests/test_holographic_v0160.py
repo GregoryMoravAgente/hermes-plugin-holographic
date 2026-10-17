@@ -858,7 +858,8 @@ def test_a_read_only_open_of_an_old_store_changes_nothing(tmp_path):
     before = _schema(path)
     s = MemoryStore(str(path), hrr_dim=DIM, migrate=False)
     assert sorted(r["name"] for r in s.list_entities()) == ["Anna Lee", "count"] and s.entity_rules() == 1
-    assert _status(s, "Anna Lee") == "established" and s.entity_counts() == {"entities": 2, "provisional": 1}
+    assert _status(s, "Anna Lee") == "established"
+    assert s.entity_counts() == {"entities": 2, "provisional": 1, "text_aliases": 0}
     assert s.stale_provisional_entities(days=0) and s._extract_entities('Code name "Phoenix"') == ["Phoenix"]
     s.close()
     assert _schema(path) == before

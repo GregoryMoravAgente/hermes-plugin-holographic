@@ -72,7 +72,9 @@ FACT_STORE_SCHEMA = {
         "capitals, only ever in quotes), nobody confirmed · alias {entity, content=<other name>} — one entity, two "
         "names; entity stays the name (merges them if both exist) · rename {entity, content=<new name>} · "
         "delete_entity {entity} or {entities: [...]} — names that are not names (a phrase, a command, a label): drops "
-        "them from the index, keeps every fact, and text never creates them again.\n"
+        "them from the index, keeps every fact, and text never creates them again · split {entity: <an alias>} — two "
+        "people under one entity: the alias becomes an entity of its own. 'text_aliases': names a fact's 'X aka Y' "
+        "gave, nobody confirmed; alias {entity: X, content: Y} confirms one.\n"
         "Recalled facts show their id as #N: pass it to fact_feedback; '(inferred)' marks a conclusion nobody "
         "confirmed."
     ),
@@ -82,7 +84,7 @@ FACT_STORE_SCHEMA = {
             "action": {"type": "string", "enum": ["add", "search", "probe", "related", "reason", "contradict", "update",
                                                   "change", "end", "correct", "revert", "forget", "history", "remove",
                                                   "list", "stats", "export", "review", "entities", "alias", "rename",
-                                                  "delete_entity", "rebuild_entities", "enrich"]},
+                                                  "delete_entity", "split", "rebuild_entities", "enrich"]},
             "content": {"type": "string", "description": "Fact text for 'add' / 'change' / 'correct': one short "
                                                          "standalone sentence. 'alias': the other name; 'rename': the "
                                                          "new name."},
@@ -93,7 +95,7 @@ FACT_STORE_SCHEMA = {
                                                           "only when the message says so."},
             "as_of": {"type": "string", "description": "'search' / 'list': a date (YYYY-MM-DD); what held then."},
             "entity": {"type": "string", "description": "Entity name (or an alias) for 'probe' / 'related' / 'alias' / "
-                                                        "'rename' / 'delete_entity'."},
+                                                        "'rename' / 'delete_entity' / 'split'."},
             "status": {"type": "string", "enum": ["all", "established", "provisional"],
                        "description": "'entities': which names to list (default all)."},
             "entities": {"type": "array", "items": {"type": "string"},
@@ -737,7 +739,10 @@ _MAX_LIMIT = 100
 # Agent contexts that may write (contract: skip writes for subagent / cron / flush contexts).
 _WRITER_CONTEXTS = frozenset({"", "primary"})
 _WRITE_ACTIONS = frozenset({"add", "update", "remove", "alias", "change", "end", "correct", "revert", "forget", "rename",
-                            "delete_entity", "rebuild_entities"})
+                            "delete_entity", "split", "rebuild_entities"})
+# Actions whose 'entities' declares names on a fact: a declared name that was only an alias a fact's text gave splits
+# off, and the answer says so ("split", 0.17.0).
+_DECLARING_ACTIONS = frozenset({"add", "update", "change", "correct"})
 # Context fields Hermes passes to initialize() that a version's source keeps (chat names are not kept: they change).
 _IDENTITY = ("chat_id", "chat_type", "thread_id", "user_id", "user_name")
 # Keywords (document expansion, as doc2query does for lexical search): words a person might ask with that the fact
@@ -785,6 +790,25 @@ _MAX_OPEN_STORES = 16  # per-user stores kept open; the least recently used one 
 # on the core's background worker; the last second is kept for taking the provider lock and storing what came back.
 # 32 requests, not 4 (0.16.3): a slow endpoint gets smaller batches, and the seconds are what bounds the catch-up.
 _CATCH_UP_REQUESTS, _CATCH_UP_SECONDS, _CATCH_UP_RESERVE = 32, 8.0, 1.0
+
+
+def _with_splits(answer: str, splits: dict) -> str:
+    """The tool's answer with what declared names split off ("split", 0.17.0): only when the call succeeded."""
+    if not splits:
+        return answer
+    try:
+        result = json.loads(answer)
+    except ValueError:
+        return answer
+    if not isinstance(result, dict) or "error" in result:
+        return answer
+    result["split"] = {
+        name: (f"was only another name of '{info['from']}' that a fact's text gave ('X aka Y'); now an entity of its "
+               f"own. If it is the same one: alias {{entity: '{info['from']}', content: '{info['entity']}'}}"
+               + (f". Facts {info['facts_to_check']} are linked to '{info['from']}' and name neither: check whom they "
+                  "are about" if info["facts_to_check"] else ""))
+        for name, info in splits.items()}
+    return json.dumps(result)
 
 
 def _limit(args: dict) -> int:
@@ -1365,6 +1389,10 @@ class HolographicMemoryProvider(MemoryProvider):
             return tool_error("The fact store is read-only in this context (subagent, flush, or cron with "
                               "cron_writes off); only the main agent writes facts.")
         try:
+            if tool_name == "fact_store" and args.get("action") in _DECLARING_ACTIONS and args.get("entities"):
+                with self._store.collect_splits() as splits:
+                    answer = self._TOOL_HANDLERS[tool_name](self, args)
+                return _with_splits(answer, splits)
             return self._TOOL_HANDLERS[tool_name](self, args)
         except KeyError as exc:
             return tool_error(f"Missing required argument: {exc}")
@@ -1626,6 +1654,8 @@ class HolographicMemoryProvider(MemoryProvider):
         rows = self._store.list_entities(limit=_limit(a), status=a.get("status") or None)
         counts = self._store.entity_counts()
         result = {"entities": rows, "count": len(rows), "provisional_entities": counts["provisional"]}
+        if counts["text_aliases"]:
+            result["text_aliases"] = counts["text_aliases"]
         if counts["provisional"] and a.get("status") != "provisional":
             result["hint"] = ("'provisional' names were guessed from one fact, or (letters without case) only ever found "
                               "in quotes, and nobody confirmed them. A phrase, a command or a label is not a name: "
@@ -1639,10 +1669,17 @@ class HolographicMemoryProvider(MemoryProvider):
         from them, names guessed from one fact that nobody confirmed in 60 days (0.16.0)."""
         facts = self._retriever.review(limit=_limit(a))
         names = self._store.stale_provisional_entities(limit=_limit(a))
-        result = {"candidates": facts, "count": len(facts), "entity_candidates": names}
+        aliases = self._store.unconfirmed_text_aliases(limit=_limit(a))
+        result = {"candidates": facts, "count": len(facts), "entity_candidates": names, "alias_candidates": aliases}
+        hints = []
         if names:
-            result["hint"] = ("entity_candidates: delete_entity {entities: [...]} for those that are not names (the "
-                              "facts stay).")
+            hints.append("entity_candidates: delete_entity {entities: [...]} for those that are not names (the facts "
+                         "stay).")
+        if aliases:  # 0.17.0: a text said "X aka Y"; a person decides whether that is one entity or two
+            hints.append("alias_candidates: names a fact's text gave as another name of an entity. Ask if unsure; one "
+                         "person: alias {entity, content: <alias>} confirms it; two: split {entity: <alias>}.")
+        if hints:
+            result["hint"] = " ".join(hints)
         return json.dumps(result)
 
     def _fact_call(self, a: dict, call, missing: str = ""):
@@ -1808,9 +1845,10 @@ class HolographicMemoryProvider(MemoryProvider):
         self._flush_counts(self._scope_key)
         read = self._store.read
         by_category = {r[0] or "general": r[1] for r in read("SELECT category, COUNT(*) FROM facts GROUP BY category")}
+        names = self._store.entity_counts()
         return json.dumps({
             "facts": self._store.count_facts(), "entities": read("SELECT COUNT(*) FROM entities")[0][0],
-            "provisional_entities": self._store.entity_counts()["provisional"],
+            "provisional_entities": names["provisional"], "text_aliases": names["text_aliases"],
             "entity_index": self._store.entity_index_state(),
             "by_category": by_category,
             "recalled_at_least_once": read("SELECT COUNT(*) FROM facts WHERE retrieval_count > 0")[0][0],
@@ -1887,6 +1925,7 @@ class HolographicMemoryProvider(MemoryProvider):
             "rename": lambda self, a: self._entity_call(a, ("entity", "content"),
                                                         lambda: self._store.rename_entity(a["entity"], a["content"])),
             "delete_entity": lambda self, a: self._delete_entity(a),
+            "split": lambda self, a: self._entity_call(a, ("entity",), lambda: self._store.split_alias(a["entity"])),
             "rebuild_entities": lambda self, a: json.dumps(self._store.rebuild_entity_index()),
             "enrich": lambda self, a: self._enrich(a),
         }),

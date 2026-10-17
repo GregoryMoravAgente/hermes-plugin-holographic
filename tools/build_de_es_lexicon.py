@@ -10,7 +10,9 @@ between requests; QUERIES below, verbatim). Wikidata's structured data, lexemes 
 (https://creativecommons.org/publicdomain/zero/1.0/, Wikidata:Licensing): no attribution is required, it is given
 anyway (LICENSES/Wikidata-CC0.txt). Counts of that date: German 242,105 lexemes (189,032 nouns, 26,873 adjectives,
 20,429 verbs; 583,649 verb forms), 7,767 German lexemes with "combines lexemes" (P5238); Spanish 68,285 lexemes (8,574
-verbs with 573,450 forms).
+verbs with 573,450 forms). de_compounds.tsv.gz was rebuilt from a run of 2026-10-17 (0.16.4: the German lemma, parts
+and derived queries only; 242,083 German lexemes, 189,034 nouns, 8,402 with P5238); de_es_forms.tsv.gz is of
+2026-10-12. Each table's header gives the date its queries ran.
 
 Changes (de_compounds.tsv.gz): German noun, adjective and verb lemmas, folded as text.py folds them (accents dropped,
 lower case); every noun of the dictionary is one word unless Wikidata's P5238 analysis says it is a compound (two
@@ -196,6 +198,7 @@ def verb_forms(dl: Path, code: str) -> dict:
 # -- German compounds ------------------------------------------------------------------------------------------------
 
 LINK_CODE = {v: k for k, v in T._DE_LINKS.items()}
+JUDGE = dict(need=(3, 3, 2), head_need=(4, 3, 2), need_verb=3)  # the dictionary's own words: stricter than run time
 WEEKDAYS = frozenset("montag dienstag mittwoch donnerstag freitag samstag sonnabend sonntag".split())
 
 
@@ -293,19 +296,34 @@ def build_compounds(dl: Path, exclude=frozenset(), log=print) -> tuple[dict, dic
         for _, p in readings[0]:
             prod[p] += 3
     links = {w: "".join(sorted(obs)) for w, obs in seen.items() if sum(obs.values()) >= 3}
-    # 2. every noun of the dictionary: a compound where Wikidata says so (cuts), else one word. The build's own
-    # judgement (text.py's splitter with stricter limits) cut lexicalised compounds the dictionary should keep whole:
-    # "Tablette" as Tab|Lette, "Weihnachten" as Weih|Nachten, "Reisende" as Reis|Ende; a noun Wikidata lists without
-    # an analysis is one word here, and the run-time splitter cuts only what the dictionary does not know.
+    # 2. every noun of the dictionary: a compound (cuts) or one word. Wikidata's analysis wins where it has one; a
+    # lexicalised compound text.py keeps whole (_DE_ONE_WORD: "Hochzeit", "Tablette") is one word here too; the rest is
+    # judged with text.py's splitter under stricter limits than at run time. 0.12.0 made every noun without an analysis
+    # one word instead, to keep lexicalised compounds whole; the table it built was never shipped: Wikidata lists most
+    # compounds without an analysis, and 15 of 33 everyday ones were no longer split (Zahnarzttermin, Schulbus,
+    # Mietvertrag, Elternabend; 0.16.4).
+    judge = T._DeSplitter(table(prod, links, nouns), {}, **JUDGE)
     cuts, atoms, why = {}, set(), collections.Counter()
     for w in nouns:
         if w in analyses:
             readings = analyses[w]
             cuts[w] = frozenset(s for s, _ in readings[0][1:]) if len(readings) == 1 else frozenset()
             why["Wikidata's analysis" if len(readings) == 1 else "two analyses: whole"] += 1
-        else:
+        elif any(w.endswith(end) and (w[:len(w) - len(end)] if end else w) in T._DE_ONE_WORD for end in T._DE_NOUN_END):
             atoms.add(w)
-            why["no analysis of Wikidata's: one word"] += 1
+            why["lexicalised (text.py _DE_ONE_WORD): whole"] += 1
+        elif w in one_word or (w.endswith("er") and (w[:-2] + "en" in verbs or w[:-2] + "n" in verbs)):
+            atoms.add(w)
+            why["derived, affixed, agent noun, weekday: whole"] += 1
+        elif len(w) < 6 or not (seg := judge.choose(w)):
+            atoms.add(w)
+            why["no analysis: one word"] += 1
+        elif prod.get(w, 0) >= math.exp(sum(math.log(1 + prod.get(p[1], 0)) for p in seg) / len(seg)) - 1:
+            atoms.add(w)  # Koehn & Knight: as often a part itself as its parts are
+            why["a part as often as its parts: one word"] += 1
+        else:
+            cuts[w] = judge.cuts(seg)
+            why["judged a compound"] += 1
     # the linking elements of a compound modifier belong to its last word (Hochzeit+s -> Zeit+s)
     for w, c in cuts.items():
         if c and w in links:
@@ -459,9 +477,14 @@ def build_forms(dl: Path, code: str, top: int | None, log=print) -> list[str]:
 # -- output ----------------------------------------------------------------------------------------------------------
 
 HEAD = ("# {what}, derived from Wikidata Lexemes (https://www.wikidata.org/wiki/Wikidata:Lexicographical_data), queried\n"
-        "# 2026-10-12 through https://query.wikidata.org/sparql. Wikidata's data is released under CC0 1.0 (public domain\n"
+        "# {date} through https://query.wikidata.org/sparql. Wikidata's data is released under CC0 1.0 (public domain\n"
         "# dedication, https://creativecommons.org/publicdomain/zero/1.0/): no attribution is required; it is given anyway.\n"
         "# Changes: see tools/build_de_es_lexicon.py, which made this file. See LICENSES/Wikidata-CC0.txt.\n# {fmt}\n")
+
+
+def queried(dl: Path) -> str:
+    """The date the downloads in *dl* were made (UTC), for a table's header."""
+    return time.strftime("%Y-%m-%d", time.gmtime(max(f.stat().st_mtime for f in dl.glob("*.csv"))))
 
 
 def write(path: Path, header: str, lines: list[str]) -> int:
@@ -481,12 +504,12 @@ def main(argv: list[str]) -> None:
     lines = [f"{w}\t{k}{c}{l or ''}" for w, (k, c, l) in sorted(words.items())]
     lines += [f"{w}\t={','.join(map(str, c))}" for w, c in sorted(over.items())]
     size = write(ROOT / "dictionaries" / "de_compounds.tsv.gz", HEAD.format(
-        what="German compound dictionary for text.py's splitter",
+        what="German compound dictionary for text.py's splitter", date=queried(dl),
         fmt="word TAB kinds (N noun, A adjective, V verb) class (0-4) [linking elements] | word TAB =cut,cut"), lines)
     print(f"de_compounds.tsv.gz: {size} bytes")
     lines = build_forms(dl, "de", top["de"]) + build_forms(dl, "es", top["es"])
     size = write(ROOT / "dictionaries" / "de_es_forms.tsv.gz", HEAD.format(
-        what="German and Spanish verb forms whose Snowball stem differs from their lemma's",
+        what="German and Spanish verb forms whose Snowball stem differs from their lemma's", date=queried(dl),
         fmt="language TAB lemma TAB forms"), lines)
     print(f"de_es_forms.tsv.gz: {size} bytes")
 
