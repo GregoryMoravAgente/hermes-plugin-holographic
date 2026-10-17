@@ -6,8 +6,8 @@ hrr_dim (1024), hrr_weight (0.3), mirror_memory_writes (false), prefetch_min_cov
 prefetch_repeat_turns (6), recall_indicator (true), recall_source (off | short), cron_writes (true), scope (profile |
 user | chat | thread); search by meaning, online and off by default: embeddings (off | on), embedding_url,
 embedding_model, embedding_key_env, embedding_dimensions, embedding_timeout, embedding_min_score,
-embedding_prefetch_facts, embedding_weight, embedding_space (embeddings.py, README). Fact history, provenance and forgetting:
-docs/history.md."""
+embedding_prefetch_facts, embedding_weight, embedding_space, embedding_catch_up_seconds (embeddings.py, README).
+Fact history, provenance and forgetting: docs/history.md."""
 
 from __future__ import annotations
 
@@ -781,9 +781,10 @@ _PREFETCH_LINE_CHARS = 300
 _COUNT_FLUSH_AT = 25  # buffered recall counts are written in one go at this many, and at session boundaries
 _MAX_TRACKED_SESSIONS, _MAX_TRACKED_FACTS = 16, 512
 _MAX_OPEN_STORES = 16  # per-user stores kept open; the least recently used one is closed beyond this
-# Vectors made after a turn (search by meaning): at most this many requests and seconds, on the core's background worker;
-# the last second is kept for taking the provider lock and storing what came back.
-_CATCH_UP_REQUESTS, _CATCH_UP_SECONDS, _CATCH_UP_RESERVE = 4, 8.0, 1.0
+# Vectors made after a turn (search by meaning): at most this many requests and seconds (embedding_catch_up_seconds),
+# on the core's background worker; the last second is kept for taking the provider lock and storing what came back.
+# 32 requests, not 4 (0.16.3): a slow endpoint gets smaller batches, and the seconds are what bounds the catch-up.
+_CATCH_UP_REQUESTS, _CATCH_UP_SECONDS, _CATCH_UP_RESERVE = 32, 8.0, 1.0
 
 
 def _limit(args: dict) -> int:
@@ -1235,15 +1236,19 @@ class HolographicMemoryProvider(MemoryProvider):
 
     def _catch_up_vectors(self) -> None:
         """Vectors for the active store's facts that have none, or whose text changed since theirs was made: after a
-        turn, on the core's background worker, at most _CATCH_UP_REQUESTS requests and _CATCH_UP_SECONDS. Only the
+        turn, on the core's background worker, at most _CATCH_UP_REQUESTS requests and _catch_up_seconds(), each of as
+        many facts as the endpoint's measured speed fits into the time left (Embedder.fact_batch). Only the
         request runs outside the provider lock (the next turn's prefetch must not wait on the network); reading what
         is missing and storing the vectors run under it, after checking that the store is still open here (a shutdown
         or an LRU eviction may close it while the request is out), and the store skips a fact whose text changed in
         between. Facts that recall would not inject or that look secret are never sent (_sendable). Every wait — the
         lock, the request — comes out of the one budget: the lock is taken with a timeout, and a request gets what is
         left after _CATCH_UP_RESERVE for storing its answer."""
-        deadline = time.monotonic() + _CATCH_UP_SECONDS
-        if self._embedder is None or not self._locked_until(deadline):
+        if self._embedder is None:
+            return
+        budget = self._catch_up_seconds()
+        deadline = time.monotonic() + budget
+        if not self._locked_until(deadline):
             return
         try:
             if not self._tool_writable or not self._store or not self._retriever:
@@ -1253,7 +1258,7 @@ class HolographicMemoryProvider(MemoryProvider):
         finally:
             self._op_lock.release()
         try:
-            for _ in range(_CATCH_UP_REQUESTS):
+            for turn_request in range(_CATCH_UP_REQUESTS):
                 if not self._embedder.usable() or not self._locked_until(deadline):
                     return
                 try:  # may wait for a prefetch: the budget is checked after it
@@ -1265,7 +1270,13 @@ class HolographicMemoryProvider(MemoryProvider):
                 left = deadline - time.monotonic() - _CATCH_UP_RESERVE
                 if not todo or left < embeddings.MIN_REQUEST_SECONDS:
                     return
-                vectors = self._embedder.embed([content for _, content, _ in todo], budget=left)
+                # A fair test of the server: the turn's first request, with most of the budget (a wait for the
+                # provider lock may have taken the rest; review 0.16.3)
+                fair = turn_request == 0 and left >= 0.8 * (budget - _CATCH_UP_RESERVE)
+                todo = todo[:self._embedder.fact_batch([len(content) for _, content, _ in todo], left, probe=fair)]
+                if not todo:  # not even one fact fits in what is left: the next turn goes on
+                    return
+                vectors = self._embedder.embed_facts([content for _, content, _ in todo], budget=left, decisive=fair)
                 if vectors is None or not self._locked_until(deadline):
                     return
                 try:
@@ -1277,6 +1288,10 @@ class HolographicMemoryProvider(MemoryProvider):
                     self._op_lock.release()
         except Exception as exc:  # a busy file, a broken connection: the next turn goes on
             logger.debug("holographic: making fact vectors stopped (%s)", exc)
+
+    def _catch_up_seconds(self) -> float:
+        """The after-turn budget for fact vectors: embedding_catch_up_seconds, else _CATCH_UP_SECONDS."""
+        return self._embedding.catch_up or _CATCH_UP_SECONDS
 
     def _locked_until(self, deadline: float) -> bool:
         """Take the provider lock, waiting no later than *deadline*; the caller releases it."""
@@ -1824,7 +1839,8 @@ class HolographicMemoryProvider(MemoryProvider):
             return "off"
         counts = self._retriever.vector_index(self._embedding.tag).counts(
             allowed=_sendable)
-        return {"status": self._embedder.status(), "model": self._embedding.tag, **counts}
+        return {"status": self._embedder.status(), "model": self._embedding.tag, **counts,
+                "after_turn": {"seconds": self._catch_up_seconds(), "last_batch": self._embedder.last_batch or "none yet"}}
 
     def _export(self, a: dict) -> str:
         """The facts as Markdown, most trusted first, with their entities: a readable view of the store."""

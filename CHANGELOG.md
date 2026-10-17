@@ -1,5 +1,106 @@
 # Changelog
 
+## 0.16.3 — 2026-10-17
+
+Search by meaning on a slow local endpoint (issue #5 by sprd-tmu: qwen3-embedding-4b on a local NPU server, 0.23 s
+for one text, 7.7 s for a batch of 32 facts of about 570 characters).
+
+### Fixed
+
+- **A slow endpoint never got a single fact vector.** The vectors after a turn had 8 s, 7 of them for the request,
+  and every batch was 32 facts — the same 32 newest each time. A server that needs longer for 32 was cut every time,
+  each cut paused the endpoint (60 s, doubling to 15 min), and after the pause the same batch went out again:
+  `facts_with_vector: 0` for good. Now the first request to an endpoint carries 4 facts, and each answer's time
+  (seconds per character, from sending) sizes the next batch: as many facts as fit into half of the time left, at
+  most 32 — on a local server at most into half of `embedding_timeout` (below) — and one fact whenever one is
+  expected to take less than the time left. Nothing is sent that would not fit, but for the turn's first request
+  when it still has most of the budget: the last second of a budget, or what a wait for the provider lock left, is
+  no test of the server. A batch that runs out of time is no failure — the server may be slow, not down: it is not
+  paused, the next batch is smaller (a quarter at the same time left), and the catch-up stops for this turn. One fact
+  that runs out of a turn's first request, 3 batches in a row cut short, a refused connection, an HTTP status or a
+  broken answer are failures as before. Running out of time is recognised however it shows: the caller's wait
+  ending, a read timing out, or waiting for the headers timing out, which urllib wraps in `URLError`. A batch a
+  message was sent during is not measured: on a one-slot server the message waited with it. With the reporter's
+  numbers (a fake endpoint at 0.24 s per fact) 119 facts fill in 5 turns, about 25 a turn, never paused, the
+  message's vector before every turn answered.
+- **That cut also switched recall by meaning off.** The pause it caused is the endpoint's, so the message's vector
+  before the next turn (0.23 s on that server) was not asked for either, for up to 15 minutes.
+- **A message waiting behind our own batch paused the endpoint.** A local server often answers one request at a
+  time: a message's vector asked for during a batch of 7 s waits behind it and runs out of `embedding_timeout`
+  (older than 0.16.3). On a local server a batch is now sized to take at most half of `embedding_timeout`, so a
+  message queued behind it still gets the other half; and a message's request that runs out of time while a fact
+  batch of ours held the endpoint for part of its wait — running at the deadline, or ending after the first quarter
+  of the wait, however it ended (answered, or timed out inside urllib) — is not the endpoint's failure: recall uses
+  the words that turn, no pause.
+- **A request still running made the next one fail at once.** A request given up on goes on on its own thread, and no
+  new request starts while it does (so a server that never answers holds one thread per caller at most); the next
+  one — often the message's vector before the next turn, or another store's — failed at once with "an earlier request
+  is still waiting" and doubled the pause, though the answer was often a moment away. It now waits for it up to half
+  of its own time, so a message's network waits share one `embedding_timeout` (in 0.16.2 it failed at once in that
+  case). When the request still running is a batch of ours given up on less than twice `embedding_timeout` ago, the
+  new one gives up without a pause; after that it is a stalled server and the new one fails, the pause growing each
+  time, as before. `fact_store stats` says so as soon as that time is up, not only at the next request.
+- **An error that came after the caller stopped waiting was lost.** A 503 or a malformed answer to a request given up
+  on now counts when the next request starts: the endpoint is paused, as it would have been in time — once per
+  request (one already counted as a failure, a fact cut short or a message that timed out, is not counted again), and
+  once for several that came together ("HTTP 503 (and 1 more)").
+- **An answer ended a pause that came after it was sent.** A batch still running that ended well cleared the pause a
+  message's 503 had set meanwhile (older than 0.16.3). Each failure now moves an epoch; an answer ends the pause only
+  if no failure was counted since its request was sent, and no request starts once another caller's failure has
+  paused the endpoint.
+
+### Added
+
+- **`embedding_catch_up_seconds`** (8, from 2 to 60): how long the fact vectors after a turn may take. No reply waits
+  for them in the core's usual path, but the core runs every provider's after-turn work on one worker in turn (sync,
+  then the next turn's prefetch queue), so a longer budget delays the next turn's extraction; at shutdown the core
+  waits 5 s for that worker, and what comes back after that is not stored (the store is checked before anything is
+  written), though the request itself is not called back. Up to 32 requests a turn instead of 4: with smaller
+  batches the seconds are what bounds the catch-up.
+- **`fact_store stats`** shows the budget and what the endpoint's last batch did, under
+  `search_by_meaning.after_turn` (`{"seconds": 8.0, "last_batch": "12 facts in 2.9 s"}`, that a batch was not done
+  in time, or that it was not sent while an earlier request ran). The endpoint is shared by every store a provider
+  opens, so the last batch may be another store's.
+
+### Reviewed
+
+Round 1, Codex CLI (gpt-6.1-sol) and Antigravity CLI on throwaway copies of the first draft, each with a model of the
+reported server. Both found that a timeout urllib wraps in `URLError` still paused the endpoint and kept the batch at
+32 (the draft caught only a bare `TimeoutError`), and that on a one-slot server a message's request queued behind a
+7.7 s batch of the first turn ran out of time and paused it. Codex also: the last half second of a budget sent one
+fact and paused a working endpoint; a 503 after a cut was dropped; two callers at once can each leave a request
+given up on. Antigravity also: a cut batch of one store made another store's message pause the shared endpoint; the
+documentation promised more than the code did.
+
+Round 2, Codex CLI (gpt-6-astra) on the fixed draft: a fact worker that never ended kept every later request "busy"
+and the endpoint "ready" for good (`_BUSY` had no end); the turn's first request after a wait for the provider lock
+still tested the server with what was left, and paused it; a batch that ended just before a message's deadline left
+the message's wait unexplained, and paused the endpoint; a batch that ended well cleared a newer 503; one request
+could double the pause twice (a cut, then its late 503), and of two late errors only the first was seen; a message
+queued with a batch made it look slower, and the local cap then let one fact a turn through whatever the budget;
+the documentation quoted numbers of the first draft. All fixed above, with tests. Found on the way: on Windows
+`time.monotonic` ticks every ~15 ms, so a batch that ended in the tick the message was sent looked like it held the
+endpoint; the times compared are now `time.perf_counter`, and a batch must have held the endpoint for a quarter of
+the message's wait.
+
+Round 3, Antigravity CLI on the fixed draft: every round-2 finding fixed, and a model of the reported server gave
+119 facts in 5 turns and 2,000 in 72 at 8 s, 9 at 60 s, with no pause. It found that a batch ended by urllib's own
+timeout (its thread over before the join) left no trace, so a message queued behind it still paused the endpoint; that
+the status said "ready" for a request stalled past its time until the next request came; and a wrong count of tests
+failing on 0.16.2. Fixed above, with tests.
+
+- **Not taken.** Measuring with the module clock `_now` instead of the real one (Antigravity): `_now` is the clock of
+  deadlines and pauses that tests freeze, while a join and a server's speed are real seconds. Smoothing the measured
+  speed, or a fixed cost per request apart from the cost per character (both rounds): a fixed cost only makes batches
+  smaller, and a batch a message waited with is no longer measured. A request slot shared by all callers, with
+  messages first (Codex): the catch-up runs outside the provider lock and every other caller inside it, so two
+  requests at once is the most a provider makes; a slot would make a message wait for a batch on hosted APIs too. A
+  thread of the plugin's own for the catch-up: see HANDOFF.
+
+1518 tests pass on the local core (the 22 that need a newer core fail as before); 26 new, of which 23 fail on 0.16.2
+here (the other three guard what holds there too: a refused connection, one fact with a turn's whole budget, no
+fact sent into what a long wait for the provider lock left).
+
 ## 0.16.2 — 2026-10-17
 
 What 0.16.1 showed on the same Chinese store (issue #4: 49 entities → 44 on the rebuild, both holes closed, no

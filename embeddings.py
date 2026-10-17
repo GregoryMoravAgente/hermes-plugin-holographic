@@ -7,7 +7,8 @@ and messages into vectors, and recall uses them next to the words, never in thei
 - vectors live in their own table, ``fact_embeddings``: one per current fact, with the model and a hash of the text it
   was made from, so a text an older version changed, or a vector of another model, is never compared;
 - every failure falls back to words without a word of complaint to the user; after one the endpoint is left alone for
-  a while (60 s, doubling up to 15 min), so a dead server does not cost seconds on every turn;
+  a while (60 s, doubling up to 15 min), so a dead server does not cost seconds on every turn; a batch of fact
+  vectors that only ran out of the after-turn time is no failure: the next batch is smaller (issue #5);
 - what recall must not inject (``_recall_problem``) is never sent, nor a message holding a credential.
 
 Nothing here runs, and nothing leaves the machine, unless ``embeddings: on``. Design after
@@ -54,6 +55,13 @@ _MAX_RESPONSE = 64 << 20
 # on the first, 0.68-0.84 on the second), so it is only an optional floor (embedding_min_score). Below
 # MIN_VECTORS_FOR_Z vectors the spread says nothing and only that floor can admit a fact.
 MIN_REQUEST_SECONDS = 0.5  # a request is not started with less time than this left
+# A batch of fact vectors is sized, once the endpoint's speed was measured, to take this share of the time left:
+# a local server may need 7.7 s for 32 facts, longer than the after-turn budget (issue #5).
+_FACT_FIT = 0.5
+_PROBE_BATCH = 4  # facts in the first request to an endpoint whose speed is not known yet
+_MAX_CUTS = 3  # batches of facts cut short in a row before the endpoint counts as failing (a server that never answers)
+_CUT = object()  # _request: a request for fact vectors ran out of time (embed_facts decides what that means)
+_BUSY = object()  # _request: not sent or not answered in time while our own fact request held the endpoint
 RECALL_MARGIN = 1.0  # before a turn
 SEARCH_MARGIN = 0.5  # fact_store search: the agent asked, and judges what it gets
 # fact_store search beyond the words (Retriever.beyond_words): of the SEARCH_TOP_K facts closest in meaning, one is
@@ -102,7 +110,8 @@ def _number(value, default, low, high, kind=float):
 class Settings:
     """The plugin config's embedding_* keys, validated (see README, "Search by meaning")."""
 
-    __slots__ = ("url", "model", "key_env", "dimensions", "timeout", "min_score", "recall_facts", "weight", "space")
+    __slots__ = ("url", "model", "key_env", "dimensions", "timeout", "min_score", "recall_facts", "weight", "space",
+                 "catch_up")
 
     def __init__(self, config: dict):
         self.url = str(config.get("embedding_url") or "https://api.openai.com/v1").strip()
@@ -117,6 +126,9 @@ class Settings:
         # a label of your own, part of the vectors' identity: change it when the server starts serving another model
         # under the same address and name, and every vector is made again
         self.space = str(config.get("embedding_space") or "").strip()
+        # seconds the fact vectors after a turn may take (None: the plugin's 8). No reply waits for them, but the core
+        # runs every provider's after-turn work on one worker in turn: more here delays the next turn's extraction
+        self.catch_up = _number(config.get("embedding_catch_up_seconds"), None, 2.0, 60.0)
 
     @property
     def tag(self) -> str:
@@ -240,6 +252,18 @@ def _read_until(response, deadline: float) -> bytes:
         chunks.append(chunk)
 
 
+class _GivenUp:
+    """A request whose caller stopped waiting: its thread, what it returns, whether it carries fact vectors or was a
+    message's request that timed out behind ours (busy), when it was given up on, and whether its failure was already
+    counted (a late answer then changes nothing: one request, one step of the pause)."""
+
+    __slots__ = ("worker", "box", "fact", "busy", "at", "counted")
+
+    def __init__(self, worker, box, fact: bool, busy: bool, counted: bool):
+        self.worker, self.box, self.fact, self.busy, self.counted = worker, box, fact, busy, counted
+        self.at = time.perf_counter()
+
+
 class Embedder:
     """The endpoint: texts in, unit-length float32 vectors out. Shared by every store a provider opens; thread-safe."""
 
@@ -251,11 +275,23 @@ class Embedder:
         self._lock = threading.Lock()
         self._pause = self._paused_until = 0.0
         self._last_error = ""
+        # +1 with every failure: an answer to a request sent before the latest failure does not end its pause
+        self._epoch = 0
         self._queries: OrderedDict = OrderedDict()
         # Requests given up on that may still be running (a stalled server): while one is, no new request starts,
-        # so a server that never answers holds one thread and connection at most, not one per retry.
-        self._abandoned: list[threading.Thread] = []
+        # so a server that never answers holds one thread and connection per caller at most (the catch-up, outside
+        # the provider lock, and one caller under it), not one per retry.
+        self._abandoned: list[_GivenUp] = []
         self.calls = 0  # requests sent (stats, tests)
+        self._messages_sent = 0  # requests other than fact batches: a fact batch they queued behind is not measured
+        # Fact vectors (embed_facts): seconds per character the endpoint took, None until measured; fact requests
+        # being waited for, and when the last one ended; batches cut short in a row; what the endpoint's last batch
+        # did (stats). Shared by every store, as the endpoint is.
+        self._fact_rate: float | None = None
+        self._facts_out = 0
+        self._fact_ended = 0.0
+        self._cuts = 0
+        self.last_batch = ""
 
     def _key(self) -> str:
         return str(self._environ.get(self.settings.key_env) or "").strip() if self.settings.key_env else ""
@@ -283,10 +319,13 @@ class Embedder:
         if why:
             return f"unavailable: {why}"
         with self._lock:
+            noted = self._reap_locked() or self._stalled_locked()
             left = self._paused_until - _now()
-            if left > 0:
-                return f"paused after an error ({self._last_error}); tried again in {int(left) + 1} s"
-        return "ready"
+            text = (f"paused after an error ({self._last_error}); tried again in {int(left) + 1} s" if left > 0
+                    else "ready")
+        if noted:
+            self._log_failure(*noted)
+        return text
 
     def usable(self) -> bool:
         return self.status() == "ready"
@@ -304,10 +343,99 @@ class Embedder:
             if left is not None and left < MIN_REQUEST_SECONDS:
                 return None
             got = self._request([t[:TEXT_MAX_CHARS] for t in texts[start:start + BATCH]], left)
-            if got is None:
+            if not isinstance(got, list):  # None, or _BUSY: our own fact request held the endpoint
                 return None
             out += got
         return out
+
+    def fact_batch(self, sizes: list[int], budget: float, probe: bool = True) -> int:
+        """How many of the waiting facts (their lengths, in the order they would be sent) the next request carries with
+        *budget* seconds left: _PROBE_BATCH until the endpoint's speed was measured, then as many as that speed fits
+        into _FACT_FIT of *budget*, at most BATCH — on a local server into _FACT_FIT of embedding_timeout at most, since
+        such a server often answers one request at a time and a message's vector before a turn may wait behind the
+        batch; one fact whenever one is expected to take less than *budget*. None otherwise — the end of a budget is
+        no test of the server (review 0.16.3: a fact sent into the last half second paused a working endpoint) —
+        unless *probe* (the turn's first request, with most of the budget): then one, to try."""
+        with self._lock:
+            rate = self._fact_rate
+        sizes = [max(1, min(size, TEXT_MAX_CHARS)) for size in sizes[:BATCH]]
+        if not sizes:
+            return 0
+        if not rate:
+            return min(len(sizes), _PROBE_BATCH)
+        room = budget * _FACT_FIT
+        if self._local:
+            room = min(room, self.settings.timeout * _FACT_FIT)
+        count, total = 0, 0
+        for size in sizes:
+            total += size
+            if total * rate > room:
+                break
+            count += 1
+        if count == 0 and (probe or sizes[0] * rate < budget * 0.9):
+            count = 1
+        return count
+
+    def embed_facts(self, texts: list[str], budget: float, decisive: bool = True) -> list | None:
+        """Vectors of up to BATCH fact texts in one request that may take *budget* seconds, or None; how fast the
+        endpoint answered sizes the next batch (fact_batch). A request that ran out of time is not the endpoint's
+        failure — the server may be slow rather than down (issue #5: 7.7 s for 32 facts against 7 s left): the
+        endpoint is not paused and the next batch is smaller. It is a failure when the request was *decisive* (a
+        turn's first, with most of its budget) and carried one fact, or after _MAX_CUTS cuts in a row. Nothing is
+        sent, and nothing counts, while an earlier request of ours still holds the endpoint."""
+        if not texts or len(texts) > BATCH or budget < MIN_REQUEST_SECONDS or not self.usable():
+            return None
+        batch = [t[:TEXT_MAX_CHARS] for t in texts]
+        chars = sum(max(1, len(t)) for t in batch)
+        timing: dict = {}
+        got = None
+        with self._lock:
+            self._facts_out += 1
+            messages = self._messages_sent
+        try:
+            got = self._request(batch, budget, fact=True, timing=timing)
+        finally:
+            with self._lock:
+                self._facts_out -= 1
+                # sent, and its thread has ended — answered, failed, or timed out inside urllib (review 0.16.3, round
+                # 3: a batch cut by a socket timeout left no trace, and a message queued behind it paused the endpoint);
+                # one still running is tracked as given up on
+                if "took" in timing and "given" not in timing:
+                    self._fact_ended = time.perf_counter()
+        if got is _BUSY:
+            with self._lock:
+                self.last_batch = "not sent: an earlier request was still running"
+            return None
+        if got is _CUT:
+            with self._lock:
+                self._cuts += 1
+                failing = (decisive and len(batch) == 1) or self._cuts >= _MAX_CUTS
+                if failing:
+                    self._cuts = 0
+                    given = timing.get("given")
+                    if given is not None:
+                        given.counted = True
+                    noted = self._fail_locked("no answer (timeout)" if len(batch) == 1
+                                              else f"no answer (timeout, {_MAX_CUTS} batches in a row)")
+                self._fact_rate = max(self._fact_rate or 0.0, 2.0 * budget / chars)
+                self.last_batch = (f"{len(batch)} facts were not done in {budget:.1f} s"
+                                   + ("" if failing else "; the next batch is smaller"))
+            if failing:
+                self._log_failure(*noted)
+            else:
+                logger.info("holographic: a batch of %d fact vectors took longer than the %.1f s left after the "
+                            "turn; the next batch is smaller", len(batch), budget)
+            return None
+        if got is None:
+            return None
+        took = timing.get("took", 0.0)  # from sending: a wait for an earlier request is not the server's speed
+        with self._lock:
+            # a message sent meanwhile may have queued with this batch on the server: its wait is no measure
+            if self._fact_rate is None or self._messages_sent == messages:
+                self._fact_rate = max(took, 1e-3) / chars
+            self._cuts = 0
+            self.last_batch = f"{len(batch)} facts in {took:.1f} s"
+        return got
 
     def query(self, text: str):
         """The vector of a message, from a small cache when it was asked for a moment ago; None when unavailable."""
@@ -325,19 +453,101 @@ class Embedder:
                 self._queries.popitem(last=False)
         return got[0]
 
-    def _request(self, batch: list[str], budget: float | None = None) -> list | None:
-        """One request. It runs on a daemon thread and the caller waits *budget* seconds — embedding_timeout when none
-        is given (a message's vector before a turn), the remaining after-turn budget for fact vectors, which nobody
-        waits for and come in batches of 32 — and no longer: urllib's timeout bounds each socket operation, so a server that sends its headers or its
-        chunks a byte at a time could otherwise hold the caller — and the provider lock prefetch holds — far longer
-        (review 2026-10-14). A request given up on finishes or fails on its own thread; the endpoint is paused."""
-        with self._lock:
-            self._abandoned = [t for t in self._abandoned if t.is_alive()]
-            stalled = bool(self._abandoned)
-        if stalled:
-            self._failed("no answer (an earlier request is still waiting)")
+    def _grace(self) -> float:
+        """How long a request given up on may still hold the endpoint as ours (busy), not as a stalled server."""
+        return 2.0 * self.settings.timeout
+
+    def _reap_locked(self):
+        """Under _lock: forget the requests given up on that have ended. One whose answer says the endpoint failed — an
+        HTTP status or a malformed answer that came after the caller stopped waiting (review 0.16.3: a 503 after every
+        cut kept it "ready") — and whose failure was not counted yet pauses it now, once for all of them; returns what
+        to log, or None."""
+        late, alive = [], []
+        for given in self._abandoned:
+            if given.worker.is_alive():
+                alive.append(given)
+                continue
+            if given.fact:
+                self._fact_ended = max(self._fact_ended, given.box.get("ended", 0.0))
+            error = given.box.get("error")
+            if given.counted:
+                continue
+            if isinstance(error, urllib.error.HTTPError):
+                late.append(f"HTTP {error.code}")
+            elif "malformed" in given.box:
+                late.append(f"malformed answer: {given.box['malformed']}")
+        self._abandoned = alive
+        if not late:
             return None
+        return self._fail_locked(late[0] + (f" (and {len(late) - 1} more)" if len(late) > 1 else ""))
+
+    def _stalled_locked(self):
+        """Under _lock: a request given up on more than _grace() ago and still running is a stalled server, counted
+        now rather than at the next request (review 0.16.3, round 3: the status said "ready" meanwhile); returns what to
+        log, or None. Counted once: the next request that finds it still running fails again, as before."""
+        now = time.perf_counter()
+        stale = [given for given in self._abandoned
+                 if not given.counted and given.worker.is_alive() and now - given.at > self._grace()]
+        if not stale:
+            return None
+        for given in stale:
+            given.counted = True
+        return self._fail_locked("no answer (an earlier request is still waiting)")
+
+    def _ours_busy(self, since: float) -> bool:
+        """Under _lock: did a fact request of ours hold the endpoint at some point since *since* — being waited for,
+        ended meanwhile, or given up on a moment ago and still running (review 0.16.3: a batch that ended just before
+        the message's deadline left the message's wait unexplained)?"""
+        if self._facts_out > 0 or self._fact_ended > since:
+            return True
+        now = time.perf_counter()
+        return any(given.fact and (given.box.get("ended", 0.0) > since
+                                   or (given.worker.is_alive() and now - given.at <= self._grace()))
+                   for given in self._abandoned)
+
+    def _request(self, batch: list[str], budget: float | None = None, fact: bool = False, timing: dict | None = None):
+        """One request. It runs on a daemon thread and the caller waits *budget* seconds — embedding_timeout when none
+        is given (a message's vector before a turn), the remaining after-turn budget for fact vectors, which no reply
+        waits for and come in batches of up to 32 — and no longer: urllib's timeout bounds each socket operation, so a
+        server that sends its headers or its chunks a byte at a time could otherwise hold the caller — and the provider
+        lock prefetch holds — far longer (review 2026-10-14). A request given up on finishes or fails on its own
+        thread; the endpoint is paused. Two exceptions (issue #5): a request for *fact* vectors that runs out of time
+        returns _CUT, and embed_facts decides; a message's request that runs out of time while a fact request of ours
+        held the endpoint (a local server may answer one request at a time) returns _BUSY, without a pause.
+
+        While a request given up on is still running, no new one starts: this one waits for it up to half of its own
+        time (one cut short after the last turn is often about to finish), then returns _BUSY if every request still
+        running is ours and was given up on less than _grace() ago, and fails otherwise ("an earlier request is still
+        waiting"): a server that never answers is paused, and paused for longer each time, as before 0.16.3.
+        *timing* gets "took", the seconds from sending to the answer, and "given", the request if it was given up on.
+        An answer ends the pause only if no failure was counted since it was sent."""
         timeout = self.settings.timeout if budget is None else max(0.1, budget)
+        with self._lock:
+            noted = self._reap_locked()
+            waiting = [given.worker for given in self._abandoned]
+        if noted:
+            self._log_failure(*noted)
+            return None
+        if waiting:
+            started, until = time.perf_counter(), time.perf_counter() + timeout / 2
+            for earlier in waiting:
+                earlier.join(max(0.0, until - time.perf_counter()))
+            with self._lock:
+                noted = self._reap_locked()
+                now = time.perf_counter()
+                running = list(self._abandoned)
+                ours = bool(running) and all((given.fact or given.busy) and now - given.at <= self._grace()
+                                             for given in running)
+                if not noted and running and not ours:
+                    for given in running:
+                        given.counted = True
+                    noted = self._fail_locked("no answer (an earlier request is still waiting)")
+            if noted:
+                self._log_failure(*noted)
+                return None
+            if running:
+                return _BUSY
+            timeout = max(0.1, timeout - (time.perf_counter() - started))
         body = {"model": self.settings.model, "input": batch}
         if self.settings.dimensions:
             body["dimensions"] = self.settings.dimensions
@@ -348,30 +558,62 @@ class Embedder:
             headers["Authorization"] = f"Bearer {key}"
         request = urllib.request.Request(self._url, data=json.dumps(body).encode("utf-8"), headers=headers,
                                          method="POST")
-        self.calls += 1
+        with self._lock:
+            if self._paused_until > _now():  # another caller's failure came while this one waited
+                return None
+            epoch = self._epoch
+            self.calls += 1
+            if not fact:
+                self._messages_sent += 1
         deadline = _now() + timeout
         box: dict = {}
 
         def send():  # decoding too, so the caller's wait covers the whole of it
             try:
-                with _OPENER.open(request, timeout=timeout) as response:
-                    raw = _read_until(response, deadline)
-            except BaseException as exc:  # handed to the caller below
-                box["error"] = exc
-                return
-            try:
-                box["vectors"] = _vectors(json.loads(raw), len(batch), self.settings.dimensions)
-            except ValueError as exc:  # our own wording, or the JSON parser's position
-                box["malformed"] = str(exc)[:120]
+                try:
+                    with _OPENER.open(request, timeout=timeout) as response:
+                        raw = _read_until(response, deadline)
+                except BaseException as exc:  # handed to the caller below
+                    box["error"] = exc
+                    return
+                try:
+                    box["vectors"] = _vectors(json.loads(raw), len(batch), self.settings.dimensions)
+                except ValueError as exc:  # our own wording, or the JSON parser's position
+                    box["malformed"] = str(exc)[:120]
+            finally:
+                box["ended"] = time.perf_counter()
 
         worker = threading.Thread(target=send, name="holographic-embeddings", daemon=True)
+        sent = time.perf_counter()
         worker.start()
         worker.join(timeout)
-        if worker.is_alive():
+        if timing is not None:
+            timing["took"] = time.perf_counter() - sent
+        alive = worker.is_alive()
+        # urllib's own timeout may end the request at the same moment: a read times out bare, waiting for the headers
+        # comes wrapped in URLError (review 0.16.3), as does a connection that timed out (_MAX_CUTS bounds that for
+        # facts). A connection refused or reset is a failure.
+        error = box.get("error")
+        timed_out = alive or isinstance(error, TimeoutError) or (
+            isinstance(error, urllib.error.URLError) and isinstance(error.reason, TimeoutError))
+        if timed_out:
             with self._lock:
-                self._abandoned.append(worker)
-            self._failed("no answer (timeout)")
-            return None
+                # ours only if a batch of ours held the endpoint for a fair part of the wait, not its last instant
+                ours = not fact and self._ours_busy(sent + timeout / 4)
+                fails = alive and not fact and not ours
+                if alive:
+                    given = _GivenUp(worker, box, fact, busy=ours, counted=fails)
+                    self._abandoned.append(given)
+                    if timing is not None:
+                        timing["given"] = given
+                noted = self._fail_locked("no answer (timeout)") if fails else None
+            if noted:
+                self._log_failure(*noted)
+                return None
+            if fact:
+                return _CUT
+            if ours:
+                return _BUSY
         # What is logged and shown in stats is a category, never the text of an exception raised while sending: it
         # may quote the request (a header with the key in it).
         try:
@@ -397,21 +639,34 @@ class Embedder:
             self._failed(f"malformed answer: {box['malformed']}")
             return None
         vectors = box["vectors"]
-        self._recovered()
+        self._recovered(epoch)
         return vectors
 
-    def _failed(self, why: str) -> None:
-        with self._lock:
-            first = not self._last_error
-            self._pause = min(_PAUSE_MAX, self._pause * 2) if self._pause else _PAUSE_FIRST
-            self._paused_until = _now() + self._pause
-            self._last_error = why
-            pause = self._pause
+    def _fail_locked(self, why: str) -> tuple:
+        """Under _lock: count a failure — pause the endpoint, longer each time — and return what to log."""
+        first = not self._last_error
+        self._pause = min(_PAUSE_MAX, self._pause * 2) if self._pause else _PAUSE_FIRST
+        self._paused_until = _now() + self._pause
+        self._last_error = why
+        self._epoch += 1
+        return why, first, self._pause
+
+    @staticmethod
+    def _log_failure(why: str, first: bool, pause: float) -> None:
         (logger.warning if first else logger.debug)(
             "holographic: embeddings endpoint failed (%s); words only for %d s", why, int(pause))
 
-    def _recovered(self) -> None:
+    def _failed(self, why: str) -> None:
         with self._lock:
+            noted = self._fail_locked(why)
+        self._log_failure(*noted)
+
+    def _recovered(self, epoch: int | None = None) -> None:
+        """An answer came: the endpoint works — unless a failure was counted after its request was sent (review
+        0.16.3: a batch that ended well cleared the pause a newer 503 had set)."""
+        with self._lock:
+            if epoch is not None and epoch != self._epoch:
+                return
             was = self._last_error
             self._pause = self._paused_until = 0.0
             self._last_error = ""

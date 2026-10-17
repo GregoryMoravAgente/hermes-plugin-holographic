@@ -628,7 +628,8 @@ as bge-m3 behind an aggregator does, and the plugin's status then says so), `emb
 (3 s, at most 6: the core gives a provider's recall 8 s), `embedding_min_score` (an absolute floor of similarity; off),
 `embedding_prefetch_facts` (1), `embedding_weight` (0.3), `embedding_space` (a label of your own: vectors are kept
 per address, model, dimension and this label, so when a server starts serving another model under the same address
-and name, change it and every vector is made again).
+and name, change it and every vector is made again), `embedding_catch_up_seconds` (8, from 2 to 60: how long the
+fact vectors after a turn may take; below).
 
 A store that had embeddings from another deployment may carry a column of its own vectors in `facts` (e.g. a
 `facts.embedding` BLOB). Since 0.14.3 no column the plugin did not create reaches a tool result (0.14.2 dropped
@@ -638,8 +639,26 @@ it — unless an index or trigger of the old deployment uses the column: drop th
 **How it decides**
 
 - *Fact vectors* are made after a turn, on the core's background worker, by a session that may write (the main
-  agent, and a cron job unless `cron_writes: false`; never a subagent): up to 4 requests of 32 facts each, so a store
-  catches up within a few turns (100 facts: 4 requests) and no reply waits for it. A vector is stored in its own
+  agent, and a cron job unless `cron_writes: false`; never a subagent): requests of up to 32 facts within
+  `embedding_catch_up_seconds` (8 s, at most 32 requests), so a store catches up within a few turns (100 facts: 4
+  requests to a hosted API, about 0.3 s each) and no reply waits for it in the core's usual path. The first request to
+  an endpoint carries 4 facts, and each answer's time sizes the next batch: as many facts as that speed fits into half
+  of the time left — on a local server at most into half of `embedding_timeout`, since such a server often answers one
+  request at a time and a message's vector before a turn may wait behind the batch — and one fact whenever one is
+  expected to take less than the time left. Nothing is sent that would not fit, but for the turn's first request when
+  it has most of the budget (a wait for the provider lock can take the rest). A batch that runs out of time is no
+  failure — the server may be slow, not down: the next batch is smaller (a quarter, at the same time left); a failure
+  is one fact that runs out of the turn's first request, or 3 batches in a row (0.16.3, issue #5: a 4B model on a
+  local NPU server took 7.7 s for 32 facts against the 7 s left, and 0.16.2 sent those 32 again after every pause
+  without ever storing a vector). With that server's numbers, 119 facts of 570 characters fill in 5 turns, about 25 a
+  turn (a fake endpoint at its speed, not the server itself); a reviewer's model puts 2,000 facts at about 72 turns at
+  8 s and about 10 at 60 s. Speed is measured from sending, and not from a batch a message was sent during (on a
+  one-slot server it waited with it); a fixed cost per request still counts as speed, which only makes batches
+  smaller. A longer `embedding_catch_up_seconds` fills a store sooner and delays no reply, but the core runs every
+  provider's after-turn work on one worker in turn, so the next turn's extraction waits for it, and at shutdown the
+  core waits 5 s for that worker: what comes back after that is not stored (the store is checked before anything is
+  written), though the request itself is not called back. `fact_store stats` shows the budget and what the endpoint's last batch did
+  (`after_turn`; the endpoint is shared by every store a provider opens). A vector is stored in its own
   table, `fact_embeddings`, with the model, the address (a query string by a short hash of it) and a hash of the
   text it was made from: a changed text, another model, address or `embedding_space` gets a new one, and `forget`, `end` and `remove` delete it with the fact.
 - *Before a turn* one request embeds the message — unless it is a greeting or a thank-you, has fewer than two words
@@ -671,10 +690,19 @@ it — unless an index or trigger of the old deployment uses the column: drop th
   word at all, 3 → 6 of 12; questions that must find nothing still got a fact by meaning in 1 of 30. Taking the 3
   closest by rank alone found as many but answered 20 of those 30 with one. Recall before a turn does not do this.
 - Any failure — network, HTTP status, a timeout (`embedding_timeout` for the whole request before a turn; fact
-  vectors after a turn share an 8-second budget with every wait for the provider lock, as nobody waits for them;
+  vectors after a turn share `embedding_catch_up_seconds` with every wait for the provider lock, as no reply waits
+  for them, and count as above;
   either way the request, decoding included, runs on a thread of its own and the caller stops waiting then, however
-  slowly the server sends), a malformed answer — falls back to words without a word to the user;
-  the endpoint is then left alone for 60 s, doubling up to 15 min, with one warning in the log. A redirect is a
+  slowly the server sends), a malformed answer, an HTTP status that comes after the caller stopped waiting — falls
+  back to words without a word to the user; the endpoint is then left alone for 60 s, doubling up to 15 min, with one
+  warning in the log. One request moves the pause one step at most, however many ways it fails; an answer to a
+  request sent before the latest failure does not end the pause. While a request given up on is still running no new
+  one starts; the next one waits for it up to half of its own time first (the answer to a batch cut short often comes
+  a moment later), so a message's network waits share one `embedding_timeout`. A message's request that runs out of
+  time while a fact batch of ours held the endpoint for part of its wait (the batch was running, or ended after a
+  quarter of that wait) is no failure: recall uses the words that turn, and the endpoint is not paused. A batch of
+  ours counts as holding the endpoint for twice `embedding_timeout` after it was given up on; a request still running
+  after that is a stalled server, and fails (the status says so from then on). A redirect is a
   failure too (it would carry the key elsewhere). `fact_store stats` shows `search_by_meaning`: the status, the model,
   and how many facts have a vector, wait for one, or are never sent.
 

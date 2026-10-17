@@ -86,6 +86,12 @@ that is how the verb rule of 0.16.2 was dropped (2.8 % of the names lost in its 
   person's facts to her. A fix would keep an alias from text as an unconfirmed relation, or warn when a declared name
   meets an aka alias, and let the agent split it again.
 
+- Fact vectors after a turn on a slow endpoint (0.16.3, issue #5): batches follow the measured speed, checked with
+  the reporter's numbers and a fake endpoint only, never against a real local model here. The catch-up runs on the
+  core's one after-turn worker; if a large store on a slow server makes people raise `embedding_catch_up_seconds`
+  far, a thread of the plugin's own (one at a time, stopped by `shutdown`) would free that worker — not done: it
+  needs a lifecycle and tests that wait for it.
+
 - Unsegmented scripts use a substring scan of character n-grams; an FTS5 trigram index would scale further but needs
   a sync story for older versions writing the file (no triggers: they would fail on SQLite builds without trigram).
   Not needed at this store's size; revisit if stores grow past ~50k facts.

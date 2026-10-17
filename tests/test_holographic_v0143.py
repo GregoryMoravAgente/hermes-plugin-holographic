@@ -114,8 +114,8 @@ def test_retries_do_not_accumulate_timed_out_workers(monkeypatch):
         assert "earlier request is still waiting" in e.status()
     finally:
         stalls.release.set()
-    for t in list(e._abandoned):
-        t.join(5)
+    for given in list(e._abandoned):
+        given.worker.join(5)
     clock[0] += 10000
     e.embed(["c"])  # nothing waiting any more: a request goes out again
     assert stalls.calls == 2
