@@ -85,6 +85,11 @@ def _now() -> float:
     return time.monotonic()
 
 
+def _facts(count: int) -> str:
+    """"1 fact", "12 facts" (0.17.4, issue #5: "1 facts in 0.3 s")."""
+    return f"{count} fact" if count == 1 else f"{count} facts"
+
+
 _RE_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 _RE_KEY_PREFIX = re.compile(r"(?:sk|pk|rk)[-_]|AIza|gh[pousr]_|github_pat_|xox[abprs]-|glpat-|AKIA[0-9A-Z]{8}")
 
@@ -418,7 +423,7 @@ class Embedder:
                     noted = self._fail_locked("no answer (timeout)" if len(batch) == 1
                                               else f"no answer (timeout, {_MAX_CUTS} batches in a row)")
                 self._fact_rate = max(self._fact_rate or 0.0, 2.0 * budget / chars)
-                self.last_batch = (f"{len(batch)} facts were not done in {budget:.1f} s"
+                self.last_batch = (f"{_facts(len(batch))} {'was' if len(batch) == 1 else 'were'} not done in {budget:.1f} s"
                                    + ("" if failing else "; the next batch is smaller"))
             if failing:
                 self._log_failure(*noted)
@@ -434,7 +439,7 @@ class Embedder:
             if self._fact_rate is None or self._messages_sent == messages:
                 self._fact_rate = max(took, 1e-3) / chars
             self._cuts = 0
-            self.last_batch = f"{len(batch)} facts in {took:.1f} s"
+            self.last_batch = f"{_facts(len(batch))} in {took:.1f} s"
         return got
 
     def query(self, text: str):

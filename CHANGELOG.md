@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.17.4 — 2026-10-18
+
+Three more texts the credential screen read as a credential with its value, from a live store (issue #6 by vlat0101,
+second round), and "1 fact" in the report of search by meaning (issue #5 by sprd-tmu).
+
+### Fixed
+
+- **`the report module pins LEDGER = _PROD_LEDGER`** was the PIN `_PROD_LEDGER`. With a word after it, lower-case
+  `pins` is the verb; a PIN with what it is for is singular or in capitals, and both stay a secret (`PIN card: 4821`,
+  `PINs card: 4821`, `pins: 4821`, `pins-wifi: 4821`). The cost, chosen: `pins card: 4821` is no longer caught.
+- **`input tokens) = token-accounting bug`** was a passphrase. Two hyphenated words after `=` count as a value given
+  (0.17.2: `Password wifi: correct-horse`) only when something names what the credential is for; a closing bracket
+  ends the words around the name and says nothing. A value with a digit or a symbol after the bracket stays a secret
+  (`Home wifi (password): Qwerty123`, `tokens)=Qwerty123`), and so do three words (`wifi (password) =
+  correct-horse-battery`); `(password): correct-horse` is not caught, as before 0.17.2.
+- **A folder, `~/.hermes/token-saver-ccr/`,** was the token `saver-ccr/`. After `word-`, a path that ends in `/` or `\`
+  names a folder as a file name names a file, held to the same shape: `token-Secret2026/` and `password-P@ss/` stay
+  secrets, `password-hunter2/` is not caught (as `password-hunter2.txt` is not, since 0.17.2).
+- **"1 facts in 0.3 s"** in `search_by_meaning.after_turn.last_batch` reads "1 fact in 0.3 s".
+
+What is unchanged: `password Summer2026.txt` and every case of 0.17.2's tests. Over 187,200 generated texts (the
+95,040 of 0.17.2 with these shapes added), 0.17.4 refuses nothing that 0.17.3 let through, and what it lets through
+is the three shapes above.
+
 ## 0.17.3 — 2026-10-17
 
 The screen of 0.17.2 without possessive quantifiers (`\w*+`): they need Python 3.11, which the plugin requires, but

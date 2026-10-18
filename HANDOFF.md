@@ -90,7 +90,9 @@ that is how the verb rule of 0.16.2 was dropped (2.8 % of the names lost in its 
   left on purpose (each fix loosens a security screen; review first): "the token counter.py module" (a file after a
   standalone word), "share the token-saver report" (any send request with a credential word), "перешли ключ от
   дачи" (a physical key; the dream skips it on its side), "Share grandma's secret pie recipe" (`secret` as an
-  adjective), "fix/token-refresh-2". The dream (hermes-dreaming, skills/dreaming/scripts/holo_screen.py) carries a
+  adjective), "fix/token-refresh-2". Lost on purpose in 0.17.4 (issue #6, second round): "pins card: 4821" (lower-case
+  `pins` with a word after it is the verb), "(password): correct-horse" (two words after a closing bracket),
+  "password-hunter2/" (a folder, as "password-hunter2.txt" since 0.17.2). The dream (hermes-dreaming, skills/dreaming/scripts/holo_screen.py) carries a
   verbatim copy of the screen: after any change here run its tools/vendor_screen.py, or its test and smoke go red.
   That copy runs on Python 3.9 and up: no possessive quantifiers or other 3.11 regex syntax in the screen (0.17.2
   used `\w*+` and the dream's copy failed to load there; 0.17.3, a test checks it).
