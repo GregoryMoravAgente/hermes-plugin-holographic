@@ -19,6 +19,7 @@ import re
 import threading
 import time
 import unicodedata
+import uuid
 from collections import Counter, OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List
@@ -865,6 +866,14 @@ _MAX_OPEN_STORES = 16  # per-user stores kept open; the least recently used one 
 # on the core's background worker; the last second is kept for taking the provider lock and storing what came back.
 # 32 requests, not 4 (0.16.3): a slow endpoint gets smaller batches, and the seconds are what bounds the catch-up.
 _CATCH_UP_REQUESTS, _CATCH_UP_SECONDS, _CATCH_UP_RESERVE = 32, 8.0, 1.0
+_RETIREMENT_RESULT_KEYS = (
+    "status", "provider", "home_id", "incarnation", "active_store_count", "pending_write_count",
+    "pending_flush_count", "close_failure_count", "reason",
+)
+_RETIREMENT_REASONS = frozenset({
+    "not_initialized", "no_identity", "foreign_receipt", "stale_receipt", "retirement_in_progress", "pending_flush",
+    "pending_catch_up", "flush_failed", "close_failed", "stale_store", "store_open_failed", "released",
+})
 
 
 def _with_splits(answer: str, splits: dict) -> str:
@@ -991,6 +1000,18 @@ class HolographicMemoryProvider(MemoryProvider):
         self._home, self._platform = "", ""
         self._init_key: str | None = None  # the user Hermes named at start (user scope)
         self._authors_seen = False  # a turn carried an author: a shared conversation, so an anonymous turn is nobody
+        self._home_id = ""
+        self._incarnation = ""
+        self._retirement_started = False
+        self._retirement_final_result: dict | None = None
+        self._retirement_close_failures = 0
+        self._catch_up_active = 0
+        self._catch_up_unsettled = 0
+        self._catch_up_generation = 0
+        self._catch_up_records: dict[int, dict] = {}
+        self._catch_up_failures_acknowledged = False
+        self._turn_inflight = 0
+        self._activation_usable = False
 
     @property
     def name(self) -> str:
@@ -1093,6 +1114,10 @@ class HolographicMemoryProvider(MemoryProvider):
     @_serialized
     def initialize(self, session_id: str, **kwargs) -> None:
         from hermes_constants import get_hermes_home
+        if self._retirement_started:
+            raise RuntimeError("memory provider cannot be reinitialized after retirement starts")
+        if self._turn_inflight > 0 or self._catch_up_active > 0 or self._catch_up_records:
+            raise RuntimeError("memory provider cannot be reinitialized while work is unsettled")
         _hermes_home = str(kwargs.get("hermes_home") or get_hermes_home())
         if self._stores:  # re-initialised: release the previous handles first
             self.shutdown()
@@ -1105,6 +1130,16 @@ class HolographicMemoryProvider(MemoryProvider):
             context == "cron" and is_truthy_value(self._config.get("cron_writes", True)))
         self._session_id, self._init_error = session_id, ""
         self._home, self._platform = _hermes_home, str(kwargs.get("platform") or "")
+        self._home_id = self._retirement_home_id()
+        self._incarnation = uuid.uuid4().hex
+        self._retirement_started = False
+        self._retirement_final_result = None
+        self._retirement_close_failures = 0
+        self._catch_up_active = self._catch_up_unsettled = self._turn_inflight = 0
+        self._catch_up_generation = 0
+        self._catch_up_records.clear()
+        self._catch_up_failures_acknowledged = False
+        self._activation_usable = False
         self._ident = {k: str(kwargs.get(k) or "").strip() for k in _IDENTITY}
         self._author = {}
         self._authors_seen = False
@@ -1145,8 +1180,62 @@ class HolographicMemoryProvider(MemoryProvider):
             return base
         return str(Path(base).expanduser().parent / self._scoped_dir() / f"{key}.db")
 
+    def _retirement_home_id(self) -> str:
+        """Opaque identity for this initialized home, database binding and scope."""
+        home = str(Path(self._home).expanduser().resolve())
+        db_path = self._db_path(self._home)
+        if db_path != ":memory:":
+            db_path = str(Path(db_path).expanduser().resolve())
+        binding = json.dumps({"db": db_path, "home": home, "scope": self._scope}, sort_keys=True,
+                             separators=(",", ":"))
+        return hashlib.sha256(binding.encode()).hexdigest()
+
+    def _retirement_result(self, status: str, reason: str, *, pending_write_count: int = 0,
+                           pending_flush_count: int = 0, close_failure_count: int | None = None) -> dict:
+        if status not in {"released", "unknown"} or reason not in _RETIREMENT_REASONS:
+            raise ValueError("invalid retirement result")
+        result = {
+            "status": status,
+            "provider": self.name if self._incarnation else "",
+            "home_id": self._home_id if self._incarnation else "",
+            "incarnation": self._incarnation if self._incarnation else "",
+            "active_store_count": len(self._stores),
+            "pending_write_count": max(0, int(pending_write_count)),
+            "pending_flush_count": max(0, int(pending_flush_count)),
+            "close_failure_count": max(0, self._retirement_close_failures if close_failure_count is None
+                                        else int(close_failure_count)),
+            "reason": reason,
+        }
+        if tuple(result) != _RETIREMENT_RESULT_KEYS:
+            raise AssertionError("retirement result schema changed")
+        return result
+
+    def _retirement_receipt_matches(self, receipt: dict | None) -> str | None:
+        if not self._incarnation:
+            return "not_initialized"
+        if receipt is None:
+            return None
+        if not isinstance(receipt, dict) or set(receipt) != {"provider", "home_id", "incarnation"}:
+            return "foreign_receipt"
+        if any(not isinstance(receipt.get(key), str) for key in ("provider", "home_id", "incarnation")):
+            return "foreign_receipt"
+        if receipt["provider"] != self.name or receipt["home_id"] != self._home_id:
+            return "foreign_receipt"
+        if receipt["incarnation"] != self._incarnation:
+            return "stale_receipt"
+        return None
+
+    def retirement_receipt(self) -> dict:
+        """Return the source-owned identity used by the hard retirement operation."""
+        with self._op_lock:
+            return {"provider": self.name if self._incarnation else "",
+                    "home_id": self._home_id if self._incarnation else "",
+                    "incarnation": self._incarnation if self._incarnation else ""}
+
     def _open(self, key: str) -> tuple | None:
         """(store, retriever) of *key*, opened on first use and kept in a small LRU; None if it cannot be opened."""
+        if self._retirement_started and self._turn_inflight <= 0:
+            raise RuntimeError("memory provider retirement has started")
         if key in self._stores:
             self._stores.move_to_end(key)
             return self._stores[key]
@@ -1185,6 +1274,7 @@ class HolographicMemoryProvider(MemoryProvider):
         opened = self._open(key) if key is not None else None
         self._scope_key = key
         self._store, self._retriever = opened if opened else (None, None)
+        self._activation_usable = key is not None and opened is not None
 
     def _source(self, via: str, author: dict | None = None, origin: str | None = None) -> dict:
         """Where a version is written: "while answering this person in this chat". The turn's author when the
@@ -1207,6 +1297,8 @@ class HolographicMemoryProvider(MemoryProvider):
         had authors (a shared chat), is nobody: recall and writes are off for that turn (fail closed). A conversation
         without any author is the user Hermes named at start. In every scope the author is remembered for the source
         of what this turn writes."""
+        if self._retirement_started:
+            return
         author_id = kwargs.get("author_id")
         self._author = {"id": str(author_id), "name": str(kwargs.get("author_name") or "")} \
             if author_id not in (None, "") else {}
@@ -1264,6 +1356,8 @@ class HolographicMemoryProvider(MemoryProvider):
         """Up to five relevant facts: keyword candidates that pass the relevance gate, plus the top facts of entities
         the message names; facts already injected in this session within ``prefetch_repeat_turns`` are not repeated."""
         self._last_recall = 0
+        if self._retirement_started:
+            return ""
         if not self._retriever or not query:
             return ""
         query = query[:_PREFETCH_QUERY_CHARS]  # a pasted log of 60 KB took seconds under the provider lock
@@ -1336,6 +1430,39 @@ class HolographicMemoryProvider(MemoryProvider):
             return None
 
     def _catch_up_vectors(self) -> None:
+        """Track the after-turn worker while it runs outside ``_op_lock``."""
+        if self._embedder is None:
+            return
+        budget = self._catch_up_seconds()
+        deadline = time.monotonic() + budget
+        if not self._op_lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+            return
+        try:
+            if self._retirement_started and self._turn_inflight <= 0:
+                return
+            self._catch_up_generation += 1
+            generation = self._catch_up_generation
+            self._catch_up_records[generation] = {"incarnation": self._incarnation, "state": "active"}
+            self._catch_up_active += 1
+        finally:
+            self._op_lock.release()
+        settled = False
+        try:
+            settled = bool(self._catch_up_vectors_body(deadline=deadline))
+        except Exception as exc:  # a failed invocation remains retryable custody, not a successful empty result
+            logger.debug("holographic: making fact vectors stopped (%s)", type(exc).__name__)
+        finally:
+            with self._op_lock:
+                self._catch_up_active -= 1
+                if settled:
+                    self._catch_up_records.pop(generation, None)
+                else:
+                    self._catch_up_records[generation]["state"] = "failed"
+                self._catch_up_unsettled = sum(
+                    record["state"] == "failed" for record in self._catch_up_records.values()
+                )
+
+    def _catch_up_vectors_body(self, *, deadline: float | None = None) -> bool:
         """Vectors for the active store's facts that have none, or whose text changed since theirs was made: after a
         turn, on the core's background worker, at most _CATCH_UP_REQUESTS requests and _catch_up_seconds(), each of as
         many facts as the endpoint's measured speed fits into the time left (Embedder.fact_batch). Only the
@@ -1346,14 +1473,14 @@ class HolographicMemoryProvider(MemoryProvider):
         lock, the request — comes out of the one budget: the lock is taken with a timeout, and a request gets what is
         left after _CATCH_UP_RESERVE for storing its answer."""
         if self._embedder is None:
-            return
+            return True
         budget = self._catch_up_seconds()
-        deadline = time.monotonic() + budget
+        deadline = deadline if deadline is not None else time.monotonic() + budget
         if not self._locked_until(deadline):
-            return
+            return False
         try:
             if not self._tool_writable or not self._store or not self._retriever:
-                return
+                return True
             store, tag = self._store, self._embedding.tag
             index = self._retriever.vector_index(tag)
         finally:
@@ -1361,34 +1488,36 @@ class HolographicMemoryProvider(MemoryProvider):
         try:
             for turn_request in range(_CATCH_UP_REQUESTS):
                 if not self._embedder.usable() or not self._locked_until(deadline):
-                    return
+                    return False
                 try:  # may wait for a prefetch: the budget is checked after it
                     if not self._open_here(store):
-                        return
+                        return False
                     todo = index.pending(embeddings.BATCH, allowed=_sendable)
                 finally:
                     self._op_lock.release()
                 left = deadline - time.monotonic() - _CATCH_UP_RESERVE
                 if not todo or left < embeddings.MIN_REQUEST_SECONDS:
-                    return
+                    return not todo
                 # A fair test of the server: the turn's first request, with most of the budget (a wait for the
                 # provider lock may have taken the rest; review 0.16.3)
                 fair = turn_request == 0 and left >= 0.8 * (budget - _CATCH_UP_RESERVE)
                 todo = todo[:self._embedder.fact_batch([len(content) for _, content, _ in todo], left, probe=fair)]
                 if not todo:  # not even one fact fits in what is left: the next turn goes on
-                    return
+                    return False
                 vectors = self._embedder.embed_facts([content for _, content, _ in todo], budget=left, decisive=fair)
                 if vectors is None or not self._locked_until(deadline):
-                    return
+                    return False
                 try:
                     if not self._open_here(store):
-                        return
+                        return False
                     store.put_vectors(tag, [(fact_id, digest, embeddings.to_blob(vector))
                                             for (fact_id, _, digest), vector in zip(todo, vectors)])
                 finally:
                     self._op_lock.release()
         except Exception as exc:  # a busy file, a broken connection: the next turn goes on
             logger.debug("holographic: making fact vectors stopped (%s)", exc)
+            return False
+        return False
 
     def _catch_up_seconds(self) -> float:
         """The after-turn budget for fact vectors: embedding_catch_up_seconds, else _CATCH_UP_SECONDS."""
@@ -1452,6 +1581,8 @@ class HolographicMemoryProvider(MemoryProvider):
 
     @_serialized
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+        if self._retirement_started:
+            return tool_error("Holographic memory retirement is in progress.")
         if tool_name not in self._TOOL_HANDLERS:
             return tool_error(f"Unknown tool: {tool_name}")
         if self._store is None:
@@ -1493,15 +1624,25 @@ class HolographicMemoryProvider(MemoryProvider):
                   turn_author: dict | None = None) -> None:
         """After a completed turn (the core runs it on a background worker): extraction, then, with search by meaning
         on, vectors for facts that have none (_catch_up_vectors, outside the provider lock)."""
-        self._sync_turn(user_content, assistant_content, session_id=session_id, messages=messages,
-                        turn_author=turn_author)
-        self._catch_up_vectors()
+        with self._op_lock:
+            if self._retirement_started:
+                raise RuntimeError("Holographic memory retirement is in progress")
+            self._turn_inflight += 1
+        try:
+            self._sync_turn(user_content, assistant_content, session_id=session_id, messages=messages,
+                            turn_author=turn_author)
+            self._catch_up_vectors()
+        finally:
+            with self._op_lock:
+                self._turn_inflight -= 1
 
     @_serialized
     def _sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", messages=None,
                    turn_author: dict | None = None) -> None:
         """Extraction per completed turn, filed under whoever wrote it. In user scope a turn by a bot, or an
         anonymous turn in a shared conversation, is skipped rather than stored in somebody's memory."""
+        if self._retirement_started and self._turn_inflight <= 0:
+            raise RuntimeError("Holographic memory retirement is in progress")
         if not self._extracting() or not user_content:
             return
         if self._scope != "user":  # profile: the shared store; chat / thread: this chat's store, never the shared one
@@ -1520,6 +1661,8 @@ class HolographicMemoryProvider(MemoryProvider):
 
     @_serialized
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        if self._retirement_started:
+            return
         # User scope extracts per turn in sync_turn (attributed); a whole transcript cannot be attributed safely.
         if self._extracting() and self._scope != "user" and self._store and messages:
             self._auto_extract_facts(messages, self._store, author={})
@@ -1529,6 +1672,8 @@ class HolographicMemoryProvider(MemoryProvider):
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         """Harvest before the turns are summarised away (a long session that is later killed keeps what it said),
         and let facts injected into the compressed turns be recalled again."""
+        if self._retirement_started:
+            return ""
         if self._extracting() and self._scope != "user" and self._store and messages:
             self._auto_extract_facts(messages, self._store, author={})
         for key in [k for k in self._injected if k.split("|", 1)[0] == self._session_id]:
@@ -1540,6 +1685,8 @@ class HolographicMemoryProvider(MemoryProvider):
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False,
                           rewound: bool = False, **kwargs) -> None:
         """Rebind to the new session; a new conversation or a rewound transcript forgets what was injected."""
+        if self._retirement_started:
+            return
         old = self._session_id
         self._session_id = new_session_id
         if reset or rewound:
@@ -1558,6 +1705,8 @@ class HolographicMemoryProvider(MemoryProvider):
         reworded or removed. When on, ``replace`` and ``remove`` follow the entry through
         ``metadata["previous_content"]`` (the exact old entry; ``old_text`` is only a search fragment): a replaced
         entry is a change of its fact (history kept), a removed one is forgotten."""
+        if self._retirement_started:
+            return
         if not (self._writable and self._store and is_truthy_value(self._config.get("mirror_memory_writes", False))):
             return
         if content and _fact_problem(content):
@@ -1579,9 +1728,121 @@ class HolographicMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.debug("Holographic memory_write mirror failed: %s", e)
 
+    def _retirement_pending_counts(self) -> tuple[int, int]:
+        """Return (individual writes, store buffers) without changing pending ownership."""
+        pending_write_count = sum(
+            max(0, int(count))
+            for counts in self._pending.values()
+            for count in counts.values()
+            if isinstance(count, int) and not isinstance(count, bool)
+        )
+        pending_flush_count = sum(1 for counts in self._pending.values() if counts)
+        return pending_write_count, pending_flush_count
+
+    def _flush_counts_for_retirement(self) -> tuple[int, int]:
+        """Flush every retained counter without the bounded soft-LRU truncation.
+
+        Returns ``(pending_buffers, failed_buffers)``.  A failed or missing store remains in
+        ``_pending`` so a same-receipt retry still owns the exact buffered counts.
+        """
+        failed = 0
+        for store_key in list(self._pending):
+            pending = self._pending.get(store_key)
+            if not pending:
+                self._pending.pop(store_key, None)
+                continue
+            opened = self._stores.get(store_key)
+            if not opened:
+                failed += 1
+                continue
+            try:
+                flushed = opened[0].add_retrieval_counts(dict(pending))
+            except Exception as exc:  # noqa: BLE001 - the result is a typed retryable custody state
+                logger.debug("Holographic retirement count flush stopped (%s)", type(exc).__name__)
+                flushed = False
+            if flushed:
+                self._pending.pop(store_key, None)
+            else:
+                failed += 1
+        return self._retirement_pending_counts()[1], failed
+
+    @_serialized
+    def retire(self, receipt: dict | None = None) -> dict:
+        """Release this provider's stores after all owned work has settled.
+
+        This is deliberately separate from the legacy soft ``shutdown`` path: an ``unknown``
+        result keeps the exact receipt, counters, and shared store entries for a same-owner retry.
+        """
+        receipt_reason = self._retirement_receipt_matches(receipt)
+        if receipt_reason:
+            return self._retirement_result("unknown", receipt_reason)
+        if self._retirement_final_result is not None:
+            return dict(self._retirement_final_result)
+
+        self._retirement_started = True
+        if not self._activation_usable:
+            reason = "no_identity" if self._scope_key is None else "store_open_failed"
+            return self._retirement_result("unknown", reason)
+        if self._turn_inflight > 0 or self._catch_up_active > 0:
+            pending_write_count, pending_flush_count = self._retirement_pending_counts()
+            return self._retirement_result("unknown", "pending_catch_up",
+                                           pending_write_count=pending_write_count,
+                                           pending_flush_count=pending_flush_count)
+        failed_catch_up = [record for record in self._catch_up_records.values() if record["state"] == "failed"]
+        if failed_catch_up:
+            if not self._catch_up_failures_acknowledged:
+                self._catch_up_failures_acknowledged = True
+                pending_write_count, pending_flush_count = self._retirement_pending_counts()
+                return self._retirement_result("unknown", "pending_catch_up",
+                                               pending_write_count=pending_write_count,
+                                               pending_flush_count=pending_flush_count)
+            for generation in [key for key, record in self._catch_up_records.items()
+                               if record["state"] == "failed"]:
+                self._catch_up_records.pop(generation, None)
+            self._catch_up_unsettled = 0
+            self._catch_up_failures_acknowledged = False
+
+        _, failed_flushes = self._flush_counts_for_retirement()
+        pending_write_count, pending_flush_count = self._retirement_pending_counts()
+        if failed_flushes or pending_flush_count:
+            return self._retirement_result("unknown", "flush_failed" if failed_flushes else "pending_flush",
+                                           pending_write_count=pending_write_count,
+                                           pending_flush_count=pending_flush_count)
+
+        retirement_reasons = set()
+        for key, opened in list(self._stores.items()):
+            store = opened[0]
+            try:
+                released, reason = store.release_for_retirement()
+            except Exception as exc:  # noqa: BLE001 - custody must remain retryable on an unexpected close error
+                logger.debug("Holographic retirement close stopped (%s)", type(exc).__name__)
+                released, reason = False, "close_failed"
+            if released:
+                self._stores.pop(key, None)
+                if self._scope_key == key:
+                    self._store = self._retriever = None
+            else:
+                retirement_reasons.add(reason)
+                if reason == "close_failed":
+                    self._retirement_close_failures += 1
+
+        if self._stores:
+            if "close_failed" in retirement_reasons:
+                reason = "close_failed"
+            elif "stale_store" in retirement_reasons:
+                reason = "stale_store"
+            else:  # pragma: no cover - release_for_retirement has a closed enum
+                reason = "close_failed"
+            return self._retirement_result("unknown", reason)
+        self._store = self._retriever = None
+        self._retirement_final_result = self._retirement_result("released", "released")
+        return dict(self._retirement_final_result)
+
     @_serialized
     def shutdown(self) -> None:
         # Close on the caller's thread: leaving the shared connection (+ write lock) to GC keeps it alive on a gateway.
+        if self._retirement_started:
+            return
         self._flush_counts()
         self._pending.clear()  # counts the database refused now are dropped, never applied to another store
         for store, _ in self._stores.values():

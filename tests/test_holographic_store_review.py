@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 
 import pytest
@@ -195,3 +196,309 @@ def test_a_file_from_a_newer_release_is_not_opened_for_writing(tmp_path):
     provider = _provider(tmp_path)
     assert "update the plugin" in provider.system_prompt_block() and ".recover" not in provider.system_prompt_block()
     provider.shutdown()
+
+
+# --- provider retirement -------------------------------------------------------------------------------------------
+
+
+def test_retirement_receipt_is_strict_and_never_reports_absent(tmp_path):
+    uninitialized = HolographicMemoryProvider(config={"db_path": str(tmp_path / "unused.db"), "hrr_dim": DIM})
+    result = uninitialized.retire()
+    assert result["status"] == "unknown"
+    assert result["reason"] == "not_initialized"
+    assert result["provider"] == result["home_id"] == result["incarnation"] == ""
+
+    provider = _provider(tmp_path)
+    receipt = provider.retirement_receipt()
+    assert set(receipt) == {"provider", "home_id", "incarnation"}
+    assert all(isinstance(value, str) and value for value in receipt.values())
+
+    foreign = dict(receipt, home_id="foreign-home")
+    refused = provider.retire(foreign)
+    assert refused["status"] == "unknown" and refused["reason"] == "foreign_receipt"
+    assert refused["active_store_count"] == 1
+    stale = provider.retire(dict(receipt, incarnation="stale-incarnation"))
+    assert stale["status"] == "unknown" and stale["reason"] == "stale_receipt"
+    malformed = [
+        dict(receipt, extra="field"),
+        {"provider": receipt["provider"], "home_id": receipt["home_id"]},
+        dict(receipt, incarnation=7),
+    ]
+    for candidate in malformed:
+        refused = provider.retire(candidate)
+        assert refused["status"] == "unknown" and refused["reason"] == "foreign_receipt"
+        assert refused["active_store_count"] == 1
+    assert stale["active_store_count"] == 1
+
+    released = provider.retire(receipt)
+    assert set(released) == {
+        "status", "provider", "home_id", "incarnation", "active_store_count", "pending_write_count",
+        "pending_flush_count", "close_failure_count", "reason",
+    }
+    assert released["status"] == "released"
+    assert released["reason"] == "released"
+    assert released["active_store_count"] == released["pending_write_count"] == released["pending_flush_count"] == 0
+    assert provider.retire(receipt) == released
+    provider.shutdown()  # hard-retirement shutdown is deliberately idempotent
+
+
+def test_retirement_failed_open_and_no_identity_stay_unknown(tmp_path):
+    db = tmp_path / "memory_store.db"
+    store = MemoryStore(str(db), hrr_dim=DIM)
+    store._conn.execute("UPDATE meta SET value = '99' WHERE key = 'history_schema'")
+    store.close()
+
+    failed_open = _provider(tmp_path)
+    failed = failed_open.retire(failed_open.retirement_receipt())
+    assert failed["status"] == "unknown" and failed["reason"] == "store_open_failed"
+    assert failed["active_store_count"] == 0
+
+    no_identity = _provider(tmp_path / "user", config={"scope": "user"}, platform="telegram")
+    refused = no_identity.retire(no_identity.retirement_receipt())
+    assert refused["status"] == "unknown" and refused["reason"] == "no_identity"
+    assert refused["active_store_count"] == 0
+
+
+def test_retirement_flush_failure_keeps_counts_for_same_receipt_retry(tmp_path):
+    provider = _provider(tmp_path)
+    store = provider._store
+    assert store is not None
+    # Keep unread rows behind the foreign cursor.  A one-row SELECT is stepped
+    # to exhaustion by sqlite3 and therefore does not retain the DELETE-mode
+    # shared read lock needed to exercise the real busy/flush boundary.
+    fact_ids = [store.add_fact("Alice Smith prefers green tea with mint")]
+    fact_ids += [store.add_fact(f"Person {i} lives in city {i}") for i in range(4)]
+    fact_id = fact_ids[0]
+    assert provider.prefetch("Alice Smith prefers green tea with mint", session_id="flush-one")
+    assert provider.prefetch("Alice Smith prefers green tea with mint", session_id="flush-two")
+    assert provider._pending[provider._scope_key][fact_id] == 2
+    _journal(store, "DELETE")
+    other, cur = _reader(store.db_path)
+    receipt = provider.retirement_receipt()
+    try:
+        assert cur.fetchone() is not None  # the reader still has rows, so its shared lock is live
+        refused = provider.retire(receipt)
+    finally:
+        cur.close()
+        other.close()
+    assert refused["status"] == "unknown" and refused["reason"] == "flush_failed"
+    assert refused["pending_write_count"] == 2 and refused["pending_flush_count"] == 1
+    assert provider._pending[provider._scope_key][fact_id] == 2
+
+    released = provider.retire(receipt)
+    assert released["status"] == "released" and released["reason"] == "released"
+    persisted = sqlite3.connect(str(store.db_path))
+    try:
+        assert persisted.execute(
+            "SELECT retrieval_count FROM facts WHERE fact_id = ?", (fact_id,)
+        ).fetchone()[0] == 2
+    finally:
+        persisted.close()
+
+
+def test_retirement_close_failure_keeps_exact_store_entry_for_retry(tmp_path):
+    provider = _provider(tmp_path)
+    store = provider._store
+    assert store is not None
+    store.add_fact("Alice Smith prefers green tea with mint")
+    entry = store._entry
+    key = store._key
+
+    class CloseOnce:
+        def __init__(self, connection):
+            self.connection = connection
+            self.fail = True
+
+        def close(self):
+            if self.fail:
+                self.fail = False
+                raise sqlite3.OperationalError("busy")
+            return self.connection.close()
+
+        def __getattr__(self, name):
+            return getattr(self.connection, name)
+
+    proxy = CloseOnce(entry["conn"])
+    entry["conn"] = proxy
+    receipt = provider.retirement_receipt()
+    first = provider.retire(receipt)
+    assert first["status"] == "unknown" and first["reason"] == "close_failed"
+    assert first["close_failure_count"] == 1
+    assert provider._stores[provider._scope_key][0] is store
+    assert MemoryStore._shared[key] is entry and entry["refs"] == 1
+    assert proxy.connection.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 1
+
+    second = provider.retire(receipt)
+    assert second["status"] == "released" and second["close_failure_count"] == 1
+    assert key not in MemoryStore._shared
+    verify = sqlite3.connect(str(store.db_path))
+    try:
+        assert verify.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 1
+    finally:
+        verify.close()
+
+
+def test_retirement_stale_store_does_not_close_successor_or_sibling(tmp_path):
+    provider = _provider(tmp_path)
+    store = provider._store
+    assert store is not None
+    store.add_fact("Alice Smith prefers green tea with mint")
+    receipt = provider.retirement_receipt()
+    sibling_root = tmp_path.parent / f"{tmp_path.name}-sibling"
+    sibling_root.mkdir()
+    successor = sibling = None
+    try:
+        # This is the existing profile-removal path: it force-closes the old shared entry and
+        # removes only that registry entry, leaving the provider's holder stale.
+        assert MemoryStore.release_all_under(tmp_path) == 1
+        successor = MemoryStore(store.db_path, hrr_dim=DIM)
+        successor.add_fact("Bob Brown prefers black coffee")
+        sibling = MemoryStore(sibling_root / "memory_store.db", hrr_dim=DIM)
+        sibling.add_fact("Carol Jones prefers mint tea")
+
+        refused = provider.retire(receipt)
+        assert refused["status"] == "unknown" and refused["reason"] == "stale_store"
+        assert refused["close_failure_count"] == 0
+        assert successor.count_facts() == 2  # the old row plus the successor's new row
+        assert sibling.count_facts() == 1
+        assert MemoryStore._shared[successor._key] is successor._entry
+    finally:
+        if successor is not None:
+            successor.close()
+        if sibling is not None:
+            sibling.close()
+        MemoryStore.release_all_under(tmp_path)
+        MemoryStore.release_all_under(sibling_root)
+
+
+def test_retirement_waits_for_real_sync_turn_catch_up_boundary(tmp_path):
+    provider = _provider(tmp_path, config={"embeddings": "on", "embedding_url": "http://127.0.0.1:9/v1",
+                                          "embedding_model": "local", "embedding_key_env": ""})
+    store = provider._store
+    assert store is not None
+    store.add_fact("Alice Smith prefers green tea with mint")
+    receipt = provider.retirement_receipt()
+    entered = threading.Event()
+    release = threading.Event()
+
+    class FakeEmbedder:
+        def usable(self):
+            return True
+
+        def fact_batch(self, sizes, budget, probe=True):
+            return len(sizes)
+
+        def embed_facts(self, texts, budget, decisive=True):
+            entered.set()
+            assert release.wait(2)
+            return None
+
+    provider._embedder = FakeEmbedder()
+    worker = threading.Thread(target=provider.sync_turn, args=("", ""), daemon=True)
+    worker.start()
+    assert entered.wait(2)
+    try:
+        with pytest.raises(RuntimeError, match="work is unsettled"):
+            provider.initialize(session_id="replacement", hermes_home=str(tmp_path), platform="telegram", user_id="one")
+        refused = provider.retire(receipt)
+        assert refused["status"] == "unknown" and refused["reason"] == "pending_catch_up"
+        assert refused["active_store_count"] == 1
+    finally:
+        release.set()
+        worker.join(2)
+    assert not worker.is_alive()
+    failed = provider.retire(receipt)
+    assert failed["status"] == "unknown" and failed["reason"] == "pending_catch_up"
+    released = provider.retire(receipt)
+    assert released["status"] == "released"
+    verify = sqlite3.connect(str(store.db_path))
+    try:
+        assert verify.execute("SELECT COUNT(*) FROM fact_embeddings").fetchone()[0] == 0
+    finally:
+        verify.close()
+
+
+def test_retirement_keeps_a_failed_catch_up_after_a_later_success(tmp_path):
+    provider = _provider(tmp_path, config={"embeddings": "on", "embedding_url": "http://127.0.0.1:9/v1",
+                                          "embedding_model": "local", "embedding_key_env": ""})
+    store = provider._store
+    assert store is not None
+    store.add_fact("Alice Smith prefers green tea with mint")
+
+    class Embedder:
+        def __init__(self):
+            self.calls = 0
+
+        def usable(self):
+            return True
+
+        def fact_batch(self, sizes, budget, probe=True):
+            return len(sizes)
+
+        def embed_facts(self, texts, budget, decisive=True):
+            self.calls += 1
+            return None if self.calls == 1 else [[0.0] * DIM for _ in texts]
+
+    provider._embedder = Embedder()
+    provider._catch_up_vectors()
+    provider._catch_up_vectors()
+    receipt = provider.retirement_receipt()
+    refused = provider.retire(receipt)
+    assert refused["status"] == "unknown" and refused["reason"] == "pending_catch_up"
+    released = provider.retire(receipt)
+    assert released["status"] == "released"
+    verify = sqlite3.connect(str(store.db_path))
+    try:
+        assert verify.execute("SELECT COUNT(*) FROM fact_embeddings").fetchone()[0] == 1
+    finally:
+        verify.close()
+
+
+def test_retirement_keeps_failed_scope_while_sibling_flushes(tmp_path):
+    provider = _provider(tmp_path, config={"scope": "user"}, platform="telegram", user_id="one")
+    first_key, first_store = provider._scope_key, provider._store
+    assert first_store is not None
+    first_ids = [first_store.add_fact("Alice Smith prefers green tea with mint")]
+    first_ids += [first_store.add_fact(f"Person {i} lives in city {i}") for i in range(4)]
+    first_id = first_ids[0]
+    assert provider.prefetch("Alice Smith prefers green tea with mint", session_id="first")
+    provider.on_turn_start(1, "", author_id="two")
+    second_key, second_store = provider._scope_key, provider._store
+    assert second_store is not None and second_key != first_key
+    second_id = second_store.add_fact("Bob Brown prefers black coffee")
+    assert provider.prefetch("Bob Brown prefers black coffee", session_id="second")
+    assert provider._pending[first_key][first_id] == 1
+    assert provider._pending[second_key][second_id] == 1
+    _journal(first_store, "DELETE")
+    other, cur = _reader(first_store.db_path)
+    receipt = provider.retirement_receipt()
+    try:
+        assert cur.fetchone() is not None
+        refused = provider.retire(receipt)
+    finally:
+        cur.close()
+        other.close()
+    assert refused["status"] == "unknown" and refused["reason"] == "flush_failed"
+    assert first_key in provider._stores and second_key in provider._stores
+    assert first_key in provider._pending and second_key not in provider._pending
+    released = provider.retire(receipt)
+    assert released["status"] == "released" and released["active_store_count"] == 0
+
+
+def test_retirement_releases_only_this_provider_ref(tmp_path):
+    db = tmp_path / "memory_store.db"
+    provider = _provider(tmp_path)
+    sibling = MemoryStore(db, hrr_dim=DIM)
+    receipt = provider.retirement_receipt()
+    released = provider.retire(receipt)
+    assert released["status"] == "released"
+    sibling._conn.execute("SELECT 1").fetchone()
+    sibling.close()
+
+
+def test_retirement_releases_all_provider_scope_stores(tmp_path):
+    provider = _provider(tmp_path, config={"scope": "user"}, platform="telegram", user_id="one")
+    provider.on_turn_start(1, "", author_id="two")
+    assert len(provider._stores) == 2
+    released = provider.retire(provider.retirement_receipt())
+    assert released["status"] == "released" and released["active_store_count"] == 0

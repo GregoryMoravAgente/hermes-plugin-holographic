@@ -2188,6 +2188,36 @@ class MemoryStore(HistoryMixin):
                         MemoryStore._shared.pop(self._key, None)
             self._entry = None
 
+    def release_for_retirement(self) -> tuple[bool, str]:
+        """Release this holder without losing retryable custody on a close failure.
+
+        Profile retirement cannot use :meth:`close` or ``release_all_under``: both legacy paths
+        deliberately clear their registry state when a connection close fails.  This path keeps
+        the exact shared entry and this holder's reference until the close succeeds, and never
+        force-closes a connection still held by another ``MemoryStore`` instance.
+        """
+        with MemoryStore._shared_guard:
+            entry = getattr(self, "_entry", None)
+            if entry is None:
+                return True, "released"
+            if MemoryStore._shared.get(self._key) is not entry:
+                return False, "stale_store"
+            if entry["refs"] > 1:
+                entry["refs"] -= 1
+                self._entry = None
+                return True, "released"
+            try:
+                with entry["lock"]:
+                    entry["conn"].close()
+            except Exception:
+                return False, "close_failed"
+            if MemoryStore._shared.get(self._key) is not entry:
+                return False, "stale_store"
+            MemoryStore._shared.pop(self._key, None)
+            entry["refs"] = 0
+            self._entry = None
+            return True, "released"
+
     def __enter__(self) -> "MemoryStore":
         return self
 
